@@ -705,7 +705,7 @@ class MistralCrossAttention(nn.Module):
         self.attention_dropout = config.attention_dropout
         self.hidden_size_large = config.hidden_size_large
         self.hidden_size_small = config.hidden_size_small
-        self.num_heads = config.num_attention_heads_small
+        self.num_heads = config.num_cross_attention_heads_small
         self.head_dim = self.hidden_size_small // self.num_heads
         self.num_key_value_heads = config.num_key_value_heads_small
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
