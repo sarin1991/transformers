@@ -546,6 +546,7 @@ _import_structure = {
         "MgpstrProcessor",
         "MgpstrTokenizer",
     ],
+    "models.dual_mistral": ["DualMistralConfig"],
     "models.mistral": ["MistralConfig"],
     "models.mixtral": ["MixtralConfig"],
     "models.mluke": [],
@@ -2528,6 +2529,15 @@ else:
             "MgpstrForSceneTextRecognition",
             "MgpstrModel",
             "MgpstrPreTrainedModel",
+        ]
+    )
+    _import_structure["models.dual_mistral"].extend(
+        [
+            "DualMistralForCausalLM",
+            "DualMistralForSequenceClassification",
+            "DualMistralForTokenClassification",
+            "DualMistralModel",
+            "DualMistralPreTrainedModel",
         ]
     )
     _import_structure["models.mistral"].extend(
@@ -5143,6 +5153,7 @@ if TYPE_CHECKING:
         MgpstrProcessor,
         MgpstrTokenizer,
     )
+    from .models.dual_mistral import DualMistralConfig
     from .models.mistral import MistralConfig
     from .models.mixtral import MixtralConfig
     from .models.mobilebert import (
@@ -6920,6 +6931,13 @@ if TYPE_CHECKING:
             MgpstrForSceneTextRecognition,
             MgpstrModel,
             MgpstrPreTrainedModel,
+        )
+        from .models.dual_mistral import (
+            DualMistralForCausalLM,
+            DualMistralForSequenceClassification,
+            DualMistralForTokenClassification,
+            DualMistralModel,
+            DualMistralPreTrainedModel,
         )
         from .models.mistral import (
             MistralForCausalLM,

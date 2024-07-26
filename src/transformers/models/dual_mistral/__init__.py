@@ -23,7 +23,7 @@ from ...utils import (
 
 
 _import_structure = {
-    "configuration_mistral": ["MistralConfig"],
+    "configuration_mistral": ["DualMistralConfig"],
 }
 
 
@@ -34,11 +34,11 @@ except OptionalDependencyNotAvailable:
     pass
 else:
     _import_structure["modeling_mistral"] = [
-        "MistralForCausalLM",
-        "MistralModel",
-        "MistralPreTrainedModel",
-        "MistralForSequenceClassification",
-        "MistralForTokenClassification",
+        "DualMistralForCausalLM",
+        "DualMistralModel",
+        "DualMistralPreTrainedModel",
+        "DualMistralForSequenceClassification",
+        "DualMistralForTokenClassification",
     ]
 
 try:
@@ -68,7 +68,7 @@ else:
 
 
 if TYPE_CHECKING:
-    from .configuration_mistral import MistralConfig
+    from .configuration_mistral import DualMistralConfig
 
     try:
         if not is_torch_available():
@@ -77,11 +77,11 @@ if TYPE_CHECKING:
         pass
     else:
         from .modeling_mistral import (
-            MistralForCausalLM,
-            MistralForSequenceClassification,
-            MistralForTokenClassification,
-            MistralModel,
-            MistralPreTrainedModel,
+            DualMistralForCausalLM,
+            DualMistralForSequenceClassification,
+            DualMistralForTokenClassification,
+            DualMistralModel,
+            DualMistralPreTrainedModel,
         )
 
     try:

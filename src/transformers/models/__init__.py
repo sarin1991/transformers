@@ -139,6 +139,7 @@ from . import (
     megatron_bert,
     megatron_gpt2,
     mgp_str,
+    dual_mistral,
     mistral,
     mixtral,
     mluke,
