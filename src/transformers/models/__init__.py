@@ -153,6 +153,7 @@ from . import (
     megatron_gpt2,
     mgp_str,
     mimi,
+    dual_mistral,
     mistral,
     mixtral,
     mllama,

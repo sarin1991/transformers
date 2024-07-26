@@ -578,6 +578,7 @@ _import_structure = {
         "MgpstrTokenizer",
     ],
     "models.mimi": ["MimiConfig"],
+    "models.dual_mistral": ["DualMistralConfig"],
     "models.mistral": ["MistralConfig"],
     "models.mixtral": ["MixtralConfig"],
     "models.mllama": [
@@ -2726,6 +2727,15 @@ else:
         [
             "MimiModel",
             "MimiPreTrainedModel",
+        ]
+    )
+    _import_structure["models.dual_mistral"].extend(
+        [
+            "DualMistralForCausalLM",
+            "DualMistralForSequenceClassification",
+            "DualMistralForTokenClassification",
+            "DualMistralModel",
+            "DualMistralPreTrainedModel",
         ]
     )
     _import_structure["models.mistral"].extend(
@@ -5464,6 +5474,7 @@ if TYPE_CHECKING:
     from .models.mimi import (
         MimiConfig,
     )
+    from .models.dual_mistral import DualMistralConfig
     from .models.mistral import MistralConfig
     from .models.mixtral import MixtralConfig
     from .models.mllama import (
@@ -7380,6 +7391,13 @@ if TYPE_CHECKING:
         from .models.mimi import (
             MimiModel,
             MimiPreTrainedModel,
+        )
+        from .models.dual_mistral import (
+            DualMistralForCausalLM,
+            DualMistralForSequenceClassification,
+            DualMistralForTokenClassification,
+            DualMistralModel,
+            DualMistralPreTrainedModel,
         )
         from .models.mistral import (
             MistralForCausalLM,
