@@ -790,7 +790,7 @@ class MistralCrossAttention(nn.Module):
         return attn_output, attn_weights, past_key_value
 
 
-class MistralCrossFlashAttention2(MistralAttention):
+class MistralCrossFlashAttention2(MistralCrossAttention):
     """
     Mistral flash attention module. This module inherits from `MistralAttention` as the weights of the module stays
     untouched. The only required change would be on the forward pass where it needs to correctly call the public API of
@@ -1078,7 +1078,7 @@ class MistralCrossFlashAttention2(MistralAttention):
 
 
 # Copied from transformers.models.llama.modeling_llama.LlamaSdpaAttention with Llama->Mistral
-class MistralCrossSdpaAttention(MistralAttention):
+class MistralCrossSdpaAttention(MistralCrossAttention):
     """
     Mistral attention module using torch.nn.functional.scaled_dot_product_attention. This module inherits from
     `MistralAttention` as the weights of the module stays untouched. The only changes are on the forward pass to adapt to
