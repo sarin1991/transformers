@@ -1180,8 +1180,8 @@ class DualMistralLargeDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size_large
 
         self.self_attn = MISTRAL_ATTENTION_CLASSES[config._attn_implementation](
-            hidden_size=config.hidden_size_large, num_attention_heads_small=config.num_attention_heads_large, 
-            num_key_value_heads_small=config.num_key_value_heads_large,
+            hidden_size=config.hidden_size_large, num_attention_heads=config.num_attention_heads_large, 
+            num_key_value_heads=config.num_key_value_heads_large,
             config=config, layer_idx=layer_idx)
 
         self.mlp = MistralMLPLarge(config)
@@ -1252,8 +1252,8 @@ class DualMistralSmallDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size_small
 
         self.self_attn = MISTRAL_ATTENTION_CLASSES[config._attn_implementation](
-            hidden_size=config.hidden_size_small, num_attention_heads_small=config.num_attention_heads_small, 
-            num_key_value_heads_small=config.num_key_value_heads_small,
+            hidden_size=config.hidden_size_small, num_attention_heads=config.num_attention_heads_small, 
+            num_key_value_heads=config.num_key_value_heads_small,
             config=config, layer_idx=layer_idx)
         self.cross_attn = MISTRAL_CROSS_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx+1)
 
