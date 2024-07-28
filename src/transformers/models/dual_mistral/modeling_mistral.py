@@ -2065,7 +2065,7 @@ class DualMistralModel(DualMistralPreTrainedModel):
                     output_hidden_states = None,
                     return_dict = True,
                     cache_position = None,
-                    **kwargs
+                    kwargs = kwargs,
                 )
                 past_key_values.update(key_states=input_ids_large,value_states=memory,layer_idx=1)
             memory = output_large.last_hidden_state
@@ -2095,7 +2095,7 @@ class DualMistralModel(DualMistralPreTrainedModel):
                     output_hidden_states = None,
                     return_dict = True,
                     cache_position = None,
-                    **kwargs
+                    kwargs = kwargs,
                 )
                 memory = output_large.last_hidden_state
                 zeros_shape = (input_ids.size(dim=1),self.block_size,self.config.hidden_size_large)
@@ -2115,7 +2115,7 @@ class DualMistralModel(DualMistralPreTrainedModel):
             output_hidden_states = None,
             return_dict = True,
             cache_position = None,
-            **kwargs
+            kwargs = kwargs,
         )
         hidden_states = output_small.last_hidden_state
         next_cache = output_small.past_key_values
