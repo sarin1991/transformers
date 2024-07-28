@@ -2014,6 +2014,11 @@ class DualMistralModel(DualMistralPreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
+        kwargs = {}
+        kwargs['gradient_checkpointing'] = self.gradient_checkpointing
+        kwargs['training'] = self.training
+        kwargs['_gradient_checkpointing_func'] = self._gradient_checkpointing_func
+
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -2060,6 +2065,7 @@ class DualMistralModel(DualMistralPreTrainedModel):
                     output_hidden_states = None,
                     return_dict = True,
                     cache_position = None,
+                    **kwargs
                 )
                 past_key_values.update(key_states=input_ids_large,value_states=memory,layer_idx=1)
             memory = output_large.last_hidden_state
@@ -2089,6 +2095,7 @@ class DualMistralModel(DualMistralPreTrainedModel):
                     output_hidden_states = None,
                     return_dict = True,
                     cache_position = None,
+                    **kwargs
                 )
                 memory = output_large.last_hidden_state
                 zeros_shape = (input_ids.size(dim=1),self.block_size,self.config.hidden_size_large)
@@ -2108,6 +2115,7 @@ class DualMistralModel(DualMistralPreTrainedModel):
             output_hidden_states = None,
             return_dict = True,
             cache_position = None,
+            **kwargs
         )
         hidden_states = output_small.last_hidden_state
         next_cache = output_small.past_key_values
