@@ -2098,7 +2098,7 @@ class DualMistralModel(DualMistralPreTrainedModel):
                     kwargs = kwargs,
                 )
                 memory = output_large.last_hidden_state
-                zeros_shape = (input_ids.size(dim=1),self.block_size,self.config.hidden_size_large)
+                zeros_shape = (input_ids.size(dim=0),self.block_size,self.config.hidden_size_large)
                 memory_zeros = torch.zeros(zeros_shape,device=memory.device)
                 memory_w_zeros = torch.cat((memory_zeros,memory),dim=-2)
                 memory_filtered = memory_w_zeros[:,:inputs_ids_small_len,:]
