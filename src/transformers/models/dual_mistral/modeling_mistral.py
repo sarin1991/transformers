@@ -2035,7 +2035,7 @@ class DualMistralModel(DualMistralPreTrainedModel):
             use_cache = False
 
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+            inputs_embeds = self.small_decoder.embed_tokens(input_ids)
 
         return_legacy_cache = False
         if use_cache and not isinstance(past_key_values, Cache):
