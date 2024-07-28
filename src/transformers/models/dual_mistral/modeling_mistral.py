@@ -2046,6 +2046,7 @@ class DualMistralModel(DualMistralPreTrainedModel):
         kwargs['gradient_checkpointing'] = self.gradient_checkpointing
         kwargs['training'] = self.training
         kwargs['_gradient_checkpointing_func'] = self._gradient_checkpointing_func
+        output_large = None
         if use_cache:
             input_ids_small, _ = past_key_values.update(key_states=input_ids,value_states=input_ids,layer_idx=0)
             inputs_ids_small_len = past_key_values.get_seq_length(0)
@@ -2077,9 +2078,9 @@ class DualMistralModel(DualMistralPreTrainedModel):
             memory_filtered = memory_w_zeros[:,:inputs_ids_small_len,:]
         else:
             # Get memory filtered without cache
-            inputs_ids_small_len = input_ids.size(dim=-2)
+            inputs_ids_small_len = input_ids.size(dim=1)
             if inputs_ids_small_len<=self.block_size:
-                zeros_shape = (input_ids.size(dim=1),inputs_ids_small_len,self.config.hidden_size_large)
+                zeros_shape = (input_ids.size(dim=0),inputs_ids_small_len,self.config.hidden_size_large)
                 memory_filtered = torch.zeros(zeros_shape,device=input_ids.device)
             else:
                 # Run large decoder
@@ -2116,28 +2117,22 @@ class DualMistralModel(DualMistralPreTrainedModel):
             cache_position = None,
             kwargs = kwargs,
         )
-        hidden_states = output_small.last_hidden_state
-        next_cache = output_small.past_key_values
-        all_hidden_states = output_large.hidden_states
-        if output_small.hidden_states is not None and output_small.hidden_states is not None:
-            all_hidden_states = output_large.hidden_states + output_small.hidden_states
-        elif output_small.hidden_states is not None:
-            all_hidden_states = output_small.hidden_states
-        else:
-            all_hidden_states = output_large.hidden_states
-        if output_large.attentions is not None and output_small.attentions is not None:
-            all_self_attns = output_large.attentions + output_small.attentions
-        elif output_small.attentions is not None:
-            all_self_attns = output_small.attentions
-        else:
-            all_self_attns = output_large.attentions
+        last_hidden_state = output_small.last_hidden_state
+        past_key_values = output_small.past_key_values
+        hidden_states = output_small.hidden_states
+        attentions = output_small.attentions
+        if output_large:
+            if output_large.hidden_states is not None:
+                hidden_states = hidden_states + output_large.hidden_states
+            if output_large.attentions is not None:
+                attentions = attentions + output_large.attentions
         if not return_dict:
-            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
+            return tuple(v for v in [last_hidden_state, past_key_values, hidden_states, attentions] if v is not None)
         return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
-            past_key_values=next_cache,
-            hidden_states=all_hidden_states,
-            attentions=all_self_attns,
+            last_hidden_state=last_hidden_state,
+            past_key_values=past_key_values,
+            hidden_states=hidden_states,
+            attentions=attentions,
         )   
             
 
