@@ -2143,7 +2143,7 @@ class DualMistralForCausalLM(DualMistralPreTrainedModel):
         super().__init__(config)
         self.model = DualMistralModel(config)
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.hidden_size_small, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
