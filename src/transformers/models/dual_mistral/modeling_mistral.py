@@ -2014,11 +2014,6 @@ class DualMistralModel(DualMistralPreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
-        kwargs = {}
-        kwargs['gradient_checkpointing'] = self.gradient_checkpointing
-        kwargs['training'] = self.training
-        kwargs['_gradient_checkpointing_func'] = self._gradient_checkpointing_func
-
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -2047,6 +2042,10 @@ class DualMistralModel(DualMistralPreTrainedModel):
             past_key_values = DynamicCache.from_legacy_cache(past_key_values)
             return_legacy_cache = True
 
+        kwargs = {}
+        kwargs['gradient_checkpointing'] = self.gradient_checkpointing
+        kwargs['training'] = self.training
+        kwargs['_gradient_checkpointing_func'] = self._gradient_checkpointing_func
         if use_cache:
             input_ids_small, _ = past_key_values.update(key_states=input_ids,value_states=input_ids,layer_idx=0)
             inputs_ids_small_len = past_key_values.get_seq_length(0)
