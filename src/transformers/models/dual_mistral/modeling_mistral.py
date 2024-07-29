@@ -1259,6 +1259,7 @@ class DualMistralSmallDecoderLayer(nn.Module):
 
         self.mlp = MistralMLPSmall(config)
         self.input_layernorm = MistralRMSNorm(config.hidden_size_small, eps=config.rms_norm_eps)
+        self.post_self_attention_layernorm = MistralRMSNorm(config.hidden_size_small, eps=config.rms_norm_eps)
         self.post_attention_layernorm = MistralRMSNorm(config.hidden_size_small, eps=config.rms_norm_eps)
 
     def forward(
@@ -1303,6 +1304,8 @@ class DualMistralSmallDecoderLayer(nn.Module):
         )
         hidden_states = residual + hidden_states
 
+        residual = hidden_states
+        hidden_states = self.post_self_attention_layernorm(hidden_states)
         # Cross Attention
         hidden_states, self_attn_weights, present_key_value = self.cross_attn(
             memory=memory,
