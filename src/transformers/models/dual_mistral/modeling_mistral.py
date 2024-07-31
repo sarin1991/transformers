@@ -1250,7 +1250,7 @@ class DualMistralSmallDecoderLayer(nn.Module):
     def __init__(self, config: DualMistralConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size_small
-
+        self.block_size = config.block_size
         self.self_attn = MISTRAL_ATTENTION_CLASSES[config._attn_implementation](
             hidden_size=config.hidden_size_small, num_attention_heads=config.num_attention_heads_small, 
             num_key_value_heads=config.num_key_value_heads_small,
