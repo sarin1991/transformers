@@ -1324,11 +1324,12 @@ class DualMistralSmallDecoderLayer(nn.Module):
             start = self.block_size - cache_position[0]
             hidden_states_zeros=torch.zeros_like(hidden_states[:,:start,:])
             hidden_states_filtered=hidden_states[:,start:,:]
+            position_ids_filtered = position_ids[:-start]
             hidden_states_filtered, self_attn_weights, present_key_value = self.cross_attn(
                 memory=memory,
                 hidden_states=hidden_states_filtered,
                 attention_mask=attention_mask,
-                position_ids=position_ids,
+                position_ids=position_ids_filtered,
                 past_key_value=past_key_value,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
