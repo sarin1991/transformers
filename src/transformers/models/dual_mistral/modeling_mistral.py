@@ -1264,7 +1264,7 @@ class DualMistralSmallDecoderLayer(nn.Module):
 
     def forward(
         self,
-        memory: torch.FloatTensor,
+        memory: Optional[torch.FloatTensor],
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
@@ -1304,19 +1304,37 @@ class DualMistralSmallDecoderLayer(nn.Module):
         )
         hidden_states = residual + hidden_states
 
+        # Cross Attention
         residual = hidden_states
         hidden_states = self.post_self_attention_layernorm(hidden_states)
-        # Cross Attention
-        hidden_states, self_attn_weights, present_key_value = self.cross_attn(
-            memory=memory,
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            use_cache=use_cache,
-            cache_position=cache_position,
-        )
+        if cache_position[0]>=self.block_size:
+            hidden_states, self_attn_weights, present_key_value = self.cross_attn(
+                memory=memory,
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+            )
+        elif cache_position[-1]<self.block_size:
+            hidden_states = torch.zeros_like(hidden_states)
+        else:
+            start = self.block_size - cache_position[0]
+            hidden_states_zeros=torch.zeros_like(hidden_states[:,:start,:])
+            hidden_states_filtered=hidden_states[:,start:,:]
+            hidden_states_filtered, self_attn_weights, present_key_value = self.cross_attn(
+                memory=memory,
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+            )
+            hidden_states = torch.cat((hidden_states_zeros,hidden_states_filtered),dim=1)
         hidden_states = residual + hidden_states
 
         # Fully Connected
@@ -1744,7 +1762,7 @@ class DualMistralModelSmallDecoder(nn.Module):
     @add_start_docstrings_to_model_forward(MISTRAL_INPUTS_DOCSTRING)
     def forward(
         self,
-        memory: torch.FloatTensor,
+        memory: Optional[torch.FloatTensor],
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
@@ -2045,6 +2063,12 @@ class DualMistralModel(DualMistralPreTrainedModel):
             past_key_values = DynamicCache.from_legacy_cache(past_key_values)
             return_legacy_cache = True
 
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            )
+        
         kwargs = {}
         kwargs['gradient_checkpointing'] = self.gradient_checkpointing
         kwargs['training'] = self.training
@@ -2070,41 +2094,37 @@ class DualMistralModel(DualMistralPreTrainedModel):
                     cache_position = None,
                     kwargs = kwargs,
                 )
+                memory = output_large.last_hidden_state
                 past_key_values.update(key_states=input_ids_large,value_states=memory,layer_idx=1)
-            memory = output_large.last_hidden_state
             # Get memory filtered with cache
             input_ids_large, memory = past_key_values[1]
-            zeros_shape = list(memory.shape)
-            zeros_shape[-2] = self.block_size
-            memory_zeros = torch.zeros(zeros_shape,device=memory.device)
-            memory_w_zeros = torch.cat((memory_zeros,memory),dim=-2)
-            memory_filtered = memory_w_zeros[:,:inputs_ids_small_len,:]
         else:
-            # Get memory filtered without cache
-            inputs_ids_small_len = input_ids.size(dim=1)
-            if inputs_ids_small_len<=self.block_size:
-                zeros_shape = (input_ids.size(dim=0),inputs_ids_small_len,self.config.hidden_size_large)
-                memory_filtered = torch.zeros(zeros_shape,device=input_ids.device)
-            else:
-                # Run large decoder
-                output_large = self.large_decoder(
-                    input_ids=input_ids,
-                    attention_mask = None,
-                    position_ids = None,
-                    past_key_values = past_key_values,
-                    inputs_embeds = None,
-                    use_cache = use_cache,
-                    output_attentions = None,
-                    output_hidden_states = None,
-                    return_dict = True,
-                    cache_position = None,
-                    kwargs = kwargs,
-                )
-                memory = output_large.last_hidden_state
-                zeros_shape = (input_ids.size(dim=0),self.block_size,self.config.hidden_size_large)
-                memory_zeros = torch.zeros(zeros_shape,device=memory.device)
-                memory_w_zeros = torch.cat((memory_zeros,memory),dim=-2)
-                memory_filtered = memory_w_zeros[:,:inputs_ids_small_len,:]
+            # Run large decoder
+            input_ids_large = input_ids
+            output_large = self.large_decoder(
+                input_ids=input_ids_large,
+                attention_mask = None,
+                position_ids = None,
+                past_key_values = past_key_values,
+                inputs_embeds = None,
+                use_cache = use_cache,
+                output_attentions = None,
+                output_hidden_states = None,
+                return_dict = True,
+                cache_position = None,
+                kwargs = kwargs,
+            )
+            memory = output_large.last_hidden_state 
+        if cache_position[0]>=self.block_size:
+            start = cache_position[0] - self.block_size
+            end = cache_position[-1] - self.block_size + 1
+            memory_filtered=memory[:,start:end,:]
+        elif cache_position[-1]<self.block_size:
+            memory_filtered = None
+        else:
+            start = self.block_size
+            end = cache_position[-1] - self.block_size + 1
+            memory_filtered=memory[:,start:end,:]
         # Run small decoder
         output_small = self.small_decoder(
             memory=memory_filtered,
