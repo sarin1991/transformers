@@ -1307,7 +1307,9 @@ class DualMistralSmallDecoderLayer(nn.Module):
         # Cross Attention
         residual = hidden_states
         hidden_states = self.post_self_attention_layernorm(hidden_states)
-        if cache_position[0]>=self.block_size:
+        if cache_position[-1]<self.block_size:
+            hidden_states = torch.zeros_like(hidden_states)
+        elif cache_position[0]>self.block_size:
             hidden_states, self_attn_weights, present_key_value = self.cross_attn(
                 memory=memory,
                 hidden_states=hidden_states,
@@ -1318,15 +1320,13 @@ class DualMistralSmallDecoderLayer(nn.Module):
                 use_cache=use_cache,
                 cache_position=cache_position,
             )
-        elif cache_position[-1]<self.block_size:
-            hidden_states = torch.zeros_like(hidden_states)
         else:
             start = self.block_size - cache_position[0]
             hidden_states_zeros=torch.zeros_like(hidden_states[:,:start,:])
             hidden_states_filtered=hidden_states[:,start:,:]
             hidden_states_filtered, self_attn_weights, present_key_value = self.cross_attn(
                 memory=memory,
-                hidden_states=hidden_states,
+                hidden_states=hidden_states_filtered,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_value=past_key_value,
@@ -2114,15 +2114,11 @@ class DualMistralModel(DualMistralPreTrainedModel):
                 cache_position = None,
                 kwargs = kwargs,
             )
-            memory = output_large.last_hidden_state 
-        if cache_position[0]>=self.block_size:
-            start = cache_position[0] - self.block_size
-            end = cache_position[-1] - self.block_size + 1
-            memory_filtered=memory[:,start:end,:]
-        elif cache_position[-1]<self.block_size:
+            memory = output_large.last_hidden_state
+        if cache_position[-1]<self.block_size:
             memory_filtered = None
         else:
-            start = self.block_size
+            start = max(cache_position[0] - self.block_size,0)
             end = cache_position[-1] - self.block_size + 1
             memory_filtered=memory[:,start:end,:]
         # Run small decoder
