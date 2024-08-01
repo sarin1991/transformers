@@ -1746,6 +1746,7 @@ class DualMistralModelSmallDecoder(nn.Module):
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
+        self.block_size = config.block_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size_small, self.padding_idx)
         self.layers = nn.ModuleList(
