@@ -1824,15 +1824,15 @@ class DualMistralModelSmallDecoder(nn.Module):
 
         hidden_states = inputs_embeds
         # Initialize hidden states
-        if cache_position[-1]<self.block_size:
-            hidden_states_from_large = torch.zeros_like(hidden_states)
-        elif cache_position[0]>self.block_size:
-            hidden_states_from_large = memory
-        else:
-            start = self.block_size - cache_position[0]
-            hidden_states_from_large_zeros=torch.zeros_like(hidden_states[:,:start,:])
-            hidden_states_from_large = torch.cat((hidden_states_from_large_zeros,memory),dim=1)
-        hidden_states = hidden_states + hidden_states_from_large
+        # if cache_position[-1]<self.block_size:
+        #     hidden_states_from_large = torch.zeros_like(hidden_states)
+        # elif cache_position[0]>self.block_size:
+        #     hidden_states_from_large = memory
+        # else:
+        #     start = self.block_size - cache_position[0]
+        #     hidden_states_from_large_zeros=torch.zeros_like(hidden_states[:,:start,:])
+        #     hidden_states_from_large = torch.cat((hidden_states_from_large_zeros,memory),dim=1)
+        # hidden_states = hidden_states + hidden_states_from_large
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
