@@ -1831,8 +1831,7 @@ class DualMistralModelSmallDecoder(nn.Module):
         else:
             start = self.block_size - cache_position[0]
             hidden_states_from_large_zeros=torch.zeros_like(hidden_states[:,:start,:])
-            hidden_states_from_large_filtered=memory[:,start:,:]
-            hidden_states_from_large = torch.cat((hidden_states_from_large_zeros,hidden_states_from_large_filtered),dim=1)
+            hidden_states_from_large = torch.cat((hidden_states_from_large_zeros,memory),dim=1)
         hidden_states = hidden_states + hidden_states_from_large
 
         # decoder layers
