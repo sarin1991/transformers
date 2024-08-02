@@ -926,7 +926,7 @@ class MistralCrossFlashAttention2(MistralCrossAttention):
             use_sliding_windows=use_sliding_windows,
         )
 
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size_small).contiguous()
         attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
@@ -2084,7 +2084,10 @@ class DualMistralModel(DualMistralPreTrainedModel):
         kwargs = {}
         kwargs['gradient_checkpointing'] = self.gradient_checkpointing
         kwargs['training'] = self.training
-        kwargs['_gradient_checkpointing_func'] = self._gradient_checkpointing_func
+        if self.gradient_checkpointing:
+            kwargs['_gradient_checkpointing_func'] = self._gradient_checkpointing_func
+        else:
+            kwargs['_gradient_checkpointing_func'] = None
         output_large = None
         if use_cache:
             input_ids_small, _ = past_key_values.update(key_states=input_ids,value_states=input_ids,layer_idx=0)
