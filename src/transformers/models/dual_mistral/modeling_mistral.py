@@ -706,7 +706,7 @@ class MistralCrossAttention(nn.Module):
         self.hidden_size_large = config.hidden_size_large
         self.hidden_size_small = config.hidden_size_small
         self.num_heads = config.num_cross_attention_heads_small
-        self.head_dim = self.hidden_size_small // self.num_heads
+        self.head_dim = config.cross_head_dim
         self.num_key_value_heads = config.num_key_value_heads_small
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
