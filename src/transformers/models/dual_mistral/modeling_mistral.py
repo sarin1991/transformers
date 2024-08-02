@@ -713,11 +713,6 @@ class MistralCrossAttention(nn.Module):
         self.rope_theta = config.rope_theta
         self.is_causal = True
 
-        if (self.head_dim * self.num_heads) != self.hidden_size_small:
-            raise ValueError(
-                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size_small}"
-                f" and `num_heads`: {self.num_heads})."
-            )
         self.q_proj = nn.Linear(self.hidden_size_small, self.num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(self.hidden_size_large, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(self.hidden_size_large, self.num_key_value_heads * self.head_dim, bias=False)
