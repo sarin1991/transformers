@@ -107,7 +107,6 @@ class DualMistralConfig(PretrainedConfig):
         num_hidden_layers_large=32,
         num_attention_heads_small=32,
         num_cross_attention_heads_small=32,
-        cross_head_dim=128,
         num_attention_heads_large=32,
         num_key_value_heads_small=8,
         num_key_value_heads_large=8,
@@ -137,7 +136,6 @@ class DualMistralConfig(PretrainedConfig):
         self.num_hidden_layers_large = num_hidden_layers_large
         self.num_attention_heads_small = num_attention_heads_small
         self.num_cross_attention_heads_small = num_cross_attention_heads_small
-        self.cross_head_dim = cross_head_dim
         self.num_attention_heads_large = num_attention_heads_large
         self.sliding_window = sliding_window
 

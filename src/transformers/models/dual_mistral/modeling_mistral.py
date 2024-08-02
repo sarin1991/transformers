@@ -706,13 +706,18 @@ class MistralCrossAttention(nn.Module):
         self.hidden_size_large = config.hidden_size_large
         self.hidden_size_small = config.hidden_size_small
         self.num_heads = config.num_cross_attention_heads_small
-        self.head_dim = config.cross_head_dim
+        self.head_dim = self.hidden_size_small // self.num_heads
         self.num_key_value_heads = config.num_key_value_heads_small
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         self.is_causal = True
 
+        if (self.head_dim * self.num_heads) != self.hidden_size_small:
+            raise ValueError(
+                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size_small}"
+                f" and `num_heads`: {self.num_heads})."
+            )
         self.q_proj = nn.Linear(self.hidden_size_small, self.num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(self.hidden_size_large, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(self.hidden_size_large, self.num_key_value_heads * self.head_dim, bias=False)
