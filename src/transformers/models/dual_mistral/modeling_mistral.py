@@ -1307,6 +1307,7 @@ class DualMistralSmallDecoderLayer(nn.Module):
         # Cross Attention
         residual = hidden_states
         hidden_states = self.post_self_attention_layernorm(hidden_states)
+        print(cache_position,self.block_size)
         if cache_position[-1]<self.block_size:
             hidden_states = torch.zeros_like(hidden_states)
         elif cache_position[0]>self.block_size:
@@ -2090,9 +2091,27 @@ class DualMistralModel(DualMistralPreTrainedModel):
             kwargs['_gradient_checkpointing_func'] = None
         output_large = None
         if use_cache:
-            input_ids_small, _ = past_key_values.update(key_states=input_ids,value_states=input_ids,layer_idx=0)
+            _, input_ids_small = past_key_values.update(key_states=input_ids[:,:,None],value_states=input_ids,layer_idx=0)
             inputs_ids_small_len = past_key_values.get_seq_length(0)
-            inputs_ids_large_len = past_key_values.get_seq_length(1)
+            #initialize cache
+            if len(past_key_values)<=1:
+                inputs_ids_large_len = 0
+                # initialize large decoder embedding
+                past_key_values.update(key_states=input_ids[:,:,None],value_states=None,layer_idx=1) #dummy values
+                # initialize large decoder cache
+                base_layer_idx = 2
+                for layer_idx in range(base_layer_idx,base_layer_idx+self.config.num_hidden_layers_large):
+                    past_key_values.update(key_states=input_ids[:,:,None],value_states=None,layer_idx=layer_idx) #dummy values
+                base_layer_idx=2+self.config.num_hidden_layers_large
+                # intialize small decoder cache
+                for layer_idx in range(base_layer_idx, base_layer_idx+2*self.config.num_hidden_layers_small,2):
+                    past_key_values.update(key_states=input_ids[:,:,None],value_states=None,layer_idx=layer_idx) #self attn dummy values
+                    past_key_values.update(key_states=input_ids[:,:,None],value_states=None,layer_idx=layer_idx) #cross attn dummy values
+            _, memory = past_key_values[1]
+            if not memory: #dummy value
+                inputs_ids_large_len = 0
+            else:
+                inputs_ids_large_len = past_key_values.get_seq_length(1)  
             if inputs_ids_large_len+self.block_size<inputs_ids_small_len:
                 # Run large decoder
                 input_ids_large = input_ids_small[inputs_ids_large_len:]
@@ -2110,9 +2129,8 @@ class DualMistralModel(DualMistralPreTrainedModel):
                     kwargs = kwargs,
                 )
                 memory = output_large.last_hidden_state
-                past_key_values.update(key_states=input_ids_large,value_states=memory,layer_idx=1)
-            # Get memory filtered with cache
-            input_ids_large, memory = past_key_values[1]
+                past_key_values.update(key_states=input_ids_large[:,:,None],value_states=memory,layer_idx=1)
+            _, memory = past_key_values[1]
         else:
             # Run large decoder
             input_ids_large = input_ids
