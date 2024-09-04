@@ -360,7 +360,7 @@ class DynamicCache(Cache):
             self.key_cache.append(key_states)
             self.value_cache.append(value_states)
         else:
-            if not self.value_cache[layer_idx]: #dummy value
+            if isinstance(self.value_cache[layer_idx],type(None)): #dummy value
                 self.key_cache[layer_idx] = key_states
                 self.value_cache[layer_idx] = value_states
             else:
