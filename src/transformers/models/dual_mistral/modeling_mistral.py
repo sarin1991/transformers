@@ -1257,7 +1257,6 @@ class LargeToSmallMLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size_all, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size_small, bias=False)
         self.act_fn = ACT2FN[config.hidden_act_small]
-
     def forward(self, hidden_state_small, hidden_state_large):
         hidden_state_all = torch.cat((hidden_state_small,hidden_state_large),dim=2)
         hidden_state_intermediate =  self.act_fn(self.gate_proj(hidden_state_all)) * self.up_proj(hidden_state_all)
@@ -1809,12 +1808,12 @@ class DualMistralModelSmallDecoder(nn.Module):
         B, L, SD = hidden_states.shape
         LD = self.config.hidden_size_large
         if cache_position[-1]<self.block_size:
-            memory_large = torch.zeros((B,L,LD),device=hidden_states.device)
+            memory_large = torch.zeros((B,L,LD),device=inputs_embeds.device)
         elif cache_position[0]>self.block_size:
             memory_large = memory
         else:
             start = self.block_size - cache_position[0]
-            memory_zeros = torch.zeros((B,start,LD),device=hidden_states.device)
+            memory_zeros = torch.zeros((B,start,LD),device=inputs_embeds.device)
             memory_large = torch.cat((memory_zeros,memory),dim=1)
 
         # decoder layers
