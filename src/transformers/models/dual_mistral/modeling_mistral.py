@@ -1252,7 +1252,7 @@ class LargeToSmallMLP(nn.Module):
         self.hidden_size_small = config.hidden_size_small
         self.hidden_size_large = config.hidden_size_large
         self.hidden_size_all = self.hidden_size_large + self.hidden_size_small
-        self.intermediate_size = config.intermediate_size_small + config.intermediate_size_large
+        self.intermediate_size = config.intermediate_size_small
         self.gate_proj = nn.Linear(self.hidden_size_all, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size_all, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size_small, bias=False)
