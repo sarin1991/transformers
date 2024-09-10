@@ -1251,14 +1251,14 @@ class LargeToSmallMLP(nn.Module):
         self.config = config
         self.hidden_size_small = config.hidden_size_small
         self.hidden_size_large = config.hidden_size_large
-        self.hidden_size_all = self.hidden_size_large + self.hidden_size_small
         self.intermediate_size = config.intermediate_size_small
-        self.gate_proj = nn.Linear(self.hidden_size_all, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size_all, self.intermediate_size, bias=False)
+        self.large_proj = nn.Linear(self.hidden_size_large,self.hidden_size_small)
+        self.gate_proj = nn.Linear(self.hidden_size_small, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size_small, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size_small, bias=False)
         self.act_fn = ACT2FN[config.hidden_act_small]
     def forward(self, hidden_state_small, hidden_state_large):
-        hidden_state_all = torch.cat((hidden_state_small,hidden_state_large),dim=2)
+        hidden_state_all = self.large_proj(hidden_state_large) + hidden_state_small
         hidden_state_intermediate =  self.act_fn(self.gate_proj(hidden_state_all)) * self.up_proj(hidden_state_all)
         return self.down_proj(hidden_state_intermediate)
 
