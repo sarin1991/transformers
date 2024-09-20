@@ -2106,7 +2106,7 @@ class DualMistralModel(DualMistralPreTrainedModel):
                 # intialize small decoder cache
                 for layer_idx in range(base_layer_idx, base_layer_idx+2*self.config.num_hidden_layers_small,2):
                     past_key_values.update(key_states=input_ids[:,:,None],value_states=None,layer_idx=layer_idx) #self attn dummy values
-                    past_key_values.update(key_states=input_ids[:,:,None],value_states=None,layer_idx=layer_idx) #cross attn dummy values
+                    past_key_values.update(key_states=input_ids[:,:,None],value_states=None,layer_idx=layer_idx+1) #cross attn dummy values
             _, memory = past_key_values[1]
             if isinstance(memory,type(None)): #dummy value
                 inputs_ids_large_len = 0
