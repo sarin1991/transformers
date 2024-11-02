@@ -1266,6 +1266,7 @@ class DualMistralSmallDecoderLayer(nn.Module):
             hidden_size=config.hidden_size_small, num_attention_heads=config.num_attention_heads_small, 
             num_key_value_heads=config.num_key_value_heads_small,
             config=config, layer_idx=layer_idx)
+        self.cross_attn = MISTRAL_CROSS_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx+1)
 
         self.mlp = LargeToSmallMLP(config)
         self.input_layernorm = MistralRMSNorm(config.hidden_size_small, eps=config.rms_norm_eps)
