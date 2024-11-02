@@ -706,22 +706,17 @@ class MistralCrossAttention(nn.Module):
         self.hidden_size_large = config.hidden_size_large
         self.hidden_size_small = config.hidden_size_small
         self.num_heads = config.num_cross_attention_heads_small
-        self.head_dim = self.hidden_size_small // self.num_heads
-        self.num_key_value_heads = config.num_key_value_heads_small
+        self.head_dim = config.cross_attention_head_dim
+        self.num_key_value_heads = config.cross_attention_num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         self.is_causal = True
 
-        if (self.head_dim * self.num_heads) != self.hidden_size_small:
-            raise ValueError(
-                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size_small}"
-                f" and `num_heads`: {self.num_heads})."
-            )
         self.q_proj = nn.Linear(self.hidden_size_small, self.num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(self.hidden_size_large, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(self.hidden_size_large, self.num_key_value_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.hidden_size_small, self.hidden_size_small, bias=False)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size_small, bias=False)
 
         self.rotary_emb = MistralRotaryEmbedding(
             self.head_dim,
@@ -1309,6 +1304,21 @@ class DualMistralSmallDecoderLayer(nn.Module):
 
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+        )
+        hidden_states = residual + hidden_states
+
+        # Cross Attention
+        residual = hidden_states
+        hidden_states = self.post_self_attention_layernorm(hidden_states)
+        hidden_states, self_attn_weights, present_key_value = self.cross_attn(
+            memory=memory,
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
