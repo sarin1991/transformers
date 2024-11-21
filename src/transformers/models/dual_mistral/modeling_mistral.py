@@ -1355,10 +1355,10 @@ MISTRAL_START_DOCSTRING = r"""
     MISTRAL_START_DOCSTRING,
 )
 class DualMistralPreTrainedModel(PreTrainedModel):
-    config_class = MistralConfig
+    config_class = DualMistralConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["MistralDecoderLayer"]
+    _no_split_modules = ["DualMistralLargeDecoderLayer","DualMistralSmallDecoderLayer"]
     _skip_keys_device_placement = "past_key_values"
     _supports_flash_attn_2 = True
     _supports_sdpa = True
