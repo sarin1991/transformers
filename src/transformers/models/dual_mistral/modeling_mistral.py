@@ -1245,6 +1245,23 @@ class DualMistralLargeDecoderLayer(nn.Module):
 
         return outputs
 
+class LargeToSmallMLP(nn.Module):
+    def __init__(self, config: DualMistralConfig):
+        super().__init__()
+        self.config = config
+        self.hidden_size_small = config.hidden_size_small
+        self.hidden_size_large = config.hidden_size_large
+        self.hidden_size_all = self.hidden_size_large + self.hidden_size_small
+        self.intermediate_size = config.intermediate_size_small + config.intermediate_size_large
+        self.gate_proj = nn.Linear(self.hidden_size_all, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size_all, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size_small, bias=False)
+        self.act_fn = ACT2FN[config.hidden_act_small]
+
+    def forward(self, hidden_state_small, hidden_state_large):
+        hidden_state_all = torch.cat((hidden_state_small,hidden_state_large),dim=2)
+        hidden_state_intermediate =  self.act_fn(self.gate_proj(hidden_state_all)) * self.up_proj(hidden_state_all)
+        return self.down_proj(hidden_state_intermediate)
 
 class DualMistralSmallDecoderLayer(nn.Module):
     def __init__(self, config: DualMistralConfig, layer_idx: int):
@@ -1255,9 +1272,8 @@ class DualMistralSmallDecoderLayer(nn.Module):
             hidden_size=config.hidden_size_small, num_attention_heads=config.num_attention_heads_small, 
             num_key_value_heads=config.num_key_value_heads_small,
             config=config, layer_idx=layer_idx)
-        self.cross_attn = MISTRAL_CROSS_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx+1)
 
-        self.mlp = MistralMLPSmall(config)
+        self.mlp = LargeToSmallMLP(config)
         self.input_layernorm = MistralRMSNorm(config.hidden_size_small, eps=config.rms_norm_eps)
         self.post_self_attention_layernorm = MistralRMSNorm(config.hidden_size_small, eps=config.rms_norm_eps)
         self.post_attention_layernorm = MistralRMSNorm(config.hidden_size_small, eps=config.rms_norm_eps)
@@ -1304,44 +1320,10 @@ class DualMistralSmallDecoderLayer(nn.Module):
         )
         hidden_states = residual + hidden_states
 
-        # Cross Attention
-        residual = hidden_states
-        hidden_states = self.post_self_attention_layernorm(hidden_states)
-        if cache_position[-1]<self.block_size:
-            hidden_states = torch.zeros_like(hidden_states)
-        elif cache_position[0]>=self.block_size:
-            hidden_states, self_attn_weights, present_key_value = self.cross_attn(
-                memory=memory,
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                cache_position=cache_position,
-            )
-        else:
-            start = self.block_size - cache_position[0]
-            hidden_states_zeros=torch.zeros_like(hidden_states[:,:start,:])
-            hidden_states_filtered=hidden_states[:,start:,:]
-            position_ids_filtered = position_ids[:,:-start]
-            hidden_states_filtered, self_attn_weights, present_key_value = self.cross_attn(
-                memory=memory,
-                hidden_states=hidden_states_filtered,
-                attention_mask=attention_mask,
-                position_ids=position_ids_filtered,
-                past_key_value=past_key_value,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                cache_position=cache_position,
-            )
-            hidden_states = torch.cat((hidden_states_zeros,hidden_states_filtered),dim=1)
-        hidden_states = residual + hidden_states
-
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_state_small=hidden_states,hidden_state_large=memory)
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
@@ -1823,16 +1805,17 @@ class DualMistralModelSmallDecoder(nn.Module):
         )
 
         hidden_states = inputs_embeds
-        # Initialize hidden states
-        # if cache_position[-1]<self.block_size:
-        #     hidden_states_from_large = torch.zeros_like(hidden_states)
-        # elif cache_position[0]>self.block_size:
-        #     hidden_states_from_large = memory
-        # else:
-        #     start = self.block_size - cache_position[0]
-        #     hidden_states_from_large_zeros=torch.zeros_like(hidden_states[:,:start,:])
-        #     hidden_states_from_large = torch.cat((hidden_states_from_large_zeros,memory),dim=1)
-        # hidden_states = hidden_states + hidden_states_from_large
+        # Initialize hidden states large
+        B, L, SD = hidden_states.shape
+        LD = self.config.hidden_size_large
+        if cache_position[-1]<self.block_size:
+            memory_large = torch.zeros((B,L,LD),device=hidden_states.device)
+        elif cache_position[0]>self.block_size:
+            memory_large = memory
+        else:
+            start = self.block_size - cache_position[0]
+            memory_zeros = torch.zeros((B,start,LD),device=hidden_states.device)
+            memory_large = torch.cat((memory_zeros,memory),dim=1)
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -1846,7 +1829,7 @@ class DualMistralModelSmallDecoder(nn.Module):
             if gradient_checkpointing and training:
                 layer_outputs = _gradient_checkpointing_func(
                     decoder_layer.__call__,
-                    memory,
+                    memory_large,
                     hidden_states,
                     causal_mask,
                     position_ids,
@@ -1857,7 +1840,7 @@ class DualMistralModelSmallDecoder(nn.Module):
                 )
             else:
                 layer_outputs = decoder_layer(
-                    memory,
+                    memory_large,
                     hidden_states,
                     attention_mask=causal_mask,
                     position_ids=position_ids,
