@@ -971,7 +971,7 @@ class DualMambaModel(DualMambaPreTrainedModel):
     """,
     MAMBA2_START_DOCSTRING,
 )
-class DualMambaCausalLM(DualMambaPreTrainedModel, GenerationMixin):
+class DualMambaForCausalLM(DualMambaPreTrainedModel, GenerationMixin):
     _tied_weights_keys = []
 
     def __init__(self, config):

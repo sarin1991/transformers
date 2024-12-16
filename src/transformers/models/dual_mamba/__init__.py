@@ -22,7 +22,7 @@ from ...utils import (
 
 
 _import_structure = {
-    "configuration_mamba2": ["DualMambaConfig", "Mamba2OnnxConfig"],
+    "configuration_dual_mamba": ["DualMambaConfig", "Mamba2OnnxConfig"],
 }
 
 try:
@@ -31,10 +31,10 @@ try:
 except OptionalDependencyNotAvailable:
     pass
 else:
-    _import_structure["modeling_mamba2"] = [
-        "Mamba2ForCausalLM",
-        "Mamba2Model",
-        "Mamba2PreTrainedModel",
+    _import_structure["modeling_dual_mamba"] = [
+        "DualMambaForCausalLM",
+        "DualMambaModel",
+        "DualMambaPreTrainedModel",
     ]
 
 
@@ -47,10 +47,10 @@ if TYPE_CHECKING:
     except OptionalDependencyNotAvailable:
         pass
     else:
-        from .modeling_mamba2 import (
-            Mamba2ForCausalLM,
-            Mamba2Model,
-            Mamba2PreTrainedModel,
+        from .modeling_dual_mamba import (
+            DualMambaForCausalLM,
+            DualMambaModel,
+            DualMambaPreTrainedModel,
         )
 else:
     import sys

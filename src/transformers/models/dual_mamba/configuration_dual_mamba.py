@@ -106,7 +106,7 @@ class DualMambaConfig(PretrainedConfig):
     >>> configuration = model.config
     ```"""
 
-    model_type = "mamba2"
+    model_type = "dual_mamba"
 
     def __init__(
         self,
