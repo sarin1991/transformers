@@ -132,7 +132,7 @@ class Mamba2Cache:
         self.seqlen_offset = 0
         self.dtype = dtype
         self.conv_kernel_size = config.conv_kernel
-        self.intermediate_size = int(config.expand * config.hidden_size)
+        self.intermediate_size = int(config.expand * config.hidden_size_large)
 
         self.conv_states = {
             i: torch.zeros(
@@ -150,8 +150,8 @@ class Mamba2Cache:
             )
             for i in range(config.num_hidden_layers_large)
         }
-        self.activation = config.hidden_act
-        self.act = ACT2FN[config.hidden_act]
+        self.activation = config.hidden_act_large
+        self.act = ACT2FN[config.hidden_act_large]
 
     def update_conv_state(
         self, layer_idx: int, new_conv_state: torch.Tensor, cache_position: torch.LongTensor
@@ -198,16 +198,16 @@ class Mamba2Mixer(nn.Module):
 
     def __init__(self, config: DualMambaConfig, layer_idx: int):
         super().__init__()
-        self.num_heads = config.num_heads
-        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_mamba_heads
+        self.hidden_size = config.hidden_size_large
         self.ssm_state_size = config.state_size
         self.conv_kernel_size = config.conv_kernel
         self.intermediate_size = int(config.expand * self.hidden_size)
         self.time_step_rank = int(config.time_step_rank)
         self.layer_idx = layer_idx
         self.use_conv_bias = config.use_conv_bias
-        self.activation = config.hidden_act
-        self.act = ACT2FN[config.hidden_act]
+        self.activation = config.hidden_act_large
+        self.act = ACT2FN[config.hidden_act_large]
 
         self.layer_norm_epsilon = config.layer_norm_epsilon
         self.rms_norm = config.rms_norm
@@ -626,12 +626,12 @@ class Mamba2RMSNorm(nn.Module):
 
 
 class Mamba2Block(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config: DualMambaConfig, layer_idx):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
         self.residual_in_fp32 = config.residual_in_fp32
-        self.norm = Mamba2RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.norm = Mamba2RMSNorm(config.hidden_size_large, eps=config.layer_norm_epsilon)
         self.mixer = Mamba2Mixer(config, layer_idx=layer_idx)
 
     def forward(
@@ -823,14 +823,14 @@ MAMBA2_INPUTS_DOCSTRING = r"""
     MAMBA2_START_DOCSTRING,
 )
 class Mamba2Model(Mamba2PreTrainedModel):
-    def __init__(self, config):
+    def __init__(self, config: DualMambaConfig):
         super().__init__(config)
 
-        self.embeddings = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.embeddings = nn.Embedding(config.vocab_size, config.hidden_size_large)
         self.layers = nn.ModuleList([Mamba2Block(config, layer_idx=idx) for idx in range(config.num_hidden_layers_large)])
 
         self.gradient_checkpointing = False
-        self.norm_f = Mamba2RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        self.norm_f = Mamba2RMSNorm(config.hidden_size_large, eps=config.layer_norm_epsilon)
         # Initialize weights and apply final processing
         self._register_load_state_dict_pre_hook(self.load_hook)
         self.post_init()
@@ -944,10 +944,10 @@ class Mamba2Model(Mamba2PreTrainedModel):
 class Mamba2ForCausalLM(Mamba2PreTrainedModel, GenerationMixin):
     _tied_weights_keys = []
 
-    def __init__(self, config):
+    def __init__(self, config: DualMambaConfig):
         super().__init__(config)
         self.backbone = Mamba2Model(config)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.hidden_size_large, config.vocab_size, bias=False)
         # Initialize weights and apply final processing
         self.post_init()
 

@@ -110,7 +110,8 @@ class DualMambaConfig(PretrainedConfig):
 
     def __init__(
         self,
-        num_heads=128,
+        block_size=4,
+        num_mamba_heads=128,
         head_dim=64,
         vocab_size=32768,
         hidden_size_small=4096,
@@ -130,7 +131,8 @@ class DualMambaConfig(PretrainedConfig):
         n_groups=8,
         use_bias=False,
         use_conv_bias=True,
-        hidden_act="silu",
+        hidden_act_small="silu",
+        hidden_act_large="silu",
         initializer_range=0.1,
         residual_in_fp32=True,
         time_step_rank="auto",
@@ -149,10 +151,11 @@ class DualMambaConfig(PretrainedConfig):
         rms_norm_eps=1e-6,
         **kwargs,
     ):
+        self.block_size=block_size
         self.vocab_size = vocab_size
         self.hidden_size_small = hidden_size_small
         self.intermediate_size_small = intermediate_size_small
-        self.hidden_size_small_large = hidden_size_large
+        self.hidden_size_large = hidden_size_large
         self.state_size = state_size
         self.num_hidden_layers_small = num_hidden_layers_small
         self.num_hidden_layers_large = num_hidden_layers_large
@@ -167,7 +170,8 @@ class DualMambaConfig(PretrainedConfig):
         self.pad_token_id = pad_token_id
         self.use_bias = use_bias
         self.use_conv_bias = use_conv_bias
-        self.hidden_act = hidden_act
+        self.hidden_act_small = hidden_act_small
+        self.hidden_act_large = hidden_act_large
         self.initializer_range = initializer_range
         self.time_step_rank = math.ceil(self.hidden_size / 16) if time_step_rank == "auto" else time_step_rank
         self.time_step_min = time_step_min
@@ -177,7 +181,7 @@ class DualMambaConfig(PretrainedConfig):
         self.residual_in_fp32 = residual_in_fp32
         self.use_cache = use_cache
         self.n_groups = n_groups
-        self.num_heads = num_heads
+        self.num_mamba_heads = num_mamba_heads
         self.head_dim = head_dim
         self.rms_norm = rms_norm
         self.state_size = state_size
