@@ -810,7 +810,7 @@ class DualMambaModel(DualMambaPreTrainedModel):
 
         self.large_decoder = Mamba2Model(config=config)
         self.small_decoder = MistralModel(config=config)
-        self.project = nn.Linear(config.hidden_size_large,config.hidden_size_small)
+        self.project = nn.Linear(config.hidden_size_large,config.hidden_size_small,bias=False)
 
         self.gradient_checkpointing = False
         self.post_init()
