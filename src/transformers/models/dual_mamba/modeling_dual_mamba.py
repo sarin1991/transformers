@@ -459,13 +459,14 @@ class DualMambaModel(DualMambaPreTrainedModel):
                 hidden_state_large_filled = torch.cat([hidden_state_large_zeros,
                                                        hidden_state_large[:,:end,:]],dim=1)
         # Run small decoder
-        memory = self.project(hidden_state_large_filled)
+        mistral_cache = None if isinstance(cache_params,type(None)) else cache_params.mistral_cache
+        memory = self.project(hidden_state_large_filled.to(torch.bfloat16))
         output_small = self.small_decoder(
             memory = memory,
             input_ids=input_ids,
             attention_mask = None,
             position_ids = None,
-            past_key_values = cache_params.mistral_cache,
+            past_key_values = mistral_cache,
             inputs_embeds = None,
             use_cache = use_cache,
             output_attentions = None,
