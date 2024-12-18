@@ -160,6 +160,7 @@ class DualMambaPreTrainedModel(PreTrainedModel):
     base_model_prefix = "backbone"
     _no_split_modules = ["Mamba2Block","MistralDecoderLayer"]
     supports_gradient_checkpointing = True
+    _supports_flash_attn_2 = True
     _is_stateful = True
 
     def _init_weights(self, module):
