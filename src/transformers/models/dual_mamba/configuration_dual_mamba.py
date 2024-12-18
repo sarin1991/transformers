@@ -173,7 +173,7 @@ class DualMambaConfig(PretrainedConfig):
         self.hidden_act_small = hidden_act_small
         self.hidden_act_large = hidden_act_large
         self.initializer_range = initializer_range
-        self.time_step_rank = math.ceil(self.hidden_size / 16) if time_step_rank == "auto" else time_step_rank
+        self.time_step_rank = math.ceil(self.hidden_size_large / 16) if time_step_rank == "auto" else time_step_rank
         self.time_step_min = time_step_min
         self.time_step_max = time_step_max
         self.time_step_floor = time_step_floor
