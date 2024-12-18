@@ -336,7 +336,7 @@ class DualMambaModel(DualMambaPreTrainedModel):
         return self.small_decoder.embeddings
 
     def set_input_embeddings(self, new_embeddings):
-        self.small_decoder.embeddings = new_embeddings
+        self.small_decoder.embed_tokens = new_embeddings
 
     @add_start_docstrings_to_model_forward(MAMBA2_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
@@ -366,7 +366,7 @@ class DualMambaModel(DualMambaPreTrainedModel):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         if inputs_embeds is None:
-            inputs_embeds = self.small_decoder.embeddings(input_ids)
+            inputs_embeds = self.small_decoder.embed_tokens(input_ids)
 
         if self.gradient_checkpointing and self.training and use_cache:
             use_cache = False
