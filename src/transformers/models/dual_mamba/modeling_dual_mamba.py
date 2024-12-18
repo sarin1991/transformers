@@ -478,7 +478,7 @@ class DualMambaModel(DualMambaPreTrainedModel):
         return DualMambaOutput(
             last_hidden_state=output_small.last_hidden_state,
             cache_params=cache_params,
-            hidden_states=output_small.all_hidden_states,
+            hidden_states=output_small.hidden_states,
         )
 
 
