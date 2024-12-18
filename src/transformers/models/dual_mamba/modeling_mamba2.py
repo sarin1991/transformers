@@ -146,7 +146,7 @@ class Mamba2Cache:
         }
         self.ssm_states = {
             i: torch.zeros(
-                batch_size, config.num_heads, config.head_dim, config.state_size, device=device, dtype=dtype
+                batch_size, config.num_mamba_heads, config.head_dim, config.state_size, device=device, dtype=dtype
             )
             for i in range(config.num_hidden_layers_large)
         }
@@ -672,7 +672,7 @@ class Mamba2PreTrainedModel(PreTrainedModel):
             module.D._no_weight_decay = True
 
             dt = torch.exp(
-                torch.rand(self.config.num_heads)
+                torch.rand(self.config.num_mamba_heads)
                 * (math.log(self.config.time_step_max) - math.log(self.config.time_step_min))
                 + math.log(self.config.time_step_min)
             ).clamp(min=self.config.time_step_floor)
