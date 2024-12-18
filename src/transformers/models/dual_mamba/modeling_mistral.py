@@ -20,7 +20,7 @@
 """PyTorch Mistral model."""
 
 import math
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Dict
 
 import torch
 import torch.utils.checkpoint
@@ -721,6 +721,7 @@ class MistralModel(MistralPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        kwargs : Dict = {},
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -742,6 +743,9 @@ class MistralModel(MistralPreTrainedModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+
+        self.gradient_checkpointing = kwargs['gradient_checkpointing']
+        self.training = kwargs['training']
 
         # kept for BC (non `Cache` `past_key_values` inputs)
         return_legacy_cache = False
