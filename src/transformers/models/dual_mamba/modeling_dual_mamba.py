@@ -38,7 +38,7 @@ from .configuration_dual_mamba import DualMambaConfig
 from .modeling_mamba2 import Mamba2Cache
 from ...cache_utils import DynamicCache
 from .modeling_mistral import MistralModel
-from .modeling_mamba2 import Mamba2Model
+from .modeling_mamba2 import Mamba2Model, Mamba2Mixer
 
 logger = logging.get_logger(__name__)
 
@@ -156,9 +156,9 @@ class DualMambaPreTrainedModel(PreTrainedModel):
     models.
     """
 
-    config_class = Mamba2Config
+    config_class = DualMambaConfig
     base_model_prefix = "backbone"
-    _no_split_modules = ["Mamba2Block"]
+    _no_split_modules = ["Mamba2Block","MistralDecoderLayer"]
     supports_gradient_checkpointing = True
     _is_stateful = True
 
