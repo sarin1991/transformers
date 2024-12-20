@@ -700,6 +700,7 @@ class HybridLLMCausalOutput(ModelOutput):
     logits: Optional[torch.FloatTensor] = None
     cache_params: Optional[HybridLLMCache] = None
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    attentions: Optional[Tuple[torch.FloatTensor]] = None
 
 class HybridLLMModel(HybridLLMPreTrainedModel):
     """
