@@ -21,7 +21,7 @@ from ...utils import (
 
 
 _import_structure = {
-    "configuration_hybrid_llms": ["HybridLLMConfig"],
+    "configuration_hybrid_llm": ["HybridLLMConfig"],
 }
 
 
@@ -31,7 +31,7 @@ try:
 except OptionalDependencyNotAvailable:
     pass
 else:
-    _import_structure["modeling_hybrid_llms"] = [
+    _import_structure["modeling_hybrid_llm"] = [
         "HybridLLMForCausalLM",
         "HybridLLMModel",
         "HybridLLMPreTrainedModel",
