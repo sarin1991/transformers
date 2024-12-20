@@ -507,14 +507,14 @@ class HybridLLMDecoderBlock(nn.Module):
             block_output_filled = torch.zeros((B,L,D),dtype=hidden_states.dtype,device=hidden_states.device)
         elif cache_position[0]<self.block_size:
             start = 0
-            end = cache_position[-1]-self.block_size
+            end = cache_position[-1]+1-self.block_size
             block_output_zeros = torch.zeros((B,self.block_size-cache_position[0],D),
                                                     dtype=hidden_states.dtype,device=hidden_states.device)
             block_output_filled = torch.cat([block_output_zeros,
                                                     block_output[:,start:end,:]],dim=1)
         else:
             start = cache_position[0]-self.block_size
-            end = cache_position[-1]-self.block_size
+            end = cache_position[-1]+1-self.block_size
             block_output_filled = block_output[:,start:end,:]
     
         return block_output_filled
