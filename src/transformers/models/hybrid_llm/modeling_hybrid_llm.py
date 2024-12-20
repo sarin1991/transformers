@@ -347,6 +347,7 @@ class DecoderBlock(nn.Module):
     def __init__(self, config: HybridLLMConfig, intermediate_size: int,
                  num_layers: int):
         super().__init__()
+        self.config = config
         self.num_layers = num_layers
         self.layers = nn.ModuleList(
             [HybridLLMDecoderLayer(config, intermediate_size, layer_idx) for layer_idx in range(num_layers)]
@@ -404,6 +405,7 @@ class HybridLLMDecoderBlock(nn.Module):
     def __init__(self, config: HybridLLMConfig, block_size: int, intermediate_size: int,
                  num_layers: int, rotary_emb: HybridLLMRotaryEmbedding):
         super().__init__()
+        self.config = config
         self.block_size = block_size
         self.num_layers = num_layers
         self.layers = nn.ModuleList(
