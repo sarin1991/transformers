@@ -541,7 +541,7 @@ class HybridLLMDecoderBlock(nn.Module):
         # For SDPA, when possible, we will rely on its `is_causal` argument instead of its `attn_mask` argument, in
         # order to dispatch on Flash Attention 2. This feature is not compatible with static cache, as SDPA will fail
         # to infer the attention mask.
-        past_seen_tokens = cache_params.past_seen_tokens
+        past_seen_tokens = cache_params.past_seen_tokens if cache_params else 0
         using_static_cache = False
         using_sliding_window_cache = False
         # When output attentions is True, sdpa implementation's forward method calls the eager implementation's forward
@@ -873,7 +873,7 @@ class HybridLLMModel(HybridLLMPreTrainedModel):
         # For SDPA, when possible, we will rely on its `is_causal` argument instead of its `attn_mask` argument, in
         # order to dispatch on Flash Attention 2. This feature is not compatible with static cache, as SDPA will fail
         # to infer the attention mask.
-        past_seen_tokens = cache_params.past_seen_tokens
+        past_seen_tokens = cache_params.past_seen_tokens if cache_params else 0
         using_static_cache = False
         using_sliding_window_cache = False
         # When output attentions is True, sdpa implementation's forward method calls the eager implementation's forward
