@@ -362,7 +362,7 @@ class DecoderBlock(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         runtime_kwargs: Optional[Dict] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
-        **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
+        **kwargs: Unpack[FlashAttentionKwargs],
     ) -> torch.FloatTensor:
         
         gradient_checkpointing = runtime_kwargs['gradient_checkpointing']
@@ -393,7 +393,7 @@ class DecoderBlock(nn.Module):
                     use_cache=use_cache,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
-                    **flash_attn_kwargs,
+                    **kwargs,
                 )
 
             hidden_states = layer_outputs[0]
