@@ -808,15 +808,15 @@ class HybridLLMModel(HybridLLMPreTrainedModel):
             hidden_states,
             causal_mask,
             position_ids,
-            cache_params.pre_blocks_cache,
+            cache_params.pre_blocks_cache if cache_params else None,
             use_cache,
             cache_position,
             runtime_kwargs,
             position_embeddings
             **flash_attn_kwargs,
         )
-
-        for block, block_cache in zip(self.blocks,cache_params.block_caches):
+        block_caches = cache_params.block_caches if cache_params else [None for _ in self.blocks]
+        for block, block_cache in zip(self.blocks,block_caches):
             block_hidden_states = block(
                 hidden_states,
                 block_cache,
@@ -831,7 +831,7 @@ class HybridLLMModel(HybridLLMPreTrainedModel):
             hidden_states,
             causal_mask,
             position_ids,
-            cache_params.post_blocks_cache,
+            cache_params.post_blocks_cache if cache_params else None,
             use_cache,
             cache_position,
             runtime_kwargs,
@@ -873,7 +873,7 @@ class HybridLLMModel(HybridLLMPreTrainedModel):
         # For SDPA, when possible, we will rely on its `is_causal` argument instead of its `attn_mask` argument, in
         # order to dispatch on Flash Attention 2. This feature is not compatible with static cache, as SDPA will fail
         # to infer the attention mask.
-        past_seen_tokens = cache_params.past_seen_tokens if cache_params else 0
+        past_seen_tokens = cache_params.pre_blocks_cache.past_seen_tokens if cache_params else 0
         using_static_cache = False
         using_sliding_window_cache = False
         # When output attentions is True, sdpa implementation's forward method calls the eager implementation's forward
