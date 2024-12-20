@@ -713,12 +713,13 @@ class HybridLLMModel(HybridLLMPreTrainedModel):
         self.vocab_size = config.vocab_size
 
         self.rotary_emb = HybridLLMRotaryEmbedding(config=config)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.pre_blocks = DecoderBlock(config, config.pre_intermediate_size,
                                     config.num_pre_hidden_layers)
         self.blocks = nn.ModuleList(
-            [HybridLLMDecoderBlock(config, hybrid_block_config.block_size, hybrid_block_config.intermediate_size,
-                                    hybrid_block_config.num_layers,
-                                    self.embed_tokens) for  hybrid_block_config in config.hybrid_block_configs]
+            [HybridLLMDecoderBlock(config, hybrid_block_config['block_size'], hybrid_block_config['intermediate_size'],
+                                    hybrid_block_config['num_layers'],
+                                    self.rotary_emb) for  hybrid_block_config in config.hybrid_block_configs]
         )
         self.post_blocks = DecoderBlock(config, config.post_intermediate_size,
                                     config.num_post_hidden_layers)
