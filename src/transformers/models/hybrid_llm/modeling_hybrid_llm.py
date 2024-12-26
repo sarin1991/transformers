@@ -524,7 +524,7 @@ class HybridLLMDecoderBlock(nn.Module):
         attention_mask: torch.Tensor,
         input_tensor: torch.Tensor,
         cache_position: torch.Tensor,
-        cache_params: HybridLLMCache,
+        cache_params: DynamicCache,
         output_attentions: bool,
     ):
         if self.config._attn_implementation == "flash_attention_2":
@@ -543,7 +543,7 @@ class HybridLLMDecoderBlock(nn.Module):
         # For SDPA, when possible, we will rely on its `is_causal` argument instead of its `attn_mask` argument, in
         # order to dispatch on Flash Attention 2. This feature is not compatible with static cache, as SDPA will fail
         # to infer the attention mask.
-        past_seen_tokens = cache_params.past_seen_tokens if cache_params else 0
+        past_seen_tokens = cache_params.get_seq_length() if cache_params else 0
         using_static_cache = False
         using_sliding_window_cache = False
         # When output attentions is True, sdpa implementation's forward method calls the eager implementation's forward
@@ -876,7 +876,7 @@ class HybridLLMModel(HybridLLMPreTrainedModel):
         # For SDPA, when possible, we will rely on its `is_causal` argument instead of its `attn_mask` argument, in
         # order to dispatch on Flash Attention 2. This feature is not compatible with static cache, as SDPA will fail
         # to infer the attention mask.
-        past_seen_tokens = cache_params.pre_blocks_cache.past_seen_tokens if cache_params else 0
+        past_seen_tokens = cache_params.pre_blocks_cache.get_seq_length() if cache_params else 0
         using_static_cache = False
         using_sliding_window_cache = False
         # When output attentions is True, sdpa implementation's forward method calls the eager implementation's forward
