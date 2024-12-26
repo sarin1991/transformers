@@ -494,7 +494,10 @@ class HybridLLMDecoderBlock(nn.Module):
                     **flash_attn_kwargs,
                 )
             else:
-                block_output, _ = cache_params[self.num_layers+1]
+                if len(cache_params)>self.num_layers+1:
+                    block_output, _ = cache_params[self.num_layers+1]
+                else:
+                    block_output = None
         else:   
             block_output = self.run_block(
                 hidden_states=hidden_states,
