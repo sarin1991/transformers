@@ -232,7 +232,7 @@ class HybridLLMDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.self_attn = HybridLLMAttention(config=config, hidden_size=hidden_size, layer_idx=layer_idx)
-        self.mlp = HybridLLMMLP(config,intermediate_size)
+        self.mlp = HybridLLMMLP(config,hidden_size,intermediate_size)
         self.input_layernorm = HybridLLMRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = HybridLLMRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
 
