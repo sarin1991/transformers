@@ -804,7 +804,7 @@ class HybridLLMModel(HybridLLMPreTrainedModel):
         runtime_kwargs = {
             'gradient_checkpointing': self.gradient_checkpointing,
             'training': self.training,
-            '_gradient_checkpointing_func': self._gradient_checkpointing_func,
+            '_gradient_checkpointing_func': self._gradient_checkpointing_func if self.gradient_checkpointing and self.training else None,
         }
 
         hidden_states = self.pre_blocks(
