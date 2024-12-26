@@ -713,7 +713,7 @@ class HybridLLMDownProj(nn.Module):
         self.config = config
         self.cache_head_dim = config.cache_head_dim
         self.expansion_factor = config.expansion_factor
-        self.num_heads = config.hidden_size/config.cache_head_dim
+        self.num_heads = config.hidden_size//config.cache_head_dim
         self.gate_proj = nn.Linear(config.hidden_size, self.num_heads*config.expansion_factor, bias=False)
         self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
@@ -721,7 +721,7 @@ class HybridLLMDownProj(nn.Module):
     def forward(self, hidden_states, block_hidden_states):
         res = hidden_states
         B,L,D = hidden_states.shape
-        gate = F.silu(self.gate_proj(hidden_states)).reshape(B,L,self.num_heads,self.expansion_factor,1)
+        gate = F.silu(self.gate_proj(hidden_states)).reshape(B,L,self.num_heads,self.expansion_factor)
         block_hidden_states = block_hidden_states.reshape(B,L,self.num_heads,self.expansion_factor,self.cache_head_dim)
         proj = torch.einsum('blhe,blhec->blhc', gate, block_hidden_states).reshape(B,L,-1)
         out = res + self.o_proj(proj)
