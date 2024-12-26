@@ -2,6 +2,7 @@ from typing import Callable, List, Optional, Tuple, Union, Dict
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 from dataclasses import dataclass
 
 from ...activations import ACT2FN
@@ -51,10 +52,10 @@ class HybridLLMCache:
         self.device = device
 
 class HybridLLMMLP(nn.Module):
-    def __init__(self, config: HybridLLMConfig, intermediate_size: int):
+    def __init__(self, config: HybridLLMConfig, hidden_size: int, intermediate_size: int):
         super().__init__()
         self.config = config
-        self.hidden_size = config.hidden_size
+        self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
@@ -141,19 +142,19 @@ def eager_attention_forward(
 class HybridLLMAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: HybridLLMConfig, layer_idx: int):
+    def __init__(self, config: HybridLLMConfig, hidden_size: int, layer_idx: int):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.head_dim = getattr(config, "head_dim", hidden_size // config.num_attention_heads)
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
-        self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
+        self.q_proj = nn.Linear(hidden_size, config.num_attention_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, hidden_size, bias=False)
 
     def forward(
         self,
@@ -227,13 +228,13 @@ class HybridLLMRMSNorm(nn.Module):
 
 
 class HybridLLMDecoderLayer(nn.Module):
-    def __init__(self, config: HybridLLMConfig, intermediate_size: int, layer_idx: int):
+    def __init__(self, config: HybridLLMConfig, hidden_size: int, intermediate_size: int, layer_idx: int):
         super().__init__()
-        self.hidden_size = config.hidden_size
+        self.hidden_size = hidden_size
         self.self_attn = HybridLLMAttention(config=config, layer_idx=layer_idx)
         self.mlp = HybridLLMMLP(config,intermediate_size)
-        self.input_layernorm = HybridLLMRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = HybridLLMRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = HybridLLMRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = HybridLLMRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -350,7 +351,7 @@ class DecoderBlock(nn.Module):
         self.config = config
         self.num_layers = num_layers
         self.layers = nn.ModuleList(
-            [HybridLLMDecoderLayer(config, intermediate_size, layer_idx) for layer_idx in range(num_layers)]
+            [HybridLLMDecoderLayer(config, config.hidden_size, intermediate_size, layer_idx) for layer_idx in range(num_layers)]
         )
 
     def forward(
@@ -408,8 +409,9 @@ class HybridLLMDecoderBlock(nn.Module):
         self.config = config
         self.block_size = block_size
         self.num_layers = num_layers
+        self.hidden_size = config.expansion_factor*config.hidden_size
         self.layers = nn.ModuleList(
-            [HybridLLMDecoderLayer(config, intermediate_size, layer_idx) for layer_idx in range(1, 1 + num_layers)]
+            [HybridLLMDecoderLayer(config, self.hidden_size, intermediate_size, layer_idx) for layer_idx in range(1, 1 + num_layers)]
         )
         self.rotary_emb = rotary_emb
 
@@ -705,6 +707,26 @@ class HybridLLMCausalOutput(ModelOutput):
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
 
+class HybridLLMDownProj(nn.Module):
+    def __init__(self, config: HybridLLMConfig):
+        super().__init__()
+        self.config = config
+        self.cache_head_dim = config.cache_head_dim
+        self.expansion_factor = config.expansion_factor
+        self.num_heads = config.hidden_size/config.cache_head_dim
+        self.gate_proj = nn.Linear(config.hidden_size, self.num_heads*config.expansion_factor, bias=False)
+        self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, hidden_states, block_hidden_states):
+        res = hidden_states
+        B,L,D = hidden_states.shape
+        gate = F.silu(self.gate_proj(hidden_states)).reshape(B,L,self.num_heads,self.expansion_factor,1)
+        block_hidden_states = block_hidden_states.reshape(B,L,self.num_heads,self.expansion_factor,self.cache_head_dim)
+        proj = torch.einsum('blhe,blhec->blhc', gate, block_hidden_states).reshape(B,L,-1)
+        out = res + self.o_proj(proj)
+        return out
+
 class HybridLLMModel(HybridLLMPreTrainedModel):
     """
     Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`MistralDecoderLayer`]
@@ -722,11 +744,13 @@ class HybridLLMModel(HybridLLMPreTrainedModel):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.pre_blocks = DecoderBlock(config, config.pre_intermediate_size,
                                     config.num_pre_hidden_layers)
+        self.up_proj = nn.Linear(config.hidden_size,config.hidden_size*config.expansion_factor,bias=False)
         self.blocks = nn.ModuleList(
             [HybridLLMDecoderBlock(config, hybrid_block_config['block_size'], hybrid_block_config['intermediate_size'],
                                     hybrid_block_config['num_layers'],
                                     self.rotary_emb) for  hybrid_block_config in config.hybrid_block_configs]
         )
+        self.down_proj = HybridLLMDownProj(config)
         self.post_blocks = DecoderBlock(config, config.post_intermediate_size,
                                     config.num_post_hidden_layers)
         self.norm = HybridLLMRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -821,18 +845,20 @@ class HybridLLMModel(HybridLLMPreTrainedModel):
             position_embeddings,
             **flash_attn_kwargs,
         )
+        block_hidden_states = self.up_proj(hidden_states)
         block_caches = cache_params.block_caches if cache_params else [None for _ in self.blocks]
         for block, block_cache in zip(self.blocks,block_caches):
+            res = block_hidden_states
             block_hidden_states = block(
-                hidden_states,
+                block_hidden_states,
                 block_cache,
                 use_cache,
                 cache_position,
                 runtime_kwargs,
                 **flash_attn_kwargs,
             )
-            hidden_states = hidden_states + block_hidden_states
-
+            block_hidden_states = res + block_hidden_states
+        hidden_states = self.down_proj(hidden_states,block_hidden_states)
         hidden_states = self.post_blocks(
             hidden_states,
             causal_mask,

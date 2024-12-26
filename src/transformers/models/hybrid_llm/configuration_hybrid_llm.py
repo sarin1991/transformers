@@ -116,6 +116,8 @@ class HybridLLMConfig(PretrainedConfig):
         post_intermediate_size=3584,
         num_pre_hidden_layers=16,
         num_post_hidden_layers=16,
+        expansion_factor=2,
+        cache_head_dim=16,
         hybrid_block_configs = [
             {"block_size":8, "intermediate_size": 14336, "num_layers": 16},
             {"block_size":2, "intermediate_size": 7168, "num_layers": 16},
@@ -144,6 +146,8 @@ class HybridLLMConfig(PretrainedConfig):
         self.post_intermediate_size = post_intermediate_size
         self.num_pre_hidden_layers = num_pre_hidden_layers
         self.num_post_hidden_layers = num_post_hidden_layers
+        self.expansion_factor = expansion_factor
+        self.cache_head_dim = cache_head_dim
         self.hybrid_block_configs = hybrid_block_configs
         self.num_attention_heads = num_attention_heads
         self.sliding_window = sliding_window
