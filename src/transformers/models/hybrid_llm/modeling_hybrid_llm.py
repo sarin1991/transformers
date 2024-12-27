@@ -146,15 +146,17 @@ class HybridLLMAttention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.head_dim = hidden_size // config.num_attention_heads
-        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        self.head_dim = config.head_dim
+        self.num_attention_heads = hidden_size//self.head_dim
+        self.num_key_value_heads = config.num_key_value_heads * self.num_attention_heads // config.num_attention_heads
+        self.num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
-        self.q_proj = nn.Linear(hidden_size, config.num_attention_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(hidden_size, config.num_key_value_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, hidden_size, bias=False)
+        self.q_proj = nn.Linear(hidden_size, self.num_attention_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.num_attention_heads * self.head_dim, hidden_size, bias=False)
 
     def forward(
         self,
