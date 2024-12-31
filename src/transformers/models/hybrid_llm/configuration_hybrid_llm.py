@@ -112,6 +112,7 @@ class HybridLLMConfig(PretrainedConfig):
         self,
         vocab_size=32000,
         hidden_size=1024,
+        block_hidden_size=2048,
         pre_intermediate_size=3584,
         post_intermediate_size=3584,
         num_pre_hidden_layers=16,
@@ -142,6 +143,7 @@ class HybridLLMConfig(PretrainedConfig):
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
+        self.block_hidden_size = block_hidden_size
         self.pre_intermediate_size = pre_intermediate_size
         self.post_intermediate_size = post_intermediate_size
         self.num_pre_hidden_layers = num_pre_hidden_layers

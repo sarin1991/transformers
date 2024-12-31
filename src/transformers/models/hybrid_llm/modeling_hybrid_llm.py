@@ -411,10 +411,11 @@ class HybridLLMDecoderBlock(nn.Module):
         self.config = config
         self.block_size = block_size
         self.num_layers = num_layers
-        self.hidden_size = config.expansion_factor*config.hidden_size
+        self.block_proj = nn.Linear(config.hidden_size,config.block_hidden_size,bias=False)
         self.layers = nn.ModuleList(
-            [HybridLLMDecoderLayer(config, self.hidden_size, intermediate_size, layer_idx) for layer_idx in range(1, 1 + num_layers)]
+            [HybridLLMDecoderLayer(config, config.block_hidden_size, intermediate_size, layer_idx) for layer_idx in range(1, 1 + num_layers)]
         )
+        self.up_proj = nn.Linear(config.block_hidden_size,config.hidden_size*config.expansion_factor,bias=False)
         self.rotary_emb = rotary_emb
 
     def run_block(
@@ -441,6 +442,8 @@ class HybridLLMDecoderBlock(nn.Module):
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        hidden_states = self.block_proj(hidden_states)
 
         for decoder_layer in self.layers:
             if gradient_checkpointing and training:
@@ -469,6 +472,8 @@ class HybridLLMDecoderBlock(nn.Module):
                 )
 
             hidden_states = layer_outputs[0]
+        
+        hidden_states = self.up_proj(hidden_states)
 
         if use_cache:
             hidden_states_output, _ = cache_params.update(key_states=hidden_states,value_states=hidden_states,layer_idx=self.num_layers+1)
@@ -486,7 +491,8 @@ class HybridLLMDecoderBlock(nn.Module):
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> torch.FloatTensor:
 
-        B,L,D = hidden_states.shape
+        B,L,_ = hidden_states.shape
+        D = self.config.hidden_size*self.config.expansion_factor
         if use_cache:
             hidden_states_all, _ = cache_params.update(key_states=hidden_states,value_states=hidden_states,layer_idx=0)
             if cache_params.get_seq_length(1) + self.block_size < hidden_states_all.shape[1]:
@@ -746,7 +752,6 @@ class HybridLLMModel(HybridLLMPreTrainedModel):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.pre_blocks = DecoderBlock(config, config.pre_intermediate_size,
                                     config.num_pre_hidden_layers)
-        self.up_proj = nn.Linear(config.hidden_size,config.hidden_size*config.expansion_factor,bias=False)
         self.blocks = nn.ModuleList(
             [HybridLLMDecoderBlock(config, hybrid_block_config['block_size'], hybrid_block_config['intermediate_size'],
                                     hybrid_block_config['num_layers'],
@@ -847,7 +852,7 @@ class HybridLLMModel(HybridLLMPreTrainedModel):
             position_embeddings,
             **flash_attn_kwargs,
         )
-        block_hidden_states = self.up_proj(hidden_states)
+        block_hidden_states = hidden_states
         block_caches = cache_params.block_caches if cache_params else [None for _ in self.blocks]
         for block, block_cache in zip(self.blocks,block_caches):
             res = block_hidden_states
