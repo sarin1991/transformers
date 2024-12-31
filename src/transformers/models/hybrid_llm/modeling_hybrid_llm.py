@@ -852,19 +852,20 @@ class HybridLLMModel(HybridLLMPreTrainedModel):
             position_embeddings,
             **flash_attn_kwargs,
         )
-        block_hidden_states = hidden_states
+        res = None
         block_caches = cache_params.block_caches if cache_params else [None for _ in self.blocks]
         for block, block_cache in zip(self.blocks,block_caches):
-            res = block_hidden_states
             block_hidden_states = block(
-                block_hidden_states,
+                hidden_states,
                 block_cache,
                 use_cache,
                 cache_position,
                 runtime_kwargs,
                 **flash_attn_kwargs,
             )
-            block_hidden_states = res + block_hidden_states
+            if res:
+                block_hidden_states = res + block_hidden_states
+            res = block_hidden_states
         hidden_states = self.down_proj(hidden_states,block_hidden_states)
         hidden_states = self.post_blocks(
             hidden_states,
