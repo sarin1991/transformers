@@ -37,7 +37,8 @@ class HybridLLMCache:
         device: torch.device
 
     Attributes:
-        seqlen_offset: List[DynamicCache]
+        backbone_cache: DynamicCache
+        lag_caches: List[HybridLLMLayerCache]
         dtype: torch.dtype
         device: str
     """
@@ -45,11 +46,24 @@ class HybridLLMCache:
     def __init__(
         self, config: HybridLLMConfig, dtype: torch.dtype = torch.float16, device: Optional[str] = None
     ):
-        self.pre_blocks_cache = DynamicCache()
-        self.block_caches = [DynamicCache() for block_config in config.hybrid_block_configs]
-        self.post_blocks_cache = DynamicCache()
+        self.backbone_cache = DynamicCache()
+        self.lag_caches = [HybridLLMLayerCache(config) for _ in range(config.num_hidden_layers)]
         self.dtype = dtype
         self.device = device
+
+class HybridLLMLayerCache:
+    """
+    Arguments:
+        config: HybridLLMConfig
+    
+    Attributes:
+        layer_lag_caches: List[DynamicCache]
+    """
+
+    def __init__(
+        self, config: HybridLLMConfig
+    ):
+        self.layer_lag_caches = [DynamicCache() for block_config in config.hybrid_lag_configs]
 
 class HybridLLMMLP(nn.Module):
     def __init__(self, config: HybridLLMConfig, hidden_size: int, intermediate_size: int):
@@ -229,7 +243,7 @@ class HybridLLMRMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
-class HybridLLMDecoderLayer(nn.Module):
+class DecoderLayer(nn.Module):
     def __init__(self, config: HybridLLMConfig, hidden_size: int, intermediate_size: int, layer_idx: int):
         super().__init__()
         self.hidden_size = hidden_size
@@ -279,6 +293,85 @@ class HybridLLMDecoderLayer(nn.Module):
             outputs += (self_attn_weights,)
 
         return outputs
+
+class HybridLLMLagLayer(nn.Module):
+    def __init__(self, config: HybridLLMConfig, hidden_size: int, intermediate_size: int, step_size: int):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.step_size = step_size
+        self.mlp = HybridLLMMLP(config,hidden_size,intermediate_size)
+        self.input_layernorm = HybridLLMRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+
+    def run_layer(
+        self,
+        hidden_states: torch.Tensor,
+        cache_params: Optional[DynamicCache] = None,
+        use_cache: Optional[bool] = False,
+        **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        
+        past_seen_tokens = cache_params.get_seq_length() if cache_params is not None else 0
+        cache_position = torch.arange(
+            past_seen_tokens, past_seen_tokens + hidden_states.shape[1], device=hidden_states.device
+        )
+        position_ids = cache_position.unsqueeze(0)
+
+        # Fully Connected
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+
+        if use_cache:
+            hidden_states_output, _ = cache_params.update(key_states=hidden_states,value_states=hidden_states,layer_idx=1)
+        else:
+            hidden_states_output = hidden_states
+        return hidden_states_output
+    
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cache_params: Optional[DynamicCache] = None,
+        use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
+    ) -> torch.FloatTensor:
+
+        B,L,D = hidden_states.shape
+        if use_cache:
+            hidden_states_all, _ = cache_params.update(key_states=hidden_states,value_states=hidden_states,layer_idx=0)
+            if cache_params.get_seq_length(1) + self.step_size < hidden_states_all.shape[1]:
+                layer_output = self.run_layer(
+                    hidden_states=hidden_states_all[:,cache_params.get_seq_length(1):],
+                    cache_params = cache_params,
+                    use_cache = use_cache,
+                    **flash_attn_kwargs,
+                )
+            else:
+                if len(cache_params)>1:
+                    layer_output, _ = cache_params[1]
+                else:
+                    layer_output = None
+        else:   
+            layer_output = self.run_layer(
+                hidden_states=hidden_states,
+                cache_params = cache_params,
+                use_cache = use_cache,
+                **flash_attn_kwargs,
+            )
+        if cache_position[-1]<self.step_size:
+            layer_output_filled = torch.zeros((B,L,D),dtype=hidden_states.dtype,device=hidden_states.device)
+        elif cache_position[0]<self.step_size:
+            start = 0
+            end = cache_position[-1]+1-self.step_size
+            layer_output_zeros = torch.zeros((B,self.step_size-cache_position[0],D),
+                                                    dtype=hidden_states.dtype,device=hidden_states.device)
+            layer_output_filled = torch.cat([layer_output_zeros,
+                                                    layer_output[:,start:end,:]],dim=1)
+        else:
+            start = cache_position[0]-self.step_size
+            end = cache_position[-1]+1-self.step_size
+            layer_output_filled = layer_output[:,start:end,:]
+    
+        return layer_output_filled
 
 
 class HybridLLMRotaryEmbedding(nn.Module):
@@ -345,336 +438,63 @@ class HybridLLMRotaryEmbedding(nn.Module):
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
-
-class DecoderBlock(nn.Module):
-    def __init__(self, config: HybridLLMConfig, intermediate_size: int,
-                 num_layers: int):
+class HybridLLMDecoderLayer(nn.Module):
+    def __init__(self, config: HybridLLMConfig, layer_idx: int):
         super().__init__()
-        self.config = config
-        self.num_layers = num_layers
-        self.layers = nn.ModuleList(
-            [HybridLLMDecoderLayer(config, config.hidden_size, intermediate_size, layer_idx) for layer_idx in range(num_layers)]
-        )
+        hidden_size = config.hidden_size
+        intermediate_size = config.intermediate_size
+        self.layer_idx = layer_idx
+        self.decoder = DecoderLayer(config=config,hidden_size=hidden_size,intermediate_size=intermediate_size,layer_idx=layer_idx)
+        lag_layers = []
+        for lag_config in config.hybrid_lag_configs:
+            lag_layer = HybridLLMLagLayer(config=config, hidden_size=hidden_size,
+                                          intermediate_size=lag_config['intermediate_size'], step_size=lag_config['step_size'])
+            lag_layers.append(lag_layer)
+        self.lag_layers = nn.ModuleList(lag_layers)
 
     def forward(
         self,
-        hidden_states: torch.FloatTensor = None,
-        causal_mask: Optional[torch.Tensor] = None,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        cache_params: Optional[DynamicCache] = None,
-        use_cache: Optional[bool] = None,
+        cache_params: Optional[HybridLLMCache] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
-        runtime_kwargs: Optional[Dict] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
-        **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
-    ) -> torch.FloatTensor:
-        
-        gradient_checkpointing = runtime_kwargs['gradient_checkpointing']
-        training = runtime_kwargs['training']
-        _gradient_checkpointing_func = runtime_kwargs['_gradient_checkpointing_func']
-
-        for decoder_layer in self.layers:
-
-            if gradient_checkpointing and training:
-                layer_outputs = _gradient_checkpointing_func(
-                    decoder_layer.__call__,
-                    hidden_states,
-                    causal_mask,
-                    position_ids,
-                    cache_params,
-                    None,
-                    use_cache,
-                    cache_position,
-                    position_embeddings,
-                )
-            else:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_value=cache_params,
-                    output_attentions=None,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                    **flash_attn_kwargs,
-                )
-
-            hidden_states = layer_outputs[0]
-
-        return hidden_states
-
-class HybridLLMDecoderBlock(nn.Module):
-    def __init__(self, config: HybridLLMConfig, block_size: int, intermediate_size: int,
-                 num_layers: int, rotary_emb: HybridLLMRotaryEmbedding):
-        super().__init__()
-        self.config = config
-        self.block_size = block_size
-        self.num_layers = num_layers
-        self.block_proj = nn.Linear(config.hidden_size,config.block_hidden_size,bias=False)
-        self.layers = nn.ModuleList(
-            [HybridLLMDecoderLayer(config, config.block_hidden_size, intermediate_size, layer_idx) for layer_idx in range(1, 1 + num_layers)]
-        )
-        self.up_proj = nn.Linear(config.block_hidden_size,config.hidden_size*config.expansion_factor,bias=False)
-        self.rotary_emb = rotary_emb
-
-    def run_block(
-        self,
-        hidden_states: torch.Tensor,
-        cache_params: Optional[DynamicCache] = None,
-        use_cache: Optional[bool] = False,
-        runtime_kwargs: Optional[Dict] = None,
-        **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
+        **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        gradient_checkpointing = runtime_kwargs['gradient_checkpointing']
-        training = runtime_kwargs['training']
-        _gradient_checkpointing_func = runtime_kwargs['_gradient_checkpointing_func']
-
-        past_seen_tokens = cache_params.get_seq_length() if cache_params is not None else 0
-        cache_position = torch.arange(
-            past_seen_tokens, past_seen_tokens + hidden_states.shape[1], device=hidden_states.device
-        )
-        position_ids = cache_position.unsqueeze(0)
-
-        causal_mask = self._update_causal_mask(
-            None, hidden_states, cache_position, cache_params, False
-        )
-
-        # create position embeddings to be shared across the decoder layers
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
-
-        hidden_states = self.block_proj(hidden_states)
-
-        for decoder_layer in self.layers:
-            if gradient_checkpointing and training:
-                layer_outputs = _gradient_checkpointing_func(
-                    decoder_layer.__call__,
-                    hidden_states,
-                    causal_mask,
-                    position_ids,
-                    cache_params,
-                    False,
-                    use_cache,
-                    cache_position,
-                    position_embeddings,
-                )
-            else:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_value=cache_params,
-                    output_attentions=False,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                    **flash_attn_kwargs,
-                )
-
-            hidden_states = layer_outputs[0]
         
-        hidden_states = self.up_proj(hidden_states)
-
-        if use_cache:
-            hidden_states_output, _ = cache_params.update(key_states=hidden_states,value_states=hidden_states,layer_idx=self.num_layers+1)
-        else:
-            hidden_states_output = hidden_states
-        return hidden_states_output
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        cache_params: Optional[DynamicCache] = None,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        runtime_kwargs: Optional[Dict] = None,
-        **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
-    ) -> torch.FloatTensor:
-
-        B,L,_ = hidden_states.shape
-        D = self.config.hidden_size*self.config.expansion_factor
-        if use_cache:
-            hidden_states_all, _ = cache_params.update(key_states=hidden_states,value_states=hidden_states,layer_idx=0)
-            if cache_params.get_seq_length(1) + self.block_size < hidden_states_all.shape[1]:
-                block_output = self.run_block(
-                    hidden_states=hidden_states_all[:,cache_params.get_seq_length(1):],
-                    cache_params = cache_params,
-                    use_cache = use_cache,
-                    runtime_kwargs = runtime_kwargs,
-                    **flash_attn_kwargs,
-                )
-            else:
-                if len(cache_params)>self.num_layers+1:
-                    block_output, _ = cache_params[self.num_layers+1]
-                else:
-                    block_output = None
-        else:   
-            block_output = self.run_block(
-                hidden_states=hidden_states,
-                cache_params = cache_params,
-                use_cache = use_cache,
-                runtime_kwargs = runtime_kwargs,
-                **flash_attn_kwargs,
-            )
-        if cache_position[-1]<self.block_size:
-            block_output_filled = torch.zeros((B,L,D),dtype=hidden_states.dtype,device=hidden_states.device)
-        elif cache_position[0]<self.block_size:
-            start = 0
-            end = cache_position[-1]+1-self.block_size
-            block_output_zeros = torch.zeros((B,self.block_size-cache_position[0],D),
-                                                    dtype=hidden_states.dtype,device=hidden_states.device)
-            block_output_filled = torch.cat([block_output_zeros,
-                                                    block_output[:,start:end,:]],dim=1)
-        else:
-            start = cache_position[0]-self.block_size
-            end = cache_position[-1]+1-self.block_size
-            block_output_filled = block_output[:,start:end,:]
-    
-        return block_output_filled
-
-    def _update_causal_mask(
-        self,
-        attention_mask: torch.Tensor,
-        input_tensor: torch.Tensor,
-        cache_position: torch.Tensor,
-        cache_params: DynamicCache,
-        output_attentions: bool,
-    ):
-        if self.config._attn_implementation == "flash_attention_2":
-            if attention_mask is not None and cache_params is not None:
-                is_padding_right = attention_mask[:, -1].sum().item() != input_tensor.size()[0]
-                if is_padding_right:
-                    raise ValueError(
-                        "You are attempting to perform batched generation with padding_side='right'"
-                        " this may lead to unexpected behaviour for Flash Attention version of Mistral. Make sure to "
-                        " call `tokenizer.padding_side  = 'left'` before tokenizing the input. "
-                    )
-            if attention_mask is not None and 0.0 in attention_mask:
-                return attention_mask
-            return None
-
-        # For SDPA, when possible, we will rely on its `is_causal` argument instead of its `attn_mask` argument, in
-        # order to dispatch on Flash Attention 2. This feature is not compatible with static cache, as SDPA will fail
-        # to infer the attention mask.
-        past_seen_tokens = cache_params.get_seq_length() if cache_params else 0
-        using_static_cache = False
-        using_sliding_window_cache = False
-        # When output attentions is True, sdpa implementation's forward method calls the eager implementation's forward
-        if (
-            self.config._attn_implementation == "sdpa"
-            and not (using_static_cache or using_sliding_window_cache)
-            and not output_attentions
-        ):
-            if AttentionMaskConverter._ignore_causal_mask_sdpa(
-                attention_mask,
-                inputs_embeds=input_tensor,
-                past_key_values_length=past_seen_tokens,
-                sliding_window=self.config.sliding_window,
-                is_training=self.training,
-            ):
-                return None
-
-        dtype, device = input_tensor.dtype, input_tensor.device
-        min_dtype = torch.finfo(dtype).min
-        sequence_length = input_tensor.shape[1]
-        target_length = (
-                attention_mask.shape[-1]
-                if isinstance(attention_mask, torch.Tensor)
-                else past_seen_tokens + sequence_length + 1
-            )
-
-        # In case the provided `attention` mask is 2D, we generate a causal mask here (4D).
-        causal_mask = self._prepare_4d_causal_attention_mask_with_cache_position(
+        #Decoder
+        hidden_states = self.decoder(
+            hidden_states,
             attention_mask,
-            sequence_length=sequence_length,
-            target_length=target_length,
-            dtype=dtype,
-            device=device,
-            cache_position=cache_position,
-            batch_size=input_tensor.shape[0],
-            config=self.config,
-            cache_params=cache_params,
+            position_ids,
+            cache_params.backbone_cache if cache_params else None,
+            output_attentions,
+            use_cache,
+            cache_position,
+            position_embeddings,
+            **kwargs,
         )
 
-        if (
-            self.config._attn_implementation == "sdpa"
-            and attention_mask is not None
-            and attention_mask.device.type == "cuda"
-            and not output_attentions
-        ):
-            # Attend to all tokens in fully masked rows in the causal_mask, for example the relevant first rows when
-            # using left padding. This is required by F.scaled_dot_product_attention memory-efficient attention path.
-            # Details: https://github.com/pytorch/pytorch/issues/110213
-            causal_mask = AttentionMaskConverter._unmask_unattended(causal_mask, min_dtype)
-
-        return causal_mask
-
-    @staticmethod
-    def _prepare_4d_causal_attention_mask_with_cache_position(
-        attention_mask: torch.Tensor,
-        sequence_length: int,
-        target_length: int,
-        dtype: torch.dtype,
-        device: torch.device,
-        cache_position: torch.Tensor,
-        batch_size: int,
-        config: HybridLLMConfig,
-        cache_params: HybridLLMCache,
-    ):
-        """
-        Creates a causal 4D mask of shape `(batch_size, 1, query_length, key_value_length)` from a 2D mask of shape
-        `(batch_size, key_value_length)`, or if the input `attention_mask` is already 4D, do nothing.
-
-        Args:
-            attention_mask (`torch.Tensor`):
-                A 2D attention mask of shape `(batch_size, key_value_length)` or a 4D attention mask of shape `(batch_size, 1, query_length, key_value_length)`.
-            sequence_length (`int`):
-                The sequence length being processed.
-            target_length (`int`):
-                The target length: when generating with static cache, the mask should be as long as the static cache, to account for the 0 padding, the part of the cache that is not filled yet.
-            dtype (`torch.dtype`):
-                The dtype to use for the 4D attention mask.
-            device (`torch.device`):
-                The device to plcae the 4D attention mask on.
-            cache_position (`torch.Tensor`):
-                Indices depicting the position of the input sequence tokens in the sequence.
-            batch_size (`torch.Tensor`):
-                Batch size.
-            config (`MistralConfig`):
-                The model's configuration class
-            past_key_values (`Cache`):
-                The cache class that is being used currently to generate
-        """
-        if attention_mask is not None and attention_mask.dim() == 4:
-            # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
-            causal_mask = attention_mask
-        else:
-            min_dtype = torch.finfo(dtype).min
-            causal_mask = torch.full(
-                (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device
+        #lag layers
+        residual = hidden_states
+        for lag_index, lag_layer in enumerate(self.lag_layers):
+            if cache_params:
+                cache = cache_params.lag_caches[self.layer_idx].layer_lag_caches[lag_index]
+            else:
+                cache = None
+            residual = residual + lag_layer(
+                hidden_states,
+                cache_params=cache,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                **kwargs,
             )
-            diagonal_attend_mask = torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
-            if config.sliding_window is not None:
-                # if we have sliding window, we should not attend to tokens beyond sliding window length, so we mask them out also
-                # the check is needed to verify is current checkpoint was trained with sliding window or not
-                if not isinstance(cache_params, SlidingWindowCache) or sequence_length > target_length:
-                    sliding_attend_mask = torch.arange(target_length, device=device) <= (
-                        cache_position.reshape(-1, 1) - config.sliding_window
-                    )
-                    diagonal_attend_mask.bitwise_or_(sliding_attend_mask)
-            causal_mask *= diagonal_attend_mask
-            causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
-            if attention_mask is not None:
-                causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
-                if attention_mask.shape[-1] > target_length:
-                    attention_mask = attention_mask[:, :target_length]
-                mask_length = attention_mask.shape[-1]
-                padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :]
-                padding_mask = padding_mask == 0
-                causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
-                    padding_mask, min_dtype
-                )
-        return causal_mask
+        hidden_states = residual
+        return hidden_states
 
 class HybridLLMPreTrainedModel(PreTrainedModel):
     config_class = HybridLLMConfig
@@ -715,26 +535,6 @@ class HybridLLMCausalOutput(ModelOutput):
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
 
-class HybridLLMDownProj(nn.Module):
-    def __init__(self, config: HybridLLMConfig):
-        super().__init__()
-        self.config = config
-        self.cache_head_dim = config.cache_head_dim
-        self.expansion_factor = config.expansion_factor
-        self.num_heads = config.hidden_size//config.cache_head_dim
-        self.gate_proj = nn.Linear(config.hidden_size, self.num_heads*config.expansion_factor, bias=False)
-        self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
-        self.act_fn = ACT2FN[config.hidden_act]
-
-    def forward(self, hidden_states, block_hidden_states):
-        res = hidden_states
-        B,L,D = hidden_states.shape
-        gate = F.silu(self.gate_proj(hidden_states)).reshape(B,L,self.num_heads,self.expansion_factor)
-        block_hidden_states = block_hidden_states.reshape(B,L,self.num_heads,self.expansion_factor,self.cache_head_dim)
-        proj = torch.einsum('blhe,blhec->blhc', gate, block_hidden_states).reshape(B,L,-1)
-        out = res + self.o_proj(proj)
-        return out
-
 class HybridLLMModel(HybridLLMPreTrainedModel):
     """
     Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`MistralDecoderLayer`]
@@ -750,16 +550,9 @@ class HybridLLMModel(HybridLLMPreTrainedModel):
 
         self.rotary_emb = HybridLLMRotaryEmbedding(config=config)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.pre_blocks = DecoderBlock(config, config.pre_intermediate_size,
-                                    config.num_pre_hidden_layers)
-        self.blocks = nn.ModuleList(
-            [HybridLLMDecoderBlock(config, hybrid_block_config['block_size'], hybrid_block_config['intermediate_size'],
-                                    hybrid_block_config['num_layers'],
-                                    self.rotary_emb) for  hybrid_block_config in config.hybrid_block_configs]
+        self.layers = nn.ModuleList(
+            [HybridLLMDecoderLayer(config, layer_index) for layer_index in range(config.num_hidden_layers)]
         )
-        self.down_proj = HybridLLMDownProj(config)
-        self.post_blocks = DecoderBlock(config, config.post_intermediate_size,
-                                    config.num_post_hidden_layers)
         self.norm = HybridLLMRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.gradient_checkpointing = False
 
@@ -814,7 +607,7 @@ class HybridLLMModel(HybridLLMPreTrainedModel):
             cache_params = None
         
         if cache_position is None:
-            past_seen_tokens = cache_params.pre_blocks_cache.get_seq_length() if cache_params is not None else 0
+            past_seen_tokens = cache_params.backbone_cache.get_seq_length() if cache_params is not None else 0
             cache_position = torch.arange(
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
@@ -835,49 +628,36 @@ class HybridLLMModel(HybridLLMPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
 
-        runtime_kwargs = {
-            'gradient_checkpointing': self.gradient_checkpointing,
-            'training': self.training,
-            '_gradient_checkpointing_func': self._gradient_checkpointing_func if self.gradient_checkpointing and self.training else None,
-        }
+        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
 
-        hidden_states = self.pre_blocks(
-            hidden_states,
-            causal_mask,
-            position_ids,
-            cache_params.pre_blocks_cache if cache_params else None,
-            use_cache,
-            cache_position,
-            runtime_kwargs,
-            position_embeddings,
-            **flash_attn_kwargs,
-        )
-        res = None
-        block_caches = cache_params.block_caches if cache_params else [None for _ in self.blocks]
-        for block, block_cache in zip(self.blocks,block_caches):
-            block_hidden_states = block(
-                hidden_states,
-                block_cache,
-                use_cache,
-                cache_position,
-                runtime_kwargs,
-                **flash_attn_kwargs,
-            )
-            if res:
-                block_hidden_states = res + block_hidden_states
-            res = block_hidden_states
-        hidden_states = self.down_proj(hidden_states,block_hidden_states)
-        hidden_states = self.post_blocks(
-            hidden_states,
-            causal_mask,
-            position_ids,
-            cache_params.post_blocks_cache if cache_params else None,
-            use_cache,
-            cache_position,
-            runtime_kwargs,
-            position_embeddings,
-            **flash_attn_kwargs,
-        )
+            if self.gradient_checkpointing and self.training:
+                layer_outputs = self._gradient_checkpointing_func(
+                    decoder_layer.__call__,
+                    hidden_states,
+                    causal_mask,
+                    position_ids,
+                    cache_params,
+                    output_attentions,
+                    use_cache,
+                    cache_position,
+                    position_embeddings,
+                )
+            else:
+                layer_outputs = decoder_layer(
+                    hidden_states,
+                    attention_mask=causal_mask,
+                    position_ids=position_ids,
+                    cache_params=cache_params,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    **flash_attn_kwargs,
+                )
+
+            hidden_states = layer_outputs[0]
 
         hidden_states = self.norm(hidden_states)
 
@@ -913,7 +693,7 @@ class HybridLLMModel(HybridLLMPreTrainedModel):
         # For SDPA, when possible, we will rely on its `is_causal` argument instead of its `attn_mask` argument, in
         # order to dispatch on Flash Attention 2. This feature is not compatible with static cache, as SDPA will fail
         # to infer the attention mask.
-        past_seen_tokens = cache_params.pre_blocks_cache.get_seq_length() if cache_params else 0
+        past_seen_tokens = cache_params.backbone_cache.get_seq_length() if cache_params else 0
         using_static_cache = False
         using_sliding_window_cache = False
         # When output attentions is True, sdpa implementation's forward method calls the eager implementation's forward

@@ -112,16 +112,10 @@ class HybridLLMConfig(PretrainedConfig):
         self,
         vocab_size=32000,
         hidden_size=1024,
-        block_hidden_size=2048,
-        pre_intermediate_size=3584,
-        post_intermediate_size=3584,
-        num_pre_hidden_layers=16,
-        num_post_hidden_layers=16,
-        expansion_factor=2,
-        cache_head_dim=16,
-        hybrid_block_configs = [
-            {"block_size":8, "intermediate_size": 14336, "num_layers": 16},
-            {"block_size":2, "intermediate_size": 7168, "num_layers": 16},
+        intermediate_size=3584,
+        num_hidden_layers=16,
+        hybrid_lag_configs = [
+            {"step_size":1, "intermediate_size": 3584},
         ],
         num_attention_heads=32,
         num_key_value_heads=8,
@@ -143,14 +137,9 @@ class HybridLLMConfig(PretrainedConfig):
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
-        self.block_hidden_size = block_hidden_size
-        self.pre_intermediate_size = pre_intermediate_size
-        self.post_intermediate_size = post_intermediate_size
-        self.num_pre_hidden_layers = num_pre_hidden_layers
-        self.num_post_hidden_layers = num_post_hidden_layers
-        self.expansion_factor = expansion_factor
-        self.cache_head_dim = cache_head_dim
-        self.hybrid_block_configs = hybrid_block_configs
+        self.intermediate_size = intermediate_size
+        self.num_hidden_layers = num_hidden_layers
+        self.hybrid_lag_configs = hybrid_lag_configs
         self.num_attention_heads = num_attention_heads
         self.sliding_window = sliding_window
         self.head_dim = head_dim or hidden_size // num_attention_heads
