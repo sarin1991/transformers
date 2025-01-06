@@ -466,7 +466,7 @@ class HybridLLMDecoderLayer(nn.Module):
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         
         #Decoder
-        hidden_states = self.decoder(
+        layer_outputs = self.decoder(
             hidden_states,
             attention_mask,
             position_ids,
@@ -477,6 +477,7 @@ class HybridLLMDecoderLayer(nn.Module):
             position_embeddings,
             **kwargs,
         )
+        hidden_states = layer_outputs[0]
 
         #lag layers
         residual = hidden_states
@@ -494,7 +495,8 @@ class HybridLLMDecoderLayer(nn.Module):
                 **kwargs,
             )
         hidden_states = residual
-        return hidden_states
+        outputs = (hidden_states,)
+        return outputs
 
 class HybridLLMPreTrainedModel(PreTrainedModel):
     config_class = HybridLLMConfig
