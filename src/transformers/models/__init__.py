@@ -166,6 +166,7 @@ from . import (
     mgp_str,
     mimi,
     mistral,
+    cast,
     mixtral,
     mllama,
     mluke,
