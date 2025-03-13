@@ -37,22 +37,6 @@ class CastMLPOld(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        self.act_fn = ACT2FN[config.hidden_act]
-
-    def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
-
-
-class CastMLP(nn.Module):
-    def __init__(self, config: CastConfig):
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
         self.num_experts = config.num_experts
         self.line_size = config.line_size
         self.gate_dim = self.intermediate_size//self.line_size
@@ -65,6 +49,27 @@ class CastMLP(nn.Module):
         gate_proj = rearrange(F.relu(self.gate_proj(x)), 'b l (e g) -> b l e g',e=self.num_experts)
         intermediate = einsum(up_proj, gate_proj,'b l e ls g, b l e g -> b l ls g')
         down_proj = self.down_proj(rearrange(intermediate, 'b l ls g -> b l (ls g)'))
+        return down_proj
+
+
+class CastMLP(nn.Module):
+    def __init__(self, config: CastConfig):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.num_experts = config.num_experts
+        self.line_size = config.line_size
+        self.num_fine_grained_experts = self.num_experts * self.intermediate_size//self.line_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.num_fine_grained_experts, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.num_fine_grained_experts * self.line_size, bias=False)
+        self.down_proj = nn.Linear(self.num_fine_grained_experts * self.line_size, self.hidden_size, bias=False)
+
+    def forward(self, x):
+        up_proj = rearrange(self.up_proj(x), 'b l (nfe ls) -> b l nfe ls',nfe=self.num_fine_grained_experts,ls=self.line_size)
+        gate_proj = F.relu(self.gate_proj(x))
+        intermediate = einsum(up_proj, gate_proj,'b l nfe ls, b l nfe -> b l nfe ls')
+        down_proj = self.down_proj(rearrange(intermediate, 'b l nfe ls -> b l (nfe ls)'))
         return down_proj
 
 def rotate_half(x):
