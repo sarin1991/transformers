@@ -58,18 +58,17 @@ class CastMLP(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.num_experts = config.num_experts
         self.line_size = config.line_size
-        self.num_fine_grained_experts = self.num_experts * self.intermediate_size//self.line_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.num_fine_grained_experts, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.num_fine_grained_experts * self.line_size, bias=False)
-        self.down_proj = nn.Linear(self.num_fine_grained_experts * self.line_size, self.hidden_size, bias=False)
+        self.num_experts = self.intermediate_size//self.line_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.num_experts, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 
     def forward(self, x):
-        up_proj = rearrange(self.up_proj(x), 'b l (nfe ls) -> b l nfe ls',nfe=self.num_fine_grained_experts,ls=self.line_size)
+        up_proj = rearrange(self.up_proj(x), 'b l (ne ls) -> b l nfe ls',nfe=self.num_experts,ls=self.line_size)
         gate_proj = F.relu(self.gate_proj(x))
-        intermediate = einsum(up_proj, gate_proj,'b l nfe ls, b l nfe -> b l nfe ls')
-        down_proj = self.down_proj(rearrange(intermediate, 'b l nfe ls -> b l (nfe ls)'))
+        intermediate = einsum(up_proj, gate_proj,'b l ne ls, b l ne -> b l ne ls')
+        down_proj = self.down_proj(rearrange(intermediate, 'b l ne ls -> b l (ne ls)'))
         return down_proj
 
 def rotate_half(x):
