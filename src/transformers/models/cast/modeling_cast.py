@@ -65,7 +65,7 @@ class CastMLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 
     def forward(self, x):
-        up_proj = rearrange(self.up_proj(x), 'b l (ne ls) -> b l nfe ls',nfe=self.num_experts,ls=self.line_size)
+        up_proj = rearrange(self.up_proj(x), 'b l (ne ls) -> b l ne ls',ne=self.num_experts,ls=self.line_size)
         gate_proj = F.relu(self.gate_proj(x))
         intermediate = einsum(up_proj, gate_proj,'b l ne ls, b l ne -> b l ne ls')
         down_proj = self.down_proj(rearrange(intermediate, 'b l ne ls -> b l (ne ls)'))
