@@ -30,7 +30,6 @@ class CastConfig(PretrainedConfig):
         hidden_size=4096,
         intermediate_size=14336,
         line_size=64,
-        num_experts=16,
         num_hidden_layers=32,
         num_attention_heads=32,
         num_key_value_heads=8,
@@ -54,7 +53,6 @@ class CastConfig(PretrainedConfig):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.line_size = line_size
-        self.num_experts = num_experts
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
         self.sliding_window = sliding_window
