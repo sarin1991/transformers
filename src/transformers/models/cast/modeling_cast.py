@@ -59,16 +59,22 @@ class CastMLP(nn.Module):
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.line_size = config.line_size
-        self.num_experts = self.intermediate_size//self.line_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.num_experts, bias=False)
+        self.num_blocks = self.intermediate_size//self.line_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.num_blocks, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 
+    def gate_activation(self,x,g,num_blocks):
+            x = rearrange(x, 'b l (nb ls) -> b l nb ls',nb=num_blocks,ls=self.line_size)
+            x = einsum(x, g,'b l nb ls, b l nb -> b l nb ls')
+            x = rearrange(x, 'b l nb ls -> b l (nb ls)')
+            return x
+
     def forward(self, x):
-        up_proj = rearrange(self.up_proj(x), 'b l (ne ls) -> b l ne ls',ne=self.num_experts,ls=self.line_size)
+        up_proj = self.up_proj(x)
         gate_proj = F.relu(self.gate_proj(x))
-        intermediate = einsum(up_proj, gate_proj,'b l ne ls, b l ne -> b l ne ls')
-        down_proj = self.down_proj(rearrange(intermediate, 'b l ne ls -> b l (ne ls)'))
+        intermediate = self.gate_activation(up_proj,gate_proj,self.num_blocks)
+        down_proj = self.down_proj(intermediate)
         return down_proj
 
 def rotate_half(x):
