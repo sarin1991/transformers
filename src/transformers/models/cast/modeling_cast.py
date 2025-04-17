@@ -766,7 +766,7 @@ class CastForCausalLM(CastPreTrainedModel, GenerationMixin):
             **kwargs,
         )
 
-        hidden_states = outputs.hidden_states
+        hidden_states = outputs.last_hidden_state
         sparse_ratio = outputs.sparse_ratio
         l1_reg_loss = outputs.l1_reg_loss
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
