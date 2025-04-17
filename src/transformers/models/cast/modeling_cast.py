@@ -3,6 +3,7 @@ from typing import Callable, List, Optional, Tuple, Union
 import torch
 from torch import nn
 import torch.nn.functional as F
+from dataclasses import dataclass
 
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache, SlidingWindowCache, StaticCache
@@ -22,6 +23,7 @@ from ...processing_utils import Unpack
 from ...utils import (
     LossKwargs,
     logging,
+    ModelOutput,
 )
 from ...utils.deprecation import deprecate_kwarg
 from .configuration_cast import CastConfig
@@ -75,7 +77,7 @@ class CastMLP(nn.Module):
         gate_proj = F.relu(self.gate_proj(x))
         intermediate = self.gate_activation(up_proj,gate_proj,self.num_blocks)
         down_proj = self.down_proj(intermediate)
-        return down_proj
+        return down_proj, gate_proj
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
@@ -279,10 +281,10 @@ class CastDecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states, gate_proj = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states,)
+        outputs = (hidden_states, gate_proj)
         if output_attentions:
             outputs += (self_attn_weights,)
 
@@ -376,6 +378,15 @@ class CastPreTrainedModel(PreTrainedModel):
                 module.weight.data[module.padding_idx].zero_()
 
 
+@dataclass
+class CastModelOutputWithPast(ModelOutput):
+    last_hidden_state: torch.FloatTensor = None
+    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
+    attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
+    sparse_ratio: torch.FloatTensor = None
+    l1_reg_loss: torch.FloatTensor = None
+
 class CastModel(CastPreTrainedModel):
     """
     Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`CastDecoderLayer`]
@@ -419,7 +430,7 @@ class CastModel(CastPreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
-    ) -> Union[Tuple, BaseModelOutputWithPast]:
+    ) -> Union[Tuple, CastModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -464,6 +475,8 @@ class CastModel(CastPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
 
+        sparse_ratio = torch.zeros(inputs_embeds.shape[0], device=inputs_embeds.device)
+        l1_reg_loss = torch.zeros(inputs_embeds.shape[0], device=inputs_embeds.device)
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -494,6 +507,9 @@ class CastModel(CastPreTrainedModel):
                 )
 
             hidden_states = layer_outputs[0]
+            gate_proj = layer_outputs[1]
+            sparse_ratio += (1.0/self.config.num_hidden_layers)*(gate_proj<=0).float().mean(dim = tuple(torch.arange(1,len(gate_proj.shape))))
+            l1_reg_loss +=  gate_proj.sum(dim = tuple(torch.arange(1,len(gate_proj.shape))))
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
@@ -504,11 +520,13 @@ class CastModel(CastPreTrainedModel):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        output = BaseModelOutputWithPast(
+        output = CastModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
+            sparse_ratio=sparse_ratio,
+            l1_reg_loss=l1_reg_loss,
         )
         return output if return_dict else output.to_tuple()
 
@@ -668,6 +686,16 @@ class CastModel(CastPreTrainedModel):
 class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
 
 
+@dataclass
+class CastCausalLMOutputWithPast(ModelOutput):
+    loss: Optional[torch.FloatTensor] = None
+    l1_reg_loss: Optional[torch.FloatTensor] = None
+    logits: torch.FloatTensor = None
+    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
+    attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
+    sparse_ratio: torch.FloatTensor = None
+
 class CastForCausalLM(CastPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
@@ -675,7 +703,7 @@ class CastForCausalLM(CastPreTrainedModel, GenerationMixin):
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = CastModel(config)
+        self.model: CastModel = CastModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -724,7 +752,7 @@ class CastForCausalLM(CastPreTrainedModel, GenerationMixin):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs = self.model(
+        outputs: CastModelOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -733,12 +761,14 @@ class CastForCausalLM(CastPreTrainedModel, GenerationMixin):
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
+            return_dict=True,
             cache_position=cache_position,
             **kwargs,
         )
 
-        hidden_states = outputs[0]
+        hidden_states = outputs.hidden_states
+        sparse_ratio = outputs.sparse_ratio
+        l1_reg_loss = outputs.l1_reg_loss
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
@@ -748,15 +778,17 @@ class CastForCausalLM(CastPreTrainedModel, GenerationMixin):
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 
         if not return_dict:
-            output = (logits,) + outputs[1:]
+            output = (logits,) + outputs.to_tuple()[1:]
             return (loss,) + output if loss is not None else output
 
         return CausalLMOutputWithPast(
             loss=loss,
+            l1_reg_loss=l1_reg_loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            sparse_ratio=sparse_ratio,
         )
 
 
