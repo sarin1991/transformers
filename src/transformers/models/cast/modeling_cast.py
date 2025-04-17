@@ -744,7 +744,7 @@ class CastForCausalLM(CastPreTrainedModel, GenerationMixin):
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **kwargs: Unpack[KwargsForCausalLM],
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
+    ) -> Union[Tuple, CastCausalLMOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -781,7 +781,7 @@ class CastForCausalLM(CastPreTrainedModel, GenerationMixin):
             output = (logits,) + outputs.to_tuple()[1:]
             return (loss,) + output if loss is not None else output
 
-        return CausalLMOutputWithPast(
+        return CastCausalLMOutputWithPast(
             loss=loss,
             l1_reg_loss=l1_reg_loss,
             logits=logits,
