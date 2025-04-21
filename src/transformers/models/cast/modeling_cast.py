@@ -61,8 +61,11 @@ class CastMLP(nn.Module):
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.line_size = config.line_size
-        self.num_blocks = self.intermediate_size//self.line_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.num_blocks, bias=False)
+        self.num_blocks = self.hidden_size//self.line_size
+        self.num_blocks_int = self.intermediate_size//self.line_size
+        self.g1 = nn.Linear(self.hidden_size, self.num_blocks, bias=False)
+        self.g2 = nn.Linear(self.hidden_size, self.num_blocks_int, bias=False)
+        self.g3 = nn.Linear(self.intermediate_size, self.num_blocks, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 
@@ -73,10 +76,15 @@ class CastMLP(nn.Module):
             return x
 
     def forward(self, x):
+        g1 = self.g1(x)
+        g2 = self.g2(x)
+        x = self.gate_activation(x,g1,self.num_blocks)
         up_proj = self.up_proj(x)
-        gate_proj = F.relu(self.gate_proj(x))
-        intermediate = self.gate_activation(up_proj,gate_proj,self.num_blocks)
+        intermediate = self.gate_activation(up_proj,g2,self.num_blocks_int)
+        g3 = self.g3(intermediate)
         down_proj = self.down_proj(intermediate)
+        down_proj = self.gate_activation(down_proj,g3,self.num_blocks)
+        gate_proj = torch.cat([g1,g2,g2,g3], dim=2)
         return down_proj, gate_proj
 
 def rotate_half(x):
