@@ -76,12 +76,12 @@ class CastMLP(nn.Module):
             return x
 
     def forward(self, x):
-        g1 = self.g1(x)
-        g2 = self.g2(x)
+        g1 = F.relu(self.g1(x))
+        g2 = F.relu(self.g2(x))
         x = self.gate_activation(x,g1,self.num_blocks)
         up_proj = self.up_proj(x)
         intermediate = self.gate_activation(up_proj,g2,self.num_blocks_int)
-        g3 = self.g3(intermediate)
+        g3 = F.relu(self.g3(intermediate))
         down_proj = self.down_proj(intermediate)
         down_proj = self.gate_activation(down_proj,g3,self.num_blocks)
         gate_proj = torch.cat([g1,g2,g2,g3], dim=2)
