@@ -73,7 +73,7 @@ class CastMLP(nn.Module):
             return x
 
     def forward(self, x):
-        up_proj = self.up_proj(x)
+        up_proj = F.relu(self.up_proj(x))
         gate_proj = F.relu(self.gate_proj(x))
         intermediate = self.gate_activation(up_proj,gate_proj,self.num_blocks)
         down_proj = self.down_proj(intermediate)
