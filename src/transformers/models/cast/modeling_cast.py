@@ -79,7 +79,7 @@ class CastMLP(nn.Module):
         g1 = F.relu(self.g1(x))
         g2 = F.relu(self.g2(x))
         x = self.gate_activation(x,g1,self.num_blocks)
-        up_proj = self.up_proj(x)
+        up_proj = F.relu(self.up_proj(x))
         intermediate = self.gate_activation(up_proj,g2,self.num_blocks_int)
         g3 = F.relu(self.g3(intermediate))
         down_proj = self.down_proj(intermediate)
