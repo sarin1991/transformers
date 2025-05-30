@@ -69,8 +69,8 @@ class CastMLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 
-    def gate_activation(self,x,g,num_blocks):
-            x = rearrange(x, 'b l (nb ls) -> b l nb ls',nb=num_blocks,ls=self.line_size)
+    def gate_activation(self,x,g,num_blocks,line_size):
+            x = rearrange(x, 'b l (nb ls) -> b l nb ls',nb=num_blocks,ls=line_size)
             x = einsum(x, g,'b l nb ls, b l nb -> b l nb ls')
             x = rearrange(x, 'b l nb ls -> b l (nb ls)')
             return x
@@ -79,8 +79,8 @@ class CastMLP(nn.Module):
         up_proj = F.relu(self.up_proj(x))
         l1_gate = F.relu(self.l1_gate_proj(x))
         l2_gate = F.relu(self.l1_gate_proj(x))
-        intermediate = self.gate_activation(up_proj,l1_gate,self.l1_num_blocks)
-        intermediate = self.gate_activation(intermediate,l2_gate,self.l2_num_blocks)
+        intermediate = self.gate_activation(up_proj,l1_gate,self.l1_num_blocks,self.l1_line_size)
+        intermediate = self.gate_activation(intermediate,l2_gate,self.l2_num_blocks,self.l2_line_size)
         down_proj = self.down_proj(intermediate)
         return down_proj, l1_gate, l2_gate
 
