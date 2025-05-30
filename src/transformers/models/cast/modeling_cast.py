@@ -518,12 +518,12 @@ class CastModel(CastPreTrainedModel):
             hidden_states = layer_outputs[0]
             l1_gate, l2_gate = layer_outputs[1], layer_outputs[2]
             l1_gate_exp = rearrange(l1_gate, 'b l (nb ls) -> b l nb ls',nb=self.config.intermediate_size//self.config.l2_line_size)
-            l1_l2_gate = einsum(l1_gate_exp, l2_gate,'b l nb ls, b l nb -> b l nb ls')
+            l1_l2_gate = einsum(l1_gate_exp, l2_gate > 0,'b l nb ls, b l nb -> b l nb ls')
             l1_l2_gate = rearrange(l1_l2_gate, 'b l nb ls -> b l (nb ls)')
-            l1_act = (l1_l2_gate>0).float().sum(dim = tuple(torch.arange(1,len(l1_gate.shape))))
-            l1_base = (l2_gate>0).float().sum(dim = tuple(torch.arange(1,len(l1_gate.shape))))
+            l1_act = (l1_l2_gate>0).float().sum(dim = tuple(torch.arange(1,len(l1_l2_gate.shape))))
+            l1_base = ((self.config.l2_line_size//self.config.l1_line_size)*(l2_gate>0).float().sum(dim = tuple(torch.arange(1,len(l2_gate.shape))))).clip(10e-8)
             l1_act_ratio += (1.0/self.config.num_hidden_layers)*(l1_act/l1_base)
-            l1_reg_loss +=  (l1_l2_gate).sum(dim = tuple(torch.arange(1,len(l1_gate.shape))))
+            l1_reg_loss +=  l1_l2_gate.sum(dim = tuple(torch.arange(1,len(l1_l2_gate.shape))))
             l2_act_ratio += (1.0/self.config.num_hidden_layers)*(l2_gate>0).float().mean(dim = tuple(torch.arange(1,len(l2_gate.shape))))
             l2_reg_loss +=  l2_gate.sum(dim = tuple(torch.arange(1,len(l2_gate.shape))))
 
