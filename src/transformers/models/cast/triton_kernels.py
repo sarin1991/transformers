@@ -189,7 +189,8 @@ def test_fused_up_proj_gate_activation_triton():
     for batch_size, seq_len, hidden_size, num_blocks, line_size in test_configs:
         intermediate_size = num_blocks * line_size
         x = torch.randn(batch_size, seq_len, hidden_size, device='cuda', dtype=torch.float16)
-        up_weight = torch.randn(intermediate_size, hidden_size, device='cuda', dtype=torch.float16).t()
+        # Create weight in the format expected by F.linear: (out_features, in_features)
+        up_weight = torch.randn(intermediate_size, hidden_size, device='cuda', dtype=torch.float16)
         up_bias = torch.randn(intermediate_size, device='cuda', dtype=torch.float16)
         gate = torch.randn(batch_size, seq_len, num_blocks, device='cuda', dtype=torch.float16)
         
@@ -199,8 +200,11 @@ def test_fused_up_proj_gate_activation_triton():
         gate_expanded = gate.unsqueeze(-1).expand_as(up_proj_reshaped)
         ref = (up_proj_reshaped * gate_expanded).view(batch_size, seq_len, intermediate_size)
         
+        # For Triton kernel, we need weight in (hidden_size, intermediate_size) format
+        up_weight_triton = up_weight.t()
+        
         # Triton kernel
-        out = fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks, line_size)
+        out = fused_up_proj_gate_activation_triton(x, up_weight_triton, up_bias, gate, num_blocks, line_size)
         max_diff = torch.max(torch.abs(ref - out)).item()
         mean_diff = torch.mean(torch.abs(ref - out)).item()
         print(f"Config {batch_size}x{seq_len}x{hidden_size}x{num_blocks}x{line_size}: Max diff = {max_diff:.6f}, Mean diff = {mean_diff:.6f}")
