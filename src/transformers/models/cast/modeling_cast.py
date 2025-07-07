@@ -33,38 +33,14 @@ from einops import rearrange, einsum
 logger = logging.get_logger(__name__)
 
 
-class CastMLPOld(nn.Module):
-    def __init__(self, config: CastConfig):
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.num_experts = config.num_experts
-        self.line_size = config.line_size
-        self.gate_dim = self.intermediate_size//self.line_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.gate_dim*self.num_experts, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size*self.num_experts, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-
-    def forward(self, x):
-        up_proj = rearrange(self.up_proj(x), 'b l (e ls g) -> b l e ls g',e=self.num_experts,ls=self.line_size)
-        gate_proj = rearrange(F.relu(self.gate_proj(x)), 'b l (e g) -> b l e g',e=self.num_experts)
-        intermediate = einsum(up_proj, gate_proj,'b l e ls g, b l e g -> b l ls g')
-        down_proj = self.down_proj(rearrange(intermediate, 'b l ls g -> b l (ls g)'))
-        return down_proj
-
-
 class CastMLP(nn.Module):
     def __init__(self, config: CastConfig):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.l1_line_size = config.l1_line_size
         self.l2_line_size = config.l2_line_size
-        self.l1_num_blocks = self.intermediate_size//self.l1_line_size
         self.l2_num_blocks = self.intermediate_size//self.l2_line_size
-        self.l1_gate_proj = nn.Linear(self.hidden_size, self.l1_num_blocks, bias=True)
         self.l2_gate_proj = nn.Linear(self.hidden_size, self.l2_num_blocks, bias=True)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
@@ -77,12 +53,10 @@ class CastMLP(nn.Module):
 
     def forward(self, x):
         up_proj = F.relu(self.up_proj(x))
-        l1_gate = F.relu(self.l1_gate_proj(x))
         l2_gate = F.relu(self.l2_gate_proj(x))
-        intermediate = self.gate_activation(up_proj,l1_gate,self.l1_num_blocks,self.l1_line_size)
-        intermediate = self.gate_activation(intermediate,l2_gate,self.l2_num_blocks,self.l2_line_size)
+        intermediate = self.gate_activation(up_proj,l2_gate,self.l2_num_blocks,self.l2_line_size)
         down_proj = self.down_proj(intermediate)
-        return down_proj, l1_gate, l2_gate
+        return down_proj, l2_gate
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
@@ -264,7 +238,7 @@ class CastDecoderLayer(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[FlashAttentionKwargs],
-    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+    ):
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
@@ -286,10 +260,10 @@ class CastDecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states, l1_gate, l2_gate = self.mlp(hidden_states)
+        hidden_states, l2_gate = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states, l1_gate, l2_gate)
+        outputs = (hidden_states, l2_gate)
         if output_attentions:
             outputs += (self_attn_weights,)
 
@@ -389,8 +363,6 @@ class CastModelOutputWithPast(ModelOutput):
     past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
     attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
-    l1_act_ratio: torch.FloatTensor = None
-    l1_reg_loss: torch.FloatTensor = None
     l2_act_ratio: torch.FloatTensor = None
     l2_reg_loss: torch.FloatTensor = None
 
@@ -516,14 +488,7 @@ class CastModel(CastPreTrainedModel):
                 )
 
             hidden_states = layer_outputs[0]
-            l1_gate, l2_gate = layer_outputs[1], layer_outputs[2]
-            l1_gate_exp = rearrange(l1_gate, 'b l (nb ls) -> b l nb ls',nb=self.config.intermediate_size//self.config.l2_line_size)
-            l1_l2_gate = einsum(l1_gate_exp, l2_gate > 0,'b l nb ls, b l nb -> b l nb ls')
-            l1_l2_gate = rearrange(l1_l2_gate, 'b l nb ls -> b l (nb ls)')
-            l1_act = (l1_l2_gate>0).float().sum(dim = tuple(torch.arange(1,len(l1_l2_gate.shape))))
-            l1_base = ((self.config.l2_line_size//self.config.l1_line_size)*(l2_gate>0).float().sum(dim = tuple(torch.arange(1,len(l2_gate.shape))))).clip(10e-8)
-            l1_act_ratio += (1.0/self.config.num_hidden_layers)*(l1_act/l1_base)
-            l1_reg_loss +=  l1_l2_gate.sum(dim = tuple(torch.arange(1,len(l1_l2_gate.shape))))
+            l2_gate = layer_outputs[1]
             l2_act_ratio += (1.0/self.config.num_hidden_layers)*(l2_gate>0).float().mean(dim = tuple(torch.arange(1,len(l2_gate.shape))))
             l2_reg_loss +=  l2_gate.sum(dim = tuple(torch.arange(1,len(l2_gate.shape))))
 
@@ -541,8 +506,6 @@ class CastModel(CastPreTrainedModel):
             past_key_values=past_key_values if use_cache else None,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
-            l1_act_ratio=l1_act_ratio,
-            l1_reg_loss=l1_reg_loss,
             l2_act_ratio=l2_act_ratio,
             l2_reg_loss=l2_reg_loss,
         )
