@@ -87,14 +87,14 @@ def fused_up_proj_gate_activation_kernel(
     mask_ls = offs_ls < line_size
     
     # Compute up projection: up_proj = F.relu(x @ up_weight + up_bias)
-    up_proj = tl.zeros((BLOCK_SIZE_B, BLOCK_SIZE_L, num_blocks * line_size), dtype=tl.float32)
+    up_proj = tl.zeros((BLOCK_SIZE_B, BLOCK_SIZE_L, BLOCK_SIZE_NB * BLOCK_SIZE_LS), dtype=tl.float32)
     
     # Matrix multiplication for up projection
     for h in range(0, hidden_size, BLOCK_SIZE_H):
         # Load up_weight block
         up_w_ptrs = up_weight_ptr + (offs_h[:, None] * stride_upwb + 
-                                   tl.arange(0, num_blocks * line_size)[None, :] * stride_upwh)
-        up_w = tl.load(up_w_ptrs, mask=(mask_h[:, None] & tl.arange(0, num_blocks * line_size)[None, :] < num_blocks * line_size), other=0.0)
+                                   tl.arange(0, BLOCK_SIZE_NB * BLOCK_SIZE_LS)[None, :] * stride_upwh)
+        up_w = tl.load(up_w_ptrs, mask=(mask_h[:, None] & tl.arange(0, BLOCK_SIZE_NB * BLOCK_SIZE_LS)[None, :] < num_blocks * line_size), other=0.0)
         
         # Load x block
         x_block_ptrs = x_ptr + (offs_b[:, None, None] * stride_xb + 
@@ -107,8 +107,8 @@ def fused_up_proj_gate_activation_kernel(
         up_proj += tl.dot(x_block, up_w)
     
     # Add bias and apply ReLU
-    up_bias = tl.load(up_bias_ptr + tl.arange(0, num_blocks * line_size), 
-                     mask=tl.arange(0, num_blocks * line_size) < num_blocks * line_size, other=0.0)
+    up_bias = tl.load(up_bias_ptr + tl.arange(0, BLOCK_SIZE_NB * BLOCK_SIZE_LS), 
+                     mask=tl.arange(0, BLOCK_SIZE_NB * BLOCK_SIZE_LS) < num_blocks * line_size, other=0.0)
     up_proj += up_bias[None, None, :]
     up_proj = tl.where(up_proj > 0, up_proj, 0.0)
     
@@ -118,8 +118,8 @@ def fused_up_proj_gate_activation_kernel(
                         offs_nb[None, None, :] * stride_gnb)
     g = tl.load(g_ptrs, mask=(mask_b[:, None, None] & mask_l[None, :, None] & mask_nb[None, None, :]), other=0.0)
     
-    # Reshape up_proj to (batch, seq, num_blocks, line_size) and apply gate
-    up_proj_reshaped = up_proj.view(BLOCK_SIZE_B, BLOCK_SIZE_L, num_blocks, line_size)
+    # Reshape up_proj to (batch, seq, BLOCK_SIZE_NB, BLOCK_SIZE_LS) and apply gate
+    up_proj_reshaped = up_proj.view(BLOCK_SIZE_B, BLOCK_SIZE_L, BLOCK_SIZE_NB, BLOCK_SIZE_LS)
     gate_expanded = g[:, :, :, None]  # Expand to match up_proj_reshaped shape
     
     # Apply gate activation
