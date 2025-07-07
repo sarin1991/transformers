@@ -189,7 +189,7 @@ def test_fused_up_proj_gate_activation_triton():
     for batch_size, seq_len, hidden_size, num_blocks, line_size in test_configs:
         intermediate_size = num_blocks * line_size
         x = torch.randn(batch_size, seq_len, hidden_size, device='cuda', dtype=torch.float16)
-        up_weight = torch.randn(hidden_size, intermediate_size, device='cuda', dtype=torch.float16)
+        up_weight = torch.randn(intermediate_size, hidden_size, device='cuda', dtype=torch.float16).t()
         up_bias = torch.randn(intermediate_size, device='cuda', dtype=torch.float16)
         gate = torch.randn(batch_size, seq_len, num_blocks, device='cuda', dtype=torch.float16)
         
