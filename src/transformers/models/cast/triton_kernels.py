@@ -10,12 +10,7 @@ import torch.nn.functional as F
 def fused_up_proj_gate_activation_kernel(
     x_ptr, up_weight_ptr, up_bias_ptr, gate_ptr, output_ptr,
     batch_size, seq_len, hidden_size, num_blocks, line_size,
-    stride_xb, stride_xl, stride_xh,
-    stride_upwb, stride_upwh,
-    stride_gb, stride_gl, stride_gnb,
-    stride_outb, stride_outl, stride_outnb, stride_outls,
-    BLOCK_SIZE_B: tl.constexpr, BLOCK_SIZE_L: tl.constexpr, 
-    BLOCK_SIZE_H: tl.constexpr, BLOCK_SIZE_NB: tl.constexpr, BLOCK_SIZE_LS: tl.constexpr,
+    BLOCK_SIZE_H: tl.constexpr, BLOCK_SIZE_LS: tl.constexpr,
 ):
     """
     Fused kernel that performs:
@@ -25,11 +20,11 @@ def fused_up_proj_gate_activation_kernel(
     
     Parameters:
     -----------
-    x_ptr: Pointer to input tensor of shape (batch_size, seq_len, hidden_size)
-    up_weight_ptr: Pointer to up projection weight of shape (hidden_size, intermediate_size)
-    up_bias_ptr: Pointer to up projection bias of shape (intermediate_size,)
-    gate_ptr: Pointer to pre-calculated gate tensor of shape (batch_size, seq_len, num_blocks)
-    output_ptr: Pointer to output tensor of shape (batch_size, seq_len, num_blocks, line_size)
+    x_ptr: Pointer to input tensor of shape (batch_size, seq_len, hidden_size) - contiguous
+    up_weight_ptr: Pointer to up projection weight of shape (hidden_size, intermediate_size) - contiguous
+    up_bias_ptr: Pointer to up projection bias of shape (intermediate_size,) - contiguous
+    gate_ptr: Pointer to pre-calculated gate tensor of shape (batch_size, seq_len, num_blocks) - contiguous
+    output_ptr: Pointer to output tensor of shape (batch_size, seq_len, num_blocks, line_size) - contiguous
     
     Dimensions:
     -----------
@@ -39,20 +34,10 @@ def fused_up_proj_gate_activation_kernel(
     num_blocks: Number of blocks for gate activation
     line_size: Size of each line within a block (intermediate_size = num_blocks * line_size)
     
-    Strides:
-    --------
-    stride_xb, stride_xl, stride_xh: Strides for input tensor x
-    stride_upwb, stride_upwh: Strides for up projection weight
-    stride_gb, stride_gl, stride_gnb: Strides for gate tensor
-    stride_outb, stride_outl, stride_outnb, stride_outls: Strides for output tensor
-    
     Block Sizes (compile-time constants):
     ------------------------------------
-    BLOCK_SIZE_B: Number of batch elements processed per block (typically 1)
-    BLOCK_SIZE_L: Number of sequence elements processed per block (typically 1)
-    BLOCK_SIZE_H: Number of hidden dimensions processed per block (typically 64)
-    BLOCK_SIZE_NB: Number of block indices processed per block (typically 1)
-    BLOCK_SIZE_LS: Number of line size elements processed per block (typically 64)
+    BLOCK_SIZE_H: Number of hidden dimensions processed per block (minimum 16)
+    BLOCK_SIZE_LS: Number of line size elements processed per block (minimum 16)
     
     The block sizes determine the granularity of parallelization and memory access patterns.
     Larger block sizes can improve memory bandwidth utilization but may reduce parallelism.
@@ -60,7 +45,7 @@ def fused_up_proj_gate_activation_kernel(
     # Get program ID
     pid = tl.program_id(0)
     
-    # Calculate block indices
+    # Calculate block indices - process one (batch, seq, block) element at a time
     total_blocks = batch_size * seq_len * num_blocks
     block_idx = pid
     
@@ -73,70 +58,65 @@ def fused_up_proj_gate_activation_kernel(
     nb = block_idx % num_blocks
     
     # Create offsets for the block
-    offs_b = b * BLOCK_SIZE_B + tl.arange(0, BLOCK_SIZE_B)
-    offs_l = l * BLOCK_SIZE_L + tl.arange(0, BLOCK_SIZE_L)
-    offs_h = tl.arange(0, BLOCK_SIZE_H)
-    offs_nb = nb * BLOCK_SIZE_NB + tl.arange(0, BLOCK_SIZE_NB)
     offs_ls = tl.arange(0, BLOCK_SIZE_LS)
     
     # Create masks
-    mask_b = offs_b < batch_size
-    mask_l = offs_l < seq_len
-    mask_h = offs_h < hidden_size
-    mask_nb = offs_nb < num_blocks
     mask_ls = offs_ls < line_size
     
+    # Load pre-calculated gate value for this specific (batch, seq, block) element early
+    # gate: (batch_size, seq_len, num_blocks)
+    g_ptr = gate_ptr + (b * seq_len * num_blocks + l * num_blocks + nb)
+    g = tl.load(g_ptr)
+    
+    # Early return if gate is zero - no need to compute matrix multiplication
+    if g == 0.0:
+        # Store zeros in output
+        # output: (batch_size, seq_len, num_blocks, line_size)
+        out_ptrs = output_ptr + (b * seq_len * num_blocks * line_size + 
+                               l * num_blocks * line_size + nb * line_size + offs_ls)
+        tl.store(out_ptrs, tl.zeros((BLOCK_SIZE_LS,), dtype=tl.float32), mask=mask_ls)
+        return
+    
+    # Create offsets for the block (only needed if gate is non-zero)
+    offs_h = tl.arange(0, BLOCK_SIZE_H)
+    
+    # Create masks
+    mask_h = offs_h < hidden_size
+    
     # Compute up projection: up_proj = F.relu(x @ up_weight + up_bias)
-    up_proj = tl.zeros((BLOCK_SIZE_B, BLOCK_SIZE_L, BLOCK_SIZE_NB * BLOCK_SIZE_LS), dtype=tl.float32)
+    up_proj = tl.zeros((BLOCK_SIZE_LS,), dtype=tl.float32)
     
     # Matrix multiplication for up projection
     for h in range(0, hidden_size, BLOCK_SIZE_H):
-        # Load up_weight block
-        up_w_ptrs = up_weight_ptr + (offs_h[:, None] * stride_upwb + 
-                                   tl.arange(0, BLOCK_SIZE_NB * BLOCK_SIZE_LS)[None, :] * stride_upwh)
-        up_w = tl.load(up_w_ptrs, mask=(mask_h[:, None] & tl.arange(0, BLOCK_SIZE_NB * BLOCK_SIZE_LS)[None, :] < num_blocks * line_size), other=0.0)
+        # Load up_weight block for this specific (batch, seq, block) element
+        # up_weight: (hidden_size, intermediate_size) -> (hidden_size, num_blocks * line_size)
+        up_w_ptrs = up_weight_ptr + (offs_h[:, None] * (num_blocks * line_size) + 
+                                   (nb * line_size + offs_ls)[None, :])
+        up_w = tl.load(up_w_ptrs, mask=(mask_h[:, None] & mask_ls[None, :]), other=0.0)
         
-        # Load x block
-        x_block_ptrs = x_ptr + (offs_b[:, None, None] * stride_xb + 
-                              offs_l[None, :, None] * stride_xl + 
-                              (offs_h + h)[None, None, :] * stride_xh)
-        x_block = tl.load(x_block_ptrs, mask=(mask_b[:, None, None] & mask_l[None, :, None] & 
-                                            (offs_h + h)[None, None, :] < hidden_size), other=0.0)
-        
-        # Reshape tensors for matrix multiplication
-        # x_block: (BLOCK_SIZE_B, BLOCK_SIZE_L, BLOCK_SIZE_H) -> (BLOCK_SIZE_B * BLOCK_SIZE_L, BLOCK_SIZE_H)
-        # up_w: (BLOCK_SIZE_H, BLOCK_SIZE_NB * BLOCK_SIZE_LS) -> (BLOCK_SIZE_H, BLOCK_SIZE_NB * BLOCK_SIZE_LS)
-        x_block_2d = x_block.reshape(BLOCK_SIZE_B * BLOCK_SIZE_L, BLOCK_SIZE_H)
+        # Load x block for this specific (batch, seq) element
+        # x: (batch_size, seq_len, hidden_size)
+        x_ptrs = x_ptr + (b * seq_len * hidden_size + l * hidden_size + offs_h + h)
+        x_block = tl.load(x_ptrs, mask=(offs_h + h) < hidden_size, other=0.0)
         
         # Accumulate matrix multiplication
-        up_proj += tl.dot(x_block_2d, up_w)
+        up_proj += tl.dot(x_block, up_w)
     
     # Add bias and apply ReLU
-    up_bias = tl.load(up_bias_ptr + tl.arange(0, BLOCK_SIZE_NB * BLOCK_SIZE_LS), 
-                     mask=tl.arange(0, BLOCK_SIZE_NB * BLOCK_SIZE_LS) < num_blocks * line_size, other=0.0)
-    up_proj += up_bias[None, None, :]
+    # up_bias: (intermediate_size,) -> (num_blocks * line_size,)
+    bias_ptrs = up_bias_ptr + (nb * line_size + offs_ls)
+    up_bias = tl.load(bias_ptrs, mask=mask_ls, other=0.0)
+    up_proj += up_bias
     up_proj = tl.where(up_proj > 0, up_proj, 0.0)
     
-    # Load pre-calculated gate values
-    g_ptrs = gate_ptr + (offs_b[:, None, None] * stride_gb + 
-                        offs_l[None, :, None] * stride_gl + 
-                        offs_nb[None, None, :] * stride_gnb)
-    g = tl.load(g_ptrs, mask=(mask_b[:, None, None] & mask_l[None, :, None] & mask_nb[None, None, :]), other=0.0)
-    
-    # Reshape up_proj to (batch, seq, BLOCK_SIZE_NB, BLOCK_SIZE_LS) and apply gate
-    up_proj_reshaped = up_proj.reshape(BLOCK_SIZE_B, BLOCK_SIZE_L, BLOCK_SIZE_NB, BLOCK_SIZE_LS)
-    gate_expanded = g[:, :, :, None]  # Expand to match up_proj_reshaped shape
-    
     # Apply gate activation
-    output = up_proj_reshaped * gate_expanded
+    output = up_proj * g
     
     # Store output
-    out_ptrs = output_ptr + (offs_b[:, None, None, None] * stride_outb + 
-                           offs_l[None, :, None, None] * stride_outl + 
-                           offs_nb[None, None, :, None] * stride_outnb + 
-                           offs_ls[None, None, None, :] * stride_outls)
-    tl.store(out_ptrs, output, mask=(mask_b[:, None, None, None] & mask_l[None, :, None, None] & 
-                                   mask_nb[None, None, :, None] & mask_ls[None, None, None, :]))
+    # output: (batch_size, seq_len, num_blocks, line_size)
+    out_ptrs = output_ptr + (b * seq_len * num_blocks * line_size + 
+                           l * num_blocks * line_size + nb * line_size + offs_ls)
+    tl.store(out_ptrs, output, mask=mask_ls)
 
 
 def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks, line_size):
@@ -159,6 +139,12 @@ def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks
     assert up_weight.shape == (hidden_size, intermediate_size), "Incompatible up_weight shape"
     assert gate.shape == (batch_size, seq_len, num_blocks), "Incompatible gate shape"
     
+    # Ensure all inputs are contiguous
+    x = x.contiguous()
+    up_weight = up_weight.contiguous()
+    up_bias = up_bias.contiguous()
+    gate = gate.contiguous()
+    
     # Allocate output
     output = torch.empty((batch_size, seq_len, num_blocks, line_size), 
                         device=x.device, dtype=x.dtype)
@@ -169,11 +155,7 @@ def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks
     fused_up_proj_gate_activation_kernel[grid](
         x, up_weight, up_bias, gate, output,
         batch_size, seq_len, hidden_size, num_blocks, line_size,
-        x.stride(0), x.stride(1), x.stride(2),
-        up_weight.stride(0), up_weight.stride(1),
-        gate.stride(0), gate.stride(1), gate.stride(2),
-        output.stride(0), output.stride(1), output.stride(2), output.stride(3),
-        BLOCK_SIZE_B=16, BLOCK_SIZE_L=16, BLOCK_SIZE_H=64, BLOCK_SIZE_NB=16, BLOCK_SIZE_LS=64,
+        BLOCK_SIZE_H=16, BLOCK_SIZE_LS=16,
     )
     
     # Reshape back to original shape
