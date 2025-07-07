@@ -106,7 +106,7 @@ def fused_up_proj_gate_activation_kernel(
         # Reshape tensors for matrix multiplication
         # x_block: (BLOCK_SIZE_B, BLOCK_SIZE_L, BLOCK_SIZE_H) -> (BLOCK_SIZE_B * BLOCK_SIZE_L, BLOCK_SIZE_H)
         # up_w: (BLOCK_SIZE_H, BLOCK_SIZE_NB * BLOCK_SIZE_LS) -> (BLOCK_SIZE_H, BLOCK_SIZE_NB * BLOCK_SIZE_LS)
-        x_block_2d = x_block.view(BLOCK_SIZE_B * BLOCK_SIZE_L, BLOCK_SIZE_H)
+        x_block_2d = x_block.reshape(BLOCK_SIZE_B * BLOCK_SIZE_L, BLOCK_SIZE_H)
         
         # Accumulate matrix multiplication
         up_proj += tl.dot(x_block_2d, up_w)
@@ -124,7 +124,7 @@ def fused_up_proj_gate_activation_kernel(
     g = tl.load(g_ptrs, mask=(mask_b[:, None, None] & mask_l[None, :, None] & mask_nb[None, None, :]), other=0.0)
     
     # Reshape up_proj to (batch, seq, BLOCK_SIZE_NB, BLOCK_SIZE_LS) and apply gate
-    up_proj_reshaped = up_proj.view(BLOCK_SIZE_B, BLOCK_SIZE_L, BLOCK_SIZE_NB, BLOCK_SIZE_LS)
+    up_proj_reshaped = up_proj.reshape(BLOCK_SIZE_B, BLOCK_SIZE_L, BLOCK_SIZE_NB, BLOCK_SIZE_LS)
     gate_expanded = g[:, :, :, None]  # Expand to match up_proj_reshaped shape
     
     # Apply gate activation
@@ -173,7 +173,7 @@ def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks
         up_weight.stride(0), up_weight.stride(1),
         gate.stride(0), gate.stride(1), gate.stride(2),
         output.stride(0), output.stride(1), output.stride(2), output.stride(3),
-        BLOCK_SIZE_B=1, BLOCK_SIZE_L=1, BLOCK_SIZE_H=64, BLOCK_SIZE_NB=1, BLOCK_SIZE_LS=64,
+        BLOCK_SIZE_B=16, BLOCK_SIZE_L=16, BLOCK_SIZE_H=64, BLOCK_SIZE_NB=16, BLOCK_SIZE_LS=64,
     )
     
     # Reshape back to original shape
