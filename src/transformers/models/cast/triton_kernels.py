@@ -103,8 +103,13 @@ def fused_up_proj_gate_activation_kernel(
         x_block = tl.load(x_block_ptrs, mask=(mask_b[:, None, None] & mask_l[None, :, None] & 
                                             (offs_h + h)[None, None, :] < hidden_size), other=0.0)
         
+        # Reshape tensors for matrix multiplication
+        # x_block: (BLOCK_SIZE_B, BLOCK_SIZE_L, BLOCK_SIZE_H) -> (BLOCK_SIZE_B * BLOCK_SIZE_L, BLOCK_SIZE_H)
+        # up_w: (BLOCK_SIZE_H, BLOCK_SIZE_NB * BLOCK_SIZE_LS) -> (BLOCK_SIZE_H, BLOCK_SIZE_NB * BLOCK_SIZE_LS)
+        x_block_2d = x_block.view(BLOCK_SIZE_B * BLOCK_SIZE_L, BLOCK_SIZE_H)
+        
         # Accumulate matrix multiplication
-        up_proj += tl.dot(x_block, up_w)
+        up_proj += tl.dot(x_block_2d, up_w)
     
     # Add bias and apply ReLU
     up_bias = tl.load(up_bias_ptr + tl.arange(0, BLOCK_SIZE_NB * BLOCK_SIZE_LS), 
