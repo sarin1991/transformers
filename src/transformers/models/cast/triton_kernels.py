@@ -118,7 +118,7 @@ def fused_up_proj_gate_activation_kernel(
     # output: (batch_seq_size, num_blocks, line_size)
     out_ptrs = output_ptr + (offs_bs[:, None, None] * num_blocks * line_size + 
                            nb * line_size + offs_ls[None, None, :])
-    tl.store(out_ptrs, output.reshape(BLOCK_SIZE_BS, 1, BLOCK_SIZE_LS), mask=(mask_bs[:, None, None] & mask_ls[None, None, :]))
+    tl.store(out_ptrs, output.view(BLOCK_SIZE_BS, 1, BLOCK_SIZE_LS), mask=(mask_bs[:, None, None] & mask_ls[None, None, :]))
 
 
 def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks, line_size):
