@@ -87,12 +87,15 @@ def fused_up_proj_gate_activation_kernel(
         x_ptrs += BLOCK_SIZE_H * stride_x_h
         w_ptrs += BLOCK_SIZE_H * stride_w_h
     
-    # Add bias and apply ReLU
+    # Add bias and apply ReLU - keep in float32 for precision
     # up_bias: (intermediate_size,) -> we need to load bias for the current block's line_size elements
     bias_ptrs = up_bias_ptr + (nb * line_size + offs_ls)
     up_bias = tl.load(bias_ptrs, mask=mask_ls, other=0.0)
     accumulator += up_bias[None, :]
     accumulator = tl.where(accumulator > 0, accumulator, 0.0)
+    
+    # Convert to float16 for gate multiplication (following Triton pattern)
+    accumulator = accumulator.to(tl.float16)
     
     # Apply gate activation: (BLOCK_SIZE_BS, BLOCK_SIZE_LS) * (BLOCK_SIZE_BS,) -> (BLOCK_SIZE_BS, BLOCK_SIZE_LS)
     output = accumulator * g[:, None]
