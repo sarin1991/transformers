@@ -72,7 +72,12 @@ def fused_up_proj_gate_activation_kernel(
     g = tl.load(g_ptrs, mask=mask_bs[:, None], other=0.0)
     
     # Check if all gates are zero - early return
-    if g.sum() == 0.0:
+    # Sum the gates and check if the sum is zero
+    g_sum = tl.sum(g, axis=0)
+    zero_gates = (g_sum == 0.0)
+    
+    # Early return if all gates are zero
+    if zero_gates:
         # Store zeros in output for this block
         out_ptrs = output_ptr + (offs_bs[:, None, None] * num_blocks * line_size + 
                                nb * line_size + offs_ls[None, None, :])
