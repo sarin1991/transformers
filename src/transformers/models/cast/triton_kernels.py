@@ -66,12 +66,12 @@ def fused_up_proj_gate_activation_kernel(
         # Store zeros in output for this block
         out_ptrs = output_ptr + (offs_bs[:, None] * stride_out_bs + 
                                (pid_nb * line_size + offs_ls)[None, :] * stride_out_ls)
-        tl.store(out_ptrs, tl.zeros((BLOCK_SIZE_BS, BLOCK_SIZE_LS), dtype=tl.float16), 
+        tl.store(out_ptrs, tl.zeros((BLOCK_SIZE_BS, BLOCK_SIZE_LS), dtype=tl.float32), 
                 mask=(mask_bs[:, None] & mask_ls[None, :]))
         return
     
-    # Initialize accumulator for matrix multiplication - keep in float16
-    accumulator = tl.zeros((BLOCK_SIZE_BS, BLOCK_SIZE_LS), dtype=tl.float16)
+    # Initialize accumulator for matrix multiplication - use float32 for tl.dot
+    accumulator = tl.zeros((BLOCK_SIZE_BS, BLOCK_SIZE_LS), dtype=tl.float32)
     
     # Create pointers for the first blocks of x and up_weight
     # Following the Triton pattern exactly
@@ -92,7 +92,7 @@ def fused_up_proj_gate_activation_kernel(
         x_ptrs += BLOCK_SIZE_H * stride_x_h
         w_ptrs += BLOCK_SIZE_H * stride_w_h
     
-    # Add bias and apply ReLU - keep in float16
+    # Add bias and apply ReLU - keep in float32 for precision
     bias_ptrs = up_bias_ptr + (pid_nb * line_size + offs_ls)
     up_bias = tl.load(bias_ptrs, mask=mask_ls, other=0.0)
     accumulator += up_bias[None, :]
@@ -114,22 +114,25 @@ def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks
         x: Input tensor of shape (batch_size, seq_len, hidden_size) - must be float16
         up_weight: Up projection weight of shape (hidden_size, intermediate_size) - must be float16
         up_bias: Up projection bias of shape (intermediate_size,) - must be float16
-        gate: Pre-calculated gate tensor of shape (batch_size, seq_len, num_blocks) - must be float16
+        gate: Pre-calculated gate tensor of shape (batch_size, seq_len, num_blocks) - must be float32
         num_blocks: Number of blocks
         line_size: Size of each line within a block
     Returns:
-        Output tensor of shape (batch_size, seq_len, intermediate_size), always float16
+        Output tensor of shape (batch_size, seq_len, intermediate_size), always float32
     """
     batch_size, seq_len, hidden_size = x.shape
     intermediate_size = num_blocks * line_size
     assert up_weight.shape == (hidden_size, intermediate_size), "Incompatible up_weight shape"
     assert gate.shape == (batch_size, seq_len, num_blocks), "Incompatible gate shape"
     
-    # Check that all inputs are float16
+    # Check that inputs are correct dtypes
     assert x.dtype == torch.float16, f"Input x must be float16, got {x.dtype}"
     assert up_weight.dtype == torch.float16, f"up_weight must be float16, got {up_weight.dtype}"
     assert up_bias.dtype == torch.float16, f"up_bias must be float16, got {up_bias.dtype}"
-    assert gate.dtype == torch.float16, f"gate must be float16, got {gate.dtype}"
+    
+    # Optionally upcast gate to float32 if not already
+    if gate.dtype != torch.float32:
+        gate = gate.float()
 
     # Ensure all inputs are contiguous
     x = x.contiguous()
@@ -142,9 +145,9 @@ def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks
     x_reshaped = x.view(batch_seq_size, hidden_size)
     gate_reshaped = gate.view(batch_seq_size, num_blocks)
 
-    # Allocate output as 2D tensor (float16)
+    # Allocate output as 2D tensor (float32)
     output = torch.empty((batch_seq_size, num_blocks * line_size), 
-                        device=x.device, dtype=torch.float16)
+                        device=x.device, dtype=torch.float32)
 
     # Launch kernel with 3D blocking across batch_seq, num_blocks, and line_size
     num_pid_bs = (batch_seq_size + 15) // 16
@@ -169,7 +172,7 @@ def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks
 def test_fused_up_proj_gate_activation_triton():
     """
     Test the correctness of fused_up_proj_gate_activation_triton against a PyTorch reference implementation.
-    All operations done in float16 for consistency.
+    Inputs are float16, gate is float32, output is float32.
     """
     print("Testing fused_up_proj_gate_activation_triton correctness...")
     # Test a few configurations
@@ -183,34 +186,34 @@ def test_fused_up_proj_gate_activation_triton():
         intermediate_size = num_blocks * line_size
         print(f"\n--- Testing Config {batch_size}x{seq_len}x{hidden_size}x{num_blocks}x{line_size} ---")
         
-        # Test float16
-        print("Testing float16 implementation:")
+        # Test with float16 inputs and float32 gate
+        print("Testing implementation:")
         x_fp16 = torch.randn(batch_size, seq_len, hidden_size, device='cuda', dtype=torch.float16)
         up_weight_fp16 = torch.randn(intermediate_size, hidden_size, device='cuda', dtype=torch.float16)
         up_bias_fp16 = torch.randn(intermediate_size, device='cuda', dtype=torch.float16)
-        gate_fp16 = torch.randn(batch_size, seq_len, num_blocks, device='cuda', dtype=torch.float16)
+        gate_fp32 = torch.randn(batch_size, seq_len, num_blocks, device='cuda', dtype=torch.float32)
         
-        # PyTorch reference (all float16)
-        up_proj_fp16 = F.relu(F.linear(x_fp16, up_weight_fp16, up_bias_fp16))
-        up_proj_reshaped_fp16 = up_proj_fp16.view(batch_size, seq_len, num_blocks, line_size)
-        gate_expanded_fp16 = gate_fp16.unsqueeze(-1).expand_as(up_proj_reshaped_fp16)
-        ref_fp16 = (up_proj_reshaped_fp16 * gate_expanded_fp16).view(batch_size, seq_len, intermediate_size)
+        # PyTorch reference (float16 inputs, float32 gate, float32 output)
+        up_proj_fp16 = F.relu(F.linear(x_fp16, up_weight_fp16, up_bias_fp16)).float()  # Convert to float32
+        up_proj_reshaped_fp32 = up_proj_fp16.view(batch_size, seq_len, num_blocks, line_size)
+        gate_expanded_fp32 = gate_fp32.unsqueeze(-1).expand_as(up_proj_reshaped_fp32)
+        ref_fp32 = (up_proj_reshaped_fp32 * gate_expanded_fp32).view(batch_size, seq_len, intermediate_size)
         
-        # Triton kernel (float16)
+        # Triton kernel (float16 inputs, float32 gate, float32 output)
         up_weight_triton_fp16 = up_weight_fp16.t()
-        out_fp16 = fused_up_proj_gate_activation_triton(x_fp16, up_weight_triton_fp16, up_bias_fp16, gate_fp16, num_blocks, line_size)
-        max_diff_fp16 = torch.max(torch.abs(ref_fp16 - out_fp16)).item()
-        mean_diff_fp16 = torch.mean(torch.abs(ref_fp16 - out_fp16)).item()
-        print(f"  Float16: Max diff = {max_diff_fp16:.6f}, Mean diff = {mean_diff_fp16:.6f}")
+        out_fp32 = fused_up_proj_gate_activation_triton(x_fp16, up_weight_triton_fp16, up_bias_fp16, gate_fp32, num_blocks, line_size)
+        max_diff = torch.max(torch.abs(ref_fp32 - out_fp32)).item()
+        mean_diff = torch.mean(torch.abs(ref_fp32 - out_fp32)).item()
+        print(f"  Max diff = {max_diff:.6f}, Mean diff = {mean_diff:.6f}")
         
-        # Assertions - very tight tolerances since both are float16
-        assert max_diff_fp16 < 1e-4, f"Float16 test failed for config {batch_size}x{seq_len}x{hidden_size}x{num_blocks}x{line_size}"
+        # Assertions - tight tolerances since we're comparing float32 outputs
+        assert max_diff < 1e-5, f"Test failed for config {batch_size}x{seq_len}x{hidden_size}x{num_blocks}x{line_size}"
         
         print(f"✅ Config {batch_size}x{seq_len}x{hidden_size}x{num_blocks}x{line_size} passed!")
     
     print("\n🎉 All tests passed!")
-    print("Note: All calculations done in float16 for consistency.")
-    print("Kernel operates entirely in float16 as designed.")
+    print("Note: Inputs are float16, gate is float32, output is float32.")
+    print("Kernel uses float32 accumulation for precision.")
 
 
 if __name__ == "__main__":
