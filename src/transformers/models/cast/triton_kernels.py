@@ -9,8 +9,8 @@ import torch.nn.functional as F
 @triton.jit
 def fused_up_proj_gate_activation_kernel(
     x_ptr, up_weight_ptr, up_bias_ptr, gate_ptr, output_ptr,
-    batch_size, seq_len, hidden_size, num_blocks, line_size,
-    BLOCK_SIZE_H: tl.constexpr, BLOCK_SIZE_LS: tl.constexpr,
+    batch_seq_size, hidden_size, num_blocks, line_size,
+    BLOCK_SIZE_BS: tl.constexpr, BLOCK_SIZE_H: tl.constexpr, BLOCK_SIZE_LS: tl.constexpr,
 ):
     """
     Fused kernel that performs:
@@ -20,22 +20,22 @@ def fused_up_proj_gate_activation_kernel(
     
     Parameters:
     -----------
-    x_ptr: Pointer to input tensor of shape (batch_size, seq_len, hidden_size) - contiguous
+    x_ptr: Pointer to input tensor of shape (batch_seq_size, hidden_size) - contiguous
     up_weight_ptr: Pointer to up projection weight of shape (hidden_size, intermediate_size) - contiguous
     up_bias_ptr: Pointer to up projection bias of shape (intermediate_size,) - contiguous
-    gate_ptr: Pointer to pre-calculated gate tensor of shape (batch_size, seq_len, num_blocks) - contiguous
-    output_ptr: Pointer to output tensor of shape (batch_size, seq_len, num_blocks, line_size) - contiguous
+    gate_ptr: Pointer to pre-calculated gate tensor of shape (batch_seq_size, num_blocks) - contiguous
+    output_ptr: Pointer to output tensor of shape (batch_seq_size, num_blocks, line_size) - contiguous
     
     Dimensions:
     -----------
-    batch_size: Number of batches
-    seq_len: Sequence length
+    batch_seq_size: Combined batch_size * seq_len
     hidden_size: Input hidden dimension
     num_blocks: Number of blocks for gate activation
     line_size: Size of each line within a block (intermediate_size = num_blocks * line_size)
     
     Block Sizes (compile-time constants):
     ------------------------------------
+    BLOCK_SIZE_BS: Number of batch_seq elements processed per block (minimum 16)
     BLOCK_SIZE_H: Number of hidden dimensions processed per block (minimum 16)
     BLOCK_SIZE_LS: Number of line size elements processed per block (minimum 16)
     
@@ -45,78 +45,75 @@ def fused_up_proj_gate_activation_kernel(
     # Get program ID
     pid = tl.program_id(0)
     
-    # Calculate block indices - process one (batch, seq, block) element at a time
-    total_blocks = batch_size * seq_len * num_blocks
+    # Calculate block indices - process multiple (batch_seq, block) elements at a time
+    total_blocks = (batch_seq_size + BLOCK_SIZE_BS - 1) // BLOCK_SIZE_BS * num_blocks
     block_idx = pid
     
     if block_idx >= total_blocks:
         return
     
     # Calculate indices
-    b = block_idx // (seq_len * num_blocks)
-    l = (block_idx // num_blocks) % seq_len
+    block_group_idx = block_idx // num_blocks
     nb = block_idx % num_blocks
     
     # Create offsets for the block
+    offs_bs = block_group_idx * BLOCK_SIZE_BS + tl.arange(0, BLOCK_SIZE_BS)
+    offs_h = tl.arange(0, BLOCK_SIZE_H)
     offs_ls = tl.arange(0, BLOCK_SIZE_LS)
     
     # Create masks
+    mask_bs = offs_bs < batch_seq_size
+    mask_h = offs_h < hidden_size
     mask_ls = offs_ls < line_size
     
-    # Load pre-calculated gate value for this specific (batch, seq, block) element early
-    # gate: (batch_size, seq_len, num_blocks)
-    g_ptr = gate_ptr + (b * seq_len * num_blocks + l * num_blocks + nb)
-    g = tl.load(g_ptr)
+    # Load pre-calculated gate values for this block
+    # gate: (batch_seq_size, num_blocks)
+    g_ptrs = gate_ptr + (offs_bs[:, None] * num_blocks + nb)
+    g = tl.load(g_ptrs, mask=mask_bs[:, None], other=0.0)
     
-    # Early return if gate is zero - no need to compute matrix multiplication
-    if g == 0.0:
-        # Store zeros in output
-        # output: (batch_size, seq_len, num_blocks, line_size)
-        out_ptrs = output_ptr + (b * seq_len * num_blocks * line_size + 
-                               l * num_blocks * line_size + nb * line_size + offs_ls)
-        tl.store(out_ptrs, tl.zeros((BLOCK_SIZE_LS,), dtype=tl.float32), mask=mask_ls)
+    # Check if all gates are zero - early return
+    if g.sum() == 0.0:
+        # Store zeros in output for this block
+        out_ptrs = output_ptr + (offs_bs[:, None, None] * num_blocks * line_size + 
+                               nb * line_size + offs_ls[None, None, :])
+        tl.store(out_ptrs, tl.zeros((BLOCK_SIZE_BS, 1, BLOCK_SIZE_LS), dtype=tl.float32), 
+                mask=(mask_bs[:, None, None] & mask_ls[None, None, :]))
         return
     
-    # Create offsets for the block (only needed if gate is non-zero)
-    offs_h = tl.arange(0, BLOCK_SIZE_H)
-    
-    # Create masks
-    mask_h = offs_h < hidden_size
-    
     # Compute up projection: up_proj = F.relu(x @ up_weight + up_bias)
-    up_proj = tl.zeros((BLOCK_SIZE_LS,), dtype=tl.float32)
+    up_proj = tl.zeros((BLOCK_SIZE_BS, BLOCK_SIZE_LS), dtype=tl.float32)
     
     # Matrix multiplication for up projection
     for h in range(0, hidden_size, BLOCK_SIZE_H):
-        # Load up_weight block for this specific (batch, seq, block) element
+        # Load up_weight block: (BLOCK_SIZE_H, BLOCK_SIZE_LS)
         # up_weight: (hidden_size, intermediate_size) -> (hidden_size, num_blocks * line_size)
-        up_w_ptrs = up_weight_ptr + (offs_h[:, None] * (num_blocks * line_size) + 
+        up_w_ptrs = up_weight_ptr + ((offs_h + h)[:, None] * (num_blocks * line_size) + 
                                    (nb * line_size + offs_ls)[None, :])
         up_w = tl.load(up_w_ptrs, mask=(mask_h[:, None] & mask_ls[None, :]), other=0.0)
         
-        # Load x block for this specific (batch, seq) element
-        # x: (batch_size, seq_len, hidden_size)
-        x_ptrs = x_ptr + (b * seq_len * hidden_size + l * hidden_size + offs_h + h)
-        x_block = tl.load(x_ptrs, mask=(offs_h + h) < hidden_size, other=0.0)
+        # Load x block: (BLOCK_SIZE_BS, BLOCK_SIZE_H)
+        # x: (batch_seq_size, hidden_size)
+        x_ptrs = x_ptr + (offs_bs[:, None] * hidden_size + (offs_h + h)[None, :])
+        x_block = tl.load(x_ptrs, mask=(mask_bs[:, None] & mask_h[None, :]), other=0.0)
         
-        # Accumulate matrix multiplication
+        # Matrix multiplication: (BLOCK_SIZE_BS, BLOCK_SIZE_H) @ (BLOCK_SIZE_H, BLOCK_SIZE_LS) -> (BLOCK_SIZE_BS, BLOCK_SIZE_LS)
         up_proj += tl.dot(x_block, up_w)
     
     # Add bias and apply ReLU
     # up_bias: (intermediate_size,) -> (num_blocks * line_size,)
     bias_ptrs = up_bias_ptr + (nb * line_size + offs_ls)
     up_bias = tl.load(bias_ptrs, mask=mask_ls, other=0.0)
-    up_proj += up_bias
+    up_proj += up_bias[None, :]
     up_proj = tl.where(up_proj > 0, up_proj, 0.0)
     
-    # Apply gate activation
-    output = up_proj * g
+    # Apply gate activation: (BLOCK_SIZE_BS, BLOCK_SIZE_LS) * (BLOCK_SIZE_BS, 1) -> (BLOCK_SIZE_BS, BLOCK_SIZE_LS)
+    output = up_proj * g[:, None]
     
     # Store output
-    # output: (batch_size, seq_len, num_blocks, line_size)
-    out_ptrs = output_ptr + (b * seq_len * num_blocks * line_size + 
-                           l * num_blocks * line_size + nb * line_size + offs_ls)
-    tl.store(out_ptrs, output, mask=mask_ls)
+    # output: (batch_seq_size, num_blocks, line_size)
+    out_ptrs = output_ptr + (offs_bs[:, None] * num_blocks * line_size + 
+                           nb * line_size + offs_ls[None, :])
+    tl.store(out_ptrs, output, mask=(mask_bs[:, None] & mask_ls[None, :]))
 
 
 def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks, line_size):
@@ -145,17 +142,22 @@ def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks
     up_bias = up_bias.contiguous()
     gate = gate.contiguous()
     
+    # Reshape inputs to combine batch_size and seq_len
+    batch_seq_size = batch_size * seq_len
+    x_reshaped = x.view(batch_seq_size, hidden_size)
+    gate_reshaped = gate.view(batch_seq_size, num_blocks)
+    
     # Allocate output
-    output = torch.empty((batch_size, seq_len, num_blocks, line_size), 
+    output = torch.empty((batch_seq_size, num_blocks, line_size), 
                         device=x.device, dtype=x.dtype)
     
     # Launch kernel
-    grid = (batch_size * seq_len * num_blocks,)
+    grid = ((batch_seq_size + 15) // 16 * num_blocks,)
     
     fused_up_proj_gate_activation_kernel[grid](
-        x, up_weight, up_bias, gate, output,
-        batch_size, seq_len, hidden_size, num_blocks, line_size,
-        BLOCK_SIZE_H=16, BLOCK_SIZE_LS=16,
+        x_reshaped, up_weight, up_bias, gate_reshaped, output,
+        batch_seq_size, hidden_size, num_blocks, line_size,
+        BLOCK_SIZE_BS=16, BLOCK_SIZE_H=16, BLOCK_SIZE_LS=16,
     )
     
     # Reshape back to original shape
