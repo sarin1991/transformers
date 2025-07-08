@@ -22,25 +22,29 @@ def fused_up_proj_gate_activation_kernel(
     2. output = up_proj * gate (reshaped and applied)
     
     Following proper Triton matrix multiplication pattern with gating logic added.
+    Blocks across batch_seq, num_blocks, and line_size dimensions.
     """
     # Get program ID
     pid = tl.program_id(0)
     
-    # Calculate block indices - process multiple (batch_seq, block) elements at a time
-    total_blocks = (batch_seq_size + BLOCK_SIZE_BS - 1) // BLOCK_SIZE_BS * num_blocks
-    block_idx = pid
+    # Calculate block indices - block across batch_seq, num_blocks, and line_size
+    # Similar to reference Triton pattern: pid = pid_m * num_pid_n + pid_n
+    num_pid_bs = (batch_seq_size + BLOCK_SIZE_BS - 1) // BLOCK_SIZE_BS
+    num_pid_nb = num_blocks
+    num_pid_ls = (line_size + BLOCK_SIZE_LS - 1) // BLOCK_SIZE_LS
     
-    if block_idx >= total_blocks:
+    # Calculate 3D block indices
+    pid_ls = pid % num_pid_ls
+    pid_nb = (pid // num_pid_ls) % num_pid_nb
+    pid_bs = (pid // num_pid_ls) // num_pid_nb
+    
+    if pid_bs >= num_pid_bs:
         return
     
-    # Calculate indices
-    block_group_idx = block_idx // num_blocks
-    nb = block_idx % num_blocks
-    
     # Create offsets for the block - following Triton pattern
-    offs_bs = (block_group_idx * BLOCK_SIZE_BS + tl.arange(0, BLOCK_SIZE_BS)) % batch_seq_size
+    offs_bs = (pid_bs * BLOCK_SIZE_BS + tl.arange(0, BLOCK_SIZE_BS)) % batch_seq_size
     offs_h = tl.arange(0, BLOCK_SIZE_H)
-    offs_ls = tl.arange(0, BLOCK_SIZE_LS)
+    offs_ls = (pid_ls * BLOCK_SIZE_LS + tl.arange(0, BLOCK_SIZE_LS)) % line_size
     
     # Create masks
     mask_bs = offs_bs < batch_seq_size
@@ -49,7 +53,7 @@ def fused_up_proj_gate_activation_kernel(
     
     # Load pre-calculated gate values for this block
     # gate: (batch_seq_size, num_blocks)
-    g_ptrs = gate_ptr + (offs_bs * stride_g_bs + nb * stride_g_nb)
+    g_ptrs = gate_ptr + (offs_bs * stride_g_bs + pid_nb * stride_g_nb)
     g = tl.load(g_ptrs, mask=mask_bs, other=0.0)
     
     # Check if all gates are zero - early return
@@ -60,7 +64,7 @@ def fused_up_proj_gate_activation_kernel(
     if zero_gates:
         # Store zeros in output for this block
         out_ptrs = output_ptr + (offs_bs[:, None] * stride_out_bs + 
-                               (nb * line_size + offs_ls)[None, :] * stride_out_ls)
+                               (pid_nb * line_size + offs_ls)[None, :] * stride_out_ls)
         tl.store(out_ptrs, tl.zeros((BLOCK_SIZE_BS, BLOCK_SIZE_LS), dtype=tl.float32), 
                 mask=(mask_bs[:, None] & mask_ls[None, :]))
         return
@@ -72,7 +76,7 @@ def fused_up_proj_gate_activation_kernel(
     # Following the Triton pattern exactly
     x_ptrs = x_ptr + (offs_bs[:, None] * stride_x_bs + offs_h[None, :] * stride_x_h)
     w_ptrs = up_weight_ptr + (offs_h[:, None] * stride_w_h + 
-                            (nb * line_size + offs_ls)[None, :] * stride_w_ls)
+                            (pid_nb * line_size + offs_ls)[None, :] * stride_w_ls)
     
     # Matrix multiplication: x @ up_weight
     for h in range(0, hidden_size, BLOCK_SIZE_H):
@@ -89,7 +93,7 @@ def fused_up_proj_gate_activation_kernel(
     
     # Add bias and apply ReLU - keep in float32 for precision
     # up_bias: (intermediate_size,) -> we need to load bias for the current block's line_size elements
-    bias_ptrs = up_bias_ptr + (nb * line_size + offs_ls)
+    bias_ptrs = up_bias_ptr + (pid_nb * line_size + offs_ls)
     up_bias = tl.load(bias_ptrs, mask=mask_ls, other=0.0)
     accumulator += up_bias[None, :]
     accumulator = tl.where(accumulator > 0, accumulator, 0.0)
@@ -103,7 +107,7 @@ def fused_up_proj_gate_activation_kernel(
     # Store output - following Triton pattern
     # output: (batch_seq_size, num_blocks * line_size) - 2D for simplicity
     out_ptrs = output_ptr + (offs_bs[:, None] * stride_out_bs + 
-                           (nb * line_size + offs_ls)[None, :] * stride_out_ls)
+                           (pid_nb * line_size + offs_ls)[None, :] * stride_out_ls)
     tl.store(out_ptrs, output, mask=(mask_bs[:, None] & mask_ls[None, :]))
 
 
@@ -142,8 +146,11 @@ def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks
     output = torch.empty((batch_seq_size, num_blocks * line_size), 
                         device=x.device, dtype=x.dtype)
     
-    # Launch kernel
-    grid = ((batch_seq_size + 15) // 16 * num_blocks,)
+    # Launch kernel with 3D blocking across batch_seq, num_blocks, and line_size
+    num_pid_bs = (batch_seq_size + 15) // 16
+    num_pid_nb = num_blocks
+    num_pid_ls = (line_size + 15) // 16
+    grid = (num_pid_bs * num_pid_nb * num_pid_ls,)
     
     fused_up_proj_gate_activation_kernel[grid](
         x_reshaped, up_weight, up_bias, gate_reshaped, output,
