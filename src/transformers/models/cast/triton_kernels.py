@@ -37,8 +37,8 @@ def fused_up_proj_gate_activation_kernel(
     block_group_idx = block_idx // num_blocks
     nb = block_idx % num_blocks
     
-    # Create offsets for the block
-    offs_bs = block_group_idx * BLOCK_SIZE_BS + tl.arange(0, BLOCK_SIZE_BS)
+    # Create offsets for the block - following Triton pattern
+    offs_bs = (block_group_idx * BLOCK_SIZE_BS + tl.arange(0, BLOCK_SIZE_BS)) % batch_seq_size
     offs_h = tl.arange(0, BLOCK_SIZE_H)
     offs_ls = tl.arange(0, BLOCK_SIZE_LS)
     
@@ -65,26 +65,30 @@ def fused_up_proj_gate_activation_kernel(
                 mask=(mask_bs[:, None] & mask_ls[None, :]))
         return
     
-    # Initialize accumulator for matrix multiplication
+    # Initialize accumulator for matrix multiplication - following Triton pattern
     accumulator = tl.zeros((BLOCK_SIZE_BS, BLOCK_SIZE_LS), dtype=tl.float32)
+    
+    # Create pointers for the first blocks of x and up_weight
+    # Following the Triton pattern exactly
+    x_ptrs = x_ptr + (offs_bs[:, None] * stride_x_bs + offs_h[None, :] * stride_x_h)
+    w_ptrs = up_weight_ptr + (offs_h[:, None] * stride_w_h + 
+                            (nb * line_size + offs_ls)[None, :] * stride_w_ls)
     
     # Matrix multiplication: x @ up_weight
     for h in range(0, hidden_size, BLOCK_SIZE_H):
-        # Load x block: (BLOCK_SIZE_BS, BLOCK_SIZE_H)
-        x_ptrs = x_ptr + (offs_bs[:, None] * stride_x_bs + (offs_h + h)[None, :] * stride_x_h)
+        # Load blocks with proper masking
         x_block = tl.load(x_ptrs, mask=(mask_bs[:, None] & mask_h[None, :]), other=0.0)
-        
-        # Load up_weight block: (BLOCK_SIZE_H, BLOCK_SIZE_LS)
-        # up_weight: (hidden_size, intermediate_size) -> (hidden_size, num_blocks * line_size)
-        w_ptrs = up_weight_ptr + ((offs_h + h)[:, None] * stride_w_h + 
-                                (nb * line_size + offs_ls)[None, :] * stride_w_ls)
         w_block = tl.load(w_ptrs, mask=(mask_h[:, None] & mask_ls[None, :]), other=0.0)
         
         # Matrix multiplication: (BLOCK_SIZE_BS, BLOCK_SIZE_H) @ (BLOCK_SIZE_H, BLOCK_SIZE_LS) -> (BLOCK_SIZE_BS, BLOCK_SIZE_LS)
         accumulator = tl.dot(x_block, w_block, accumulator)
+        
+        # Advance pointers to next K block - following Triton pattern
+        x_ptrs += BLOCK_SIZE_H * stride_x_h
+        w_ptrs += BLOCK_SIZE_H * stride_w_h
     
     # Add bias and apply ReLU
-    # up_bias: (intermediate_size,) -> (num_blocks * line_size,)
+    # up_bias: (intermediate_size,) -> we need to load bias for the current block's line_size elements
     bias_ptrs = up_bias_ptr + (nb * line_size + offs_ls)
     up_bias = tl.load(bias_ptrs, mask=mask_ls, other=0.0)
     accumulator += up_bias[None, :]
@@ -93,7 +97,7 @@ def fused_up_proj_gate_activation_kernel(
     # Apply gate activation: (BLOCK_SIZE_BS, BLOCK_SIZE_LS) * (BLOCK_SIZE_BS,) -> (BLOCK_SIZE_BS, BLOCK_SIZE_LS)
     output = accumulator * g[:, None]
     
-    # Store output
+    # Store output - following Triton pattern
     # output: (batch_seq_size, num_blocks * line_size) - 2D for simplicity
     out_ptrs = output_ptr + (offs_bs[:, None] * stride_out_bs + 
                            (nb * line_size + offs_ls)[None, :] * stride_out_ls)
