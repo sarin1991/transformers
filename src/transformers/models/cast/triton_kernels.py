@@ -24,7 +24,7 @@ def fused_up_proj_gate_activation_kernel(
     up_weight_ptr: Pointer to up projection weight of shape (hidden_size, intermediate_size) - contiguous
     up_bias_ptr: Pointer to up projection bias of shape (intermediate_size,) - contiguous
     gate_ptr: Pointer to pre-calculated gate tensor of shape (batch_seq_size, num_blocks) - contiguous
-    output_ptr: Pointer to output tensor of shape (batch_seq_size, num_blocks, line_size) - contiguous
+    output_ptr: Pointer to output tensor of shape (batch_seq_size, num_blocks * line_size) - contiguous
     
     Dimensions:
     -----------
@@ -79,10 +79,10 @@ def fused_up_proj_gate_activation_kernel(
     # Early return if all gates are zero
     if zero_gates:
         # Store zeros in output for this block
-        out_ptrs = output_ptr + (offs_bs[:, None, None] * num_blocks * line_size + 
-                               nb * line_size + offs_ls[None, None, :])
-        tl.store(out_ptrs, tl.zeros((BLOCK_SIZE_BS, 1, BLOCK_SIZE_LS), dtype=tl.float32), 
-                mask=(mask_bs[:, None, None] & mask_ls[None, None, :]))
+        out_ptrs = output_ptr + (offs_bs[:, None] * (num_blocks * line_size) + 
+                               nb * line_size + offs_ls[None, :])
+        tl.store(out_ptrs, tl.zeros((BLOCK_SIZE_BS, BLOCK_SIZE_LS), dtype=tl.float32), 
+                mask=(mask_bs[:, None] & mask_ls[None, :]))
         return
     
     # Compute up projection: up_proj = F.relu(x @ up_weight + up_bias)
@@ -115,10 +115,10 @@ def fused_up_proj_gate_activation_kernel(
     output = up_proj * g[:, None]
     
     # Store output
-    # output: (batch_seq_size, num_blocks, line_size)
-    out_ptrs = output_ptr + (offs_bs[:, None, None] * num_blocks * line_size + 
-                           nb * line_size + offs_ls[None, None, :])
-    tl.store(out_ptrs, output.view(BLOCK_SIZE_BS, 1, BLOCK_SIZE_LS), mask=(mask_bs[:, None, None] & mask_ls[None, None, :]))
+    # output: (batch_seq_size, num_blocks * line_size) - 2D for simplicity
+    out_ptrs = output_ptr + (offs_bs[:, None] * (num_blocks * line_size) + 
+                           nb * line_size + offs_ls[None, :])
+    tl.store(out_ptrs, output, mask=(mask_bs[:, None] & mask_ls[None, :]))
 
 
 def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks, line_size):
@@ -152,8 +152,8 @@ def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks
     x_reshaped = x.view(batch_seq_size, hidden_size)
     gate_reshaped = gate.view(batch_seq_size, num_blocks)
     
-    # Allocate output
-    output = torch.empty((batch_seq_size, num_blocks, line_size), 
+    # Allocate output as 2D tensor
+    output = torch.empty((batch_seq_size, num_blocks * line_size), 
                         device=x.device, dtype=x.dtype)
     
     # Launch kernel
