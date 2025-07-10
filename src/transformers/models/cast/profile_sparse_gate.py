@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch.profiler import ProfilerActivity, profile, record_function
 
 # Import the dense & sparse helpers from the same package
-from transformers.models.cast.triton_kernels import (
+from triton_kernels import (
     fused_up_proj_gate_activation_triton,
     fused_up_proj_gate_activation_sparse_triton,
 )
