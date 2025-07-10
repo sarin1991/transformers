@@ -104,7 +104,7 @@ def fused_up_proj_gate_activation_kernel(
         w_block = tl.load(w_ptrs, mask=(mask_h_iter[:, None] & mask_ls[None, :]), other=0.0)
 
         # (BLOCK_SIZE_BS x BLOCK_SIZE_H) @ (BLOCK_SIZE_H x BLOCK_SIZE_LS) → (BLOCK_SIZE_BS x BLOCK_SIZE_LS)
-        accumulator = tl.dot(x_block, w_block, accumulator)
+        accumulator += tl.dot(x_block, w_block)
 
         # Advance pointers along K dimension
         x_ptrs += BLOCK_SIZE_H * stride_x_h
