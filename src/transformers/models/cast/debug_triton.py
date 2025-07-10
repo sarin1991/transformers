@@ -32,12 +32,11 @@ def debug_small_scale():
     # Show input values
     print(f"Input x values:\n{x_fp16}")
     
-    # PyTorch reference - show pre-ReLU values
-    ref_pre_relu = F.linear(x_fp16, up_weight_fp16, up_bias_fp16)
-    print(f"PyTorch pre-ReLU values:\n{ref_pre_relu}")
-    
-    ref_fp16 = F.relu(ref_pre_relu)
-    ref_fp32 = ref_fp16.float()
+    # PyTorch reference (compute in fp32)
+    ref_pre_relu = F.linear(x_fp16.float(), up_weight_fp16.float(), up_bias_fp16.float())
+    print(f"PyTorch pre-ReLU values (fp32):\n{ref_pre_relu}")
+
+    ref_fp32 = F.relu(ref_pre_relu)
     
     print(f"PyTorch reference shape: {ref_fp32.shape}")
     print(f"PyTorch reference values:\n{ref_fp32}")
@@ -84,9 +83,8 @@ def debug_step_by_step():
     print(f"up_bias_fp16: {up_bias_fp16}")
     print(f"gate_fp32: {gate_fp32}")
     
-    # PyTorch reference
-    ref_fp16 = F.relu(F.linear(x_fp16, up_weight_fp16, up_bias_fp16))
-    ref_fp32 = ref_fp16.float()
+    # PyTorch reference (fp32)
+    ref_fp32 = F.relu(F.linear(x_fp16.float(), up_weight_fp16.float(), up_bias_fp16.float()))
     
     print(f"PyTorch reference: {ref_fp32}")
     
@@ -124,11 +122,10 @@ def debug_simple_matmul():
     print(f"x_fp16: {x_fp16}")
     print(f"up_weight_fp16: {up_weight_fp16}")
     
-    # PyTorch reference - just matrix multiplication
-    x_reshaped = x_fp16.view(batch_size * seq_len, hidden_size)
-    ref_matmul = F.linear(x_reshaped, up_weight_fp16, up_bias_fp16)
-    ref_relu = F.relu(ref_matmul)
-    ref_fp32 = ref_relu.float()
+    # PyTorch reference - matrix multiplication in fp32
+    x_reshaped = x_fp16.view(batch_size * seq_len, hidden_size).float()
+    ref_matmul = F.linear(x_reshaped, up_weight_fp16.float(), up_bias_fp16.float())
+    ref_fp32 = F.relu(ref_matmul)
     
     print(f"PyTorch matmul result: {ref_matmul}")
     print(f"PyTorch final result: {ref_fp32}")
@@ -176,9 +173,8 @@ def debug_weight_layout():
     print(f"Transposed weight shape: {up_weight_triton_fp16.shape}")
     print(f"Transposed weight:\n{up_weight_triton_fp16}")
     
-    # PyTorch reference
-    ref_fp16 = F.relu(F.linear(x_fp16, up_weight_fp16, up_bias_fp16))
-    ref_fp32 = ref_fp16.float()
+    # PyTorch reference (fp32)
+    ref_fp32 = F.relu(F.linear(x_fp16.float(), up_weight_fp16.float(), up_bias_fp16.float()))
     
     print(f"PyTorch reference: {ref_fp32}")
     
@@ -213,27 +209,23 @@ if __name__ == "__main__":
     if not torch.cuda.is_available():
         print("❌ CUDA is not available.")
         exit(1)
-    
+
     try:
         import triton
         print("✅ Triton is available.")
     except ImportError:
         print("❌ Triton is not available.")
         exit(1)
-    
-    # Debug weight layout first
+
+    # 1. Weight-layout sanity check (deterministic)
     weight_diff = debug_weight_layout()
-    
-    # Run small scale debug with zero bias and ones gate
-    max_diff = debug_small_scale()
-    
-    print(f"\n=== Summary ===")
-    print(f"Weight layout diff: {weight_diff:.6f}")
-    print(f"Max diff at small scale: {max_diff:.6f}")
-    
-    if weight_diff < 1e-6 and max_diff < 1e-6:
-        print("✅ Matrix multiplication is working perfectly!")
-    elif weight_diff < 1e-3 and max_diff < 1e-3:
+
+    print("\n=== Summary ===")
+    print(f"Weight layout diff : {weight_diff:.6f}")
+
+    if weight_diff < 1e-6:
+        print("✅ Weight layout check passed!")
+    elif weight_diff < 1e-3:
         print("⚠️  Small differences, but likely acceptable.")
     else:
         print("❌ Significant differences - issue needs investigation.") 

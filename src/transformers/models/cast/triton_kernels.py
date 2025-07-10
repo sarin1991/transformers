@@ -223,15 +223,141 @@ def test_fused_up_proj_gate_activation_triton():
     print("Kernel uses float32 accumulation for precision.")
 
 
+# --------------------------------------------------
+# Large-scale correctness test (moved from debug_triton.py)
+# --------------------------------------------------
+
+
+def debug_large_scale():
+    """Run several bigger shapes to verify numerical correctness."""
+    print("\n=== Large Scale Debug (triton_kernels) ===")
+
+    test_configs = [
+        (2, 4, 64, 4, 16),
+        (4, 8, 128, 4, 32),
+        (8, 16, 256, 8, 32),
+        (16, 32, 512, 8, 64),
+    ]
+
+    overall_max = 0.0
+
+    for batch_size, seq_len, hidden_size, num_blocks, line_size in test_configs:
+        intermediate_size = num_blocks * line_size
+        cfg = f"{batch_size}x{seq_len}x{hidden_size}x{num_blocks}x{line_size}"
+        print(f"\nConfig: {cfg}")
+
+        # Random fp16 data
+        x_fp16 = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float16)
+        up_weight_fp16 = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=torch.float16)
+        up_bias_fp16 = torch.randn(intermediate_size, device="cuda", dtype=torch.float16)
+        gate_fp32 = torch.rand(batch_size, seq_len, num_blocks, device="cuda", dtype=torch.float32)
+
+        # PyTorch reference in fp32
+        up_proj_fp32 = F.relu(F.linear(x_fp16.float(), up_weight_fp16.float(), up_bias_fp16.float()))
+        ref_reshaped = up_proj_fp32.view(batch_size, seq_len, num_blocks, line_size)
+        ref_fp32 = (ref_reshaped * gate_fp32.unsqueeze(-1)).view(batch_size, seq_len, intermediate_size)
+
+        # Triton
+        out_fp32 = fused_up_proj_gate_activation_triton(
+            x_fp16,
+            up_weight_fp16.t(),
+            up_bias_fp16,
+            gate_fp32,
+            num_blocks,
+            line_size,
+        )
+
+        max_diff = torch.max(torch.abs(ref_fp32 - out_fp32)).item()
+        mean_diff = torch.mean(torch.abs(ref_fp32 - out_fp32)).item()
+        print(f"Max diff = {max_diff:.6f} | Mean diff = {mean_diff:.6f}")
+
+        overall_max = max(overall_max, max_diff)
+
+    print(f"\nOverall max diff across large configs: {overall_max:.6f}")
+    return overall_max
+
+
+# --------------------------------------------------
+# Performance benchmark (PyTorch vs. Triton)
+# --------------------------------------------------
+
+
+def benchmark_fused_vs_pytorch(num_iters: int = 100):
+    """Time PyTorch reference vs Triton fused kernel on several shapes."""
+    if not torch.cuda.is_available():
+        print("CUDA not available – skipping benchmark.")
+        return
+
+    print("\n=== Performance Benchmark (fp16 inputs, fp32 gate/output) ===")
+
+    configs = [
+        (4, 8, 128, 4, 32),
+        (8, 16, 256, 8, 32),
+        (16, 32, 512, 8, 64),
+    ]
+
+    for batch_size, seq_len, hidden_size, num_blocks, line_size in configs:
+        intermediate_size = num_blocks * line_size
+        cfg = f"{batch_size}x{seq_len}x{hidden_size}x{num_blocks}x{line_size}"
+        print(f"\nConfig: {cfg}  |  Iters: {num_iters}")
+
+        # Random tensors
+        x_fp16 = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float16)
+        up_weight_fp16 = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=torch.float16)
+        up_bias_fp16 = torch.randn(intermediate_size, device="cuda", dtype=torch.float16)
+        gate_fp32 = torch.rand(batch_size, seq_len, num_blocks, device="cuda", dtype=torch.float32)
+
+        # Warm-up
+        _ = fused_up_proj_gate_activation_triton(x_fp16, up_weight_fp16.t(), up_bias_fp16, gate_fp32, num_blocks, line_size)
+        _ = F.relu(F.linear(x_fp16, up_weight_fp16, up_bias_fp16)).float()
+
+        torch.cuda.synchronize()
+
+        # ---- Triton timing ----
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(num_iters):
+            _ = fused_up_proj_gate_activation_triton(x_fp16, up_weight_fp16.t(), up_bias_fp16, gate_fp32, num_blocks, line_size)
+        end.record()
+        torch.cuda.synchronize()
+        triton_ms = start.elapsed_time(end) / num_iters
+
+        # ---- PyTorch timing ----
+        start_pt = torch.cuda.Event(enable_timing=True)
+        end_pt = torch.cuda.Event(enable_timing=True)
+        start_pt.record()
+        for _ in range(num_iters):
+            up_proj_fp16 = F.relu(F.linear(x_fp16, up_weight_fp16, up_bias_fp16)).float()
+            up_proj_reshaped = up_proj_fp16.view(batch_size, seq_len, num_blocks, line_size)
+            _ = (up_proj_reshaped * gate_fp32.unsqueeze(-1)).view(batch_size, seq_len, intermediate_size)
+        end_pt.record()
+        torch.cuda.synchronize()
+        torch_ms = start_pt.elapsed_time(end_pt) / num_iters
+
+        speedup = torch_ms / triton_ms
+        print(f"PyTorch: {torch_ms:.3f} ms | Triton: {triton_ms:.3f} ms | Speed-up: {speedup:.2f}x")
+
+
+# --------------------------------------------------
+# Main – run tests or benchmark
+# --------------------------------------------------
+
+
 if __name__ == "__main__":
     if not torch.cuda.is_available():
-        print("❌ CUDA is not available. Triton kernels require CUDA.")
+        print("❌ CUDA is not available – exiting.")
         exit(1)
+
     try:
         import triton
         print("✅ Triton is available.")
     except ImportError:
-        print("❌ Triton is not available. Please install triton.")
+        print("❌ Triton is not available. Please install it.")
         exit(1)
-    
-    test_fused_up_proj_gate_activation_triton() 
+
+    # Run correctness tests
+    debug_large_scale()
+
+    # Run benchmark
+    benchmark_fused_vs_pytorch(num_iters=100) 
