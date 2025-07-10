@@ -228,7 +228,7 @@ def test_fused_up_proj_gate_activation_triton():
         x_fp16 = torch.randn(batch_size, seq_len, hidden_size, device='cuda', dtype=torch.float16)
         up_weight_fp16 = torch.randn(intermediate_size, hidden_size, device='cuda', dtype=torch.float16)
         up_bias_fp16 = torch.randn(intermediate_size, device='cuda', dtype=torch.float16)
-        gate_fp32 = torch.randn(batch_size, seq_len, num_blocks, device='cuda', dtype=torch.float32)
+        gate_fp32 = F.relu(torch.randn(batch_size, seq_len, num_blocks, device='cuda', dtype=torch.float32))
         
         # PyTorch reference (float16 inputs, float32 gate, float32 output)
         up_proj_fp16 = F.relu(F.linear(x_fp16, up_weight_fp16, up_bias_fp16)).float()  # Convert to float32
