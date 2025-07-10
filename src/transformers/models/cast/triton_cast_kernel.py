@@ -40,8 +40,8 @@ def fused_up_proj_gate_activation_kernel_optimized(
     pid = tl.program_id(0)
 
     # Number of row blocks we need for the input set
-    num_pid_bs = triton.cdiv(num_rows, BLOCK_SIZE_BS)
-    num_pid_ls = triton.cdiv(line_size, BLOCK_SIZE_LS)
+    num_pid_bs = (num_rows + BLOCK_SIZE_BS - 1) // BLOCK_SIZE_BS
+    num_pid_ls = (line_size + BLOCK_SIZE_LS - 1) // BLOCK_SIZE_LS
 
     pid_ls = pid % num_pid_ls
     pid_rblk = pid // num_pid_ls  # block id among row-blocks
