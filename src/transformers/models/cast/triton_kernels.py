@@ -5,7 +5,7 @@ from typing import Optional
 import time
 import warnings
 import torch.nn.functional as F
-from .triton_cast_kernel import (
+from triton_cast_kernel import (
     fused_up_proj_gate_activation_sparse_triton_optimized as fused_up_proj_gate_activation_sparse_triton_opt,
 )
 
