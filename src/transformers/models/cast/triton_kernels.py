@@ -317,8 +317,11 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100):
         gate_fp32 = torch.rand(batch_size, seq_len, num_blocks, device="cuda", dtype=torch.float32)
 
         # ---- PyTorch timing ----
-        # Warm-up for PyTorch
-        _ = F.relu(F.linear(x_fp16, up_weight_fp16, up_bias_fp16)).float()
+        # Warm-up for PyTorch (5 runs)
+        for _ in range(5):
+            _ = F.relu(F.linear(x_fp16, up_weight_fp16, up_bias_fp16)).float()
+            up_proj_reshaped = up_proj_fp16.view(batch_size, seq_len, num_blocks, line_size)
+            _ = (up_proj_reshaped * gate_fp32.unsqueeze(-1)).view(batch_size, seq_len, intermediate_size)
         torch.cuda.synchronize()
 
         start_pt = torch.cuda.Event(enable_timing=True)
@@ -335,7 +338,9 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100):
         print(f"PyTorch: {torch_ms:.3f} ms")
         
         # ---- Triton timing (autotuned) ----
-        _ = fused_up_proj_gate_activation_triton(x_fp16, up_weight_fp16.t(), up_bias_fp16, gate_fp32, num_blocks, line_size)
+        # Warm-up for Triton (5 runs)
+        for _ in range(5):
+            _ = fused_up_proj_gate_activation_triton(x_fp16, up_weight_fp16.t(), up_bias_fp16, gate_fp32, num_blocks, line_size)
         torch.cuda.synchronize()
 
         start_tri = torch.cuda.Event(enable_timing=True)
