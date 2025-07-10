@@ -3,6 +3,7 @@ import triton
 import triton.language as tl
 from typing import Optional
 import time
+import warnings
 import torch.nn.functional as F
 
 
@@ -185,6 +186,244 @@ def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks
     return output.view(batch_size, seq_len, intermediate_size)
 
 
+# ---------------------------------------------------------------
+# Sparse helper
+# ---------------------------------------------------------------
+
+
+def fused_up_proj_gate_activation_sparse_triton(
+    x: torch.Tensor,
+    up_weight: torch.Tensor,
+    up_bias: torch.Tensor,
+    gate: torch.Tensor,
+    num_blocks: int,
+    line_size: int,
+    density_threshold: float = 0.5,
+):
+    """Optimized variant of *fused_up_proj_gate_activation_triton* for sparse ``gate`` tensors.
+
+    The function detects non-zero gate entries, runs the Triton kernel only on the
+    corresponding (row, block) pairs, and scatters the results back into a full-sized
+    output tensor.  For low sparsity (density > *density_threshold*) it transparently
+    falls back to the original dense implementation.
+
+    Args:
+        x:              ``(batch, seq_len, hidden_size)``, *float16*
+        up_weight:      ``(hidden_size, intermediate_size)``, *float16*
+        up_bias:        ``(intermediate_size,)``, *float16*
+        gate:           ``(batch, seq_len, num_blocks)``, *float32* or *float16/bf16*
+        num_blocks:     number of blocks in the gated FFN
+        line_size:      size of each block line (``intermediate_size = num_blocks * line_size``)
+        density_threshold: switch to dense path when *gate* is sufficiently dense.
+    Returns:
+        ``output`` – ``(batch, seq_len, intermediate_size)`` in *float32*
+    """
+
+    batch_size, seq_len, hidden_size = x.shape
+    intermediate_size = num_blocks * line_size
+
+    # Ensure the same validations as in the dense path
+    assert up_weight.shape == (hidden_size, intermediate_size), "Incompatible up_weight shape"
+    assert gate.shape == (batch_size, seq_len, num_blocks), "Incompatible gate shape"
+    assert x.dtype == torch.float16, f"Input x must be float16, got {x.dtype}"
+    assert up_weight.dtype == torch.float16, f"up_weight must be float16, got {up_weight.dtype}"
+    assert up_bias.dtype == torch.float16, f"up_bias must be float16, got {up_bias.dtype}"
+
+    if gate.dtype != torch.float32:
+        gate = gate.float()
+
+    # Prepare contiguous flattened views
+    x_reshaped = x.contiguous().view(-1, hidden_size)         # (B·S, H)
+    gate_reshaped = gate.contiguous().view(-1, num_blocks)    # (B·S, NB)
+    batch_seq_size = x_reshaped.size(0)
+
+    # ------------------------------------------------------------------
+    # Determine sparsity – decide whether to use sparse or dense path
+    # ------------------------------------------------------------------
+    gate_mask = gate_reshaped != 0
+    nnz = int(gate_mask.sum().item())
+
+    if nnz == 0:
+        # Everything is zero – return all-zeros tensor fast
+        return torch.zeros((batch_size, seq_len, intermediate_size), device=x.device, dtype=torch.float32)
+
+    density = nnz / (batch_seq_size * num_blocks)
+    if density >= density_threshold:
+        # Not sparse enough – fall back to the dense implementation
+        warnings.warn(
+            f"[sparse_helper] Density {density:.2%} ≥ threshold {density_threshold:.2%}. Falling back to dense path.",
+            stacklevel=2,
+        )
+        return fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks, line_size)
+
+    # ------------------------------------------------------------------
+    # Sparse path
+    # ------------------------------------------------------------------
+
+    # Pre-allocate full output (zero-initialised)
+    output = torch.zeros((batch_seq_size, intermediate_size), device=x.device, dtype=torch.float32)
+
+    # Indices of (row, block) pairs that have non-zero gate values
+    active_pairs = gate_mask.nonzero(as_tuple=False)          # (N, 2)
+    rows = active_pairs[:, 0]
+    blocks = active_pairs[:, 1]
+
+    # Process each unique block separately
+    unique_blocks = blocks.unique(sorted=False)
+
+    for nb in unique_blocks.tolist():
+        # Boolean mask & row indices for this block
+        rows_mask = (blocks == nb)
+        rows_nb = rows[rows_mask]
+
+        if rows_nb.numel() == 0:
+            continue  # Safety – should not happen
+
+        # Gather the relevant slices – keep everything contiguous
+        x_subset = x_reshaped.index_select(0, rows_nb).contiguous()       # (K, H)
+        gate_subset = gate_reshaped[rows_nb, nb].unsqueeze(1).contiguous()  # (K, 1)
+
+        # Slice weights & bias for this block only
+        start_col = nb * line_size
+        end_col = start_col + line_size
+        w_slice = up_weight[:, start_col:end_col].contiguous()  # (H, L)
+        b_slice = up_bias[start_col:end_col].contiguous()       # (L,)
+
+        K = x_subset.size(0)
+
+        # Allocate per-block output buffer
+        out_subset = torch.empty((K, line_size), device=x.device, dtype=torch.float32)
+
+        # Kernel grid – num_blocks = 1 for this invocation
+        grid = lambda meta: (
+            triton.cdiv(K, meta['BLOCK_SIZE_BS']) * 1 * triton.cdiv(line_size, meta['BLOCK_SIZE_LS']),
+        )
+
+        fused_up_proj_gate_activation_kernel[grid](
+            x_subset,                     # x_ptr
+            w_slice,                      # up_weight_ptr
+            b_slice,                      # up_bias_ptr
+            gate_subset,                  # gate_ptr
+            out_subset,                   # output_ptr
+            K,                            # batch_seq_size (== rows in this slice)
+            hidden_size,
+            1,                            # num_blocks (single block per call)
+            line_size,
+            x_subset.stride(0), x_subset.stride(1),
+            w_slice.stride(0), w_slice.stride(1),
+            gate_subset.stride(0), gate_subset.stride(1),
+            out_subset.stride(0), out_subset.stride(1),
+        )
+
+        # Scatter results back into the full output tensor
+        output[rows_nb, start_col:end_col] = out_subset
+
+    # Reshape back to original 3-D shape
+    return output.view(batch_size, seq_len, intermediate_size)
+
+
+# ===============================================================
+# Debug / numerical verification helpers
+# ===============================================================
+
+
+def _make_sparse_gate(batch_size: int, seq_len: int, num_blocks: int, sparsity: float = 0.9):
+    """Utility: generate a gate tensor with given *sparsity* on CUDA.
+
+    *sparsity* denotes the fraction of **zeros** (e.g. 0.9 → 10 % non-zero).
+    Returns a `torch.float32` tensor on the current CUDA device.
+    """
+    gate = torch.rand(batch_size, seq_len, num_blocks, device="cuda", dtype=torch.float32)
+    if sparsity > 0.0:
+        mask = torch.rand_like(gate) < sparsity  # True for zeros
+        gate[mask] = 0.0
+    return gate
+
+
+def debug_large_scale(use_sparse_gate: bool = False):
+    """Run several larger shapes to verify correctness of dense & sparse helpers.
+
+    If *use_sparse_gate* is True, create a gate tensor with ~10 % non-zero entries;
+    otherwise use a fully dense random gate.
+    """
+    print("\n=== Large Scale Debug (triton_kernels) ===")
+
+    test_configs = [
+        (2, 4, 64, 4, 16),
+        (4, 8, 128, 4, 32),
+        (8, 16, 256, 8, 32),
+        (16, 32, 512, 8, 64),
+    ]
+
+    overall_max_dense = 0.0
+    overall_max_sparse = 0.0
+
+    for batch_size, seq_len, hidden_size, num_blocks, line_size in test_configs:
+        intermediate_size = num_blocks * line_size
+        cfg = f"{batch_size}x{seq_len}x{hidden_size} | blocks={num_blocks}, line={line_size}"
+        print(f"\nConfig: {cfg}")
+
+        # Random fp16 data (CUDA)
+        x_fp16 = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float16)
+
+        # Weight / bias: kernel expects (H, I); PyTorch linear expects (I, H)
+        up_weight_fp16 = torch.randn(hidden_size, intermediate_size, device="cuda", dtype=torch.float16)
+        up_bias_fp16 = torch.randn(intermediate_size, device="cuda", dtype=torch.float16)
+
+        # Gate
+        if use_sparse_gate:
+            gate_fp32 = _make_sparse_gate(batch_size, seq_len, num_blocks, sparsity=0.9)  # 10% non-zero
+        else:
+            gate_fp32 = torch.rand(batch_size, seq_len, num_blocks, device="cuda", dtype=torch.float32)
+
+        # PyTorch reference (float32)
+        up_proj_fp32 = F.relu(F.linear(x_fp16.float(), up_weight_fp16.t().float(), up_bias_fp16.float()))
+        ref_reshaped = up_proj_fp32.view(batch_size, seq_len, num_blocks, line_size)
+        ref_fp32 = (ref_reshaped * gate_fp32.unsqueeze(-1)).view(batch_size, seq_len, intermediate_size)
+
+        # Dense Triton helper
+        out_dense = fused_up_proj_gate_activation_triton(
+            x_fp16,
+            up_weight_fp16,
+            up_bias_fp16,
+            gate_fp32,
+            num_blocks,
+            line_size,
+        )
+
+        # Sparse Triton helper (may internally fall back)
+        out_sparse = fused_up_proj_gate_activation_sparse_triton(
+            x_fp16,
+            up_weight_fp16,
+            up_bias_fp16,
+            gate_fp32,
+            num_blocks,
+            line_size,
+        )
+
+        # Compute diffs
+        max_diff_dense = torch.max(torch.abs(ref_fp32 - out_dense)).item()
+        mean_diff_dense = torch.mean(torch.abs(ref_fp32 - out_dense)).item()
+
+        max_diff_sparse = torch.max(torch.abs(ref_fp32 - out_sparse)).item()
+        mean_diff_sparse = torch.mean(torch.abs(ref_fp32 - out_sparse)).item()
+
+        print(f"Dense   → max diff {max_diff_dense:.6e} | mean diff {mean_diff_dense:.6e}")
+        print(f"Sparse  → max diff {max_diff_sparse:.6e} | mean diff {mean_diff_sparse:.6e}")
+
+        overall_max_dense = max(overall_max_dense, max_diff_dense)
+        overall_max_sparse = max(overall_max_sparse, max_diff_sparse)
+
+    print(
+        f"\nOverall max diff across configs | Dense: {overall_max_dense:.6e} | Sparse: {overall_max_sparse:.6e}"
+    )
+
+
+# ===============================================================
+# Main (basic self-test)
+# ===============================================================
+
+
 if __name__ == "__main__":
     if not torch.cuda.is_available():
         print("❌ CUDA is not available – exiting.")
@@ -198,3 +437,7 @@ if __name__ == "__main__":
         exit(1)
 
     print("✅ Triton kernel loaded successfully.") 
+
+    # Run numerical debug for dense and sparse gates
+    debug_large_scale(use_sparse_gate=False)
+    debug_large_scale(use_sparse_gate=True) 

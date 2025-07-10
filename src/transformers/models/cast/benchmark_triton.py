@@ -1,7 +1,9 @@
 import torch
 import torch.nn.functional as F
-import time
-from triton_kernels import fused_up_proj_gate_activation_triton
+from triton_kernels import (
+    fused_up_proj_gate_activation_triton,
+    fused_up_proj_gate_activation_sparse_triton,
+)
 
 
 def benchmark_fused_vs_pytorch(num_iters: int = 100):
@@ -40,12 +42,12 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100):
 
         start_pt = torch.cuda.Event(enable_timing=True)
         end_pt = torch.cuda.Event(enable_timing=True)
-        start_pt.record()
+        start_pt.record(torch.cuda.current_stream())
         for _ in range(num_iters):
             up_proj_fp16 = F.relu(F.linear(x_fp16, up_weight_fp16, up_bias_fp16)).float()
             up_proj_reshaped = up_proj_fp16.view(batch_size, seq_len, num_blocks, line_size)
             _ = (up_proj_reshaped * gate_fp32.unsqueeze(-1)).view(batch_size, seq_len, intermediate_size)
-        end_pt.record()
+        end_pt.record(torch.cuda.current_stream())
         torch.cuda.synchronize()
         torch_ms = start_pt.elapsed_time(end_pt) / num_iters
 
@@ -59,15 +61,50 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100):
 
         start_tri = torch.cuda.Event(enable_timing=True)
         end_tri   = torch.cuda.Event(enable_timing=True)
-        start_tri.record()
+        start_tri.record(torch.cuda.current_stream())
         for _ in range(num_iters):
             _ = fused_up_proj_gate_activation_triton(x_fp16, up_weight_fp16.t(), up_bias_fp16, gate_fp32, num_blocks, line_size)
-        end_tri.record()
+        end_tri.record(torch.cuda.current_stream())
         torch.cuda.synchronize()
         triton_ms = start_tri.elapsed_time(end_tri) / num_iters
 
         speedup = torch_ms / triton_ms
         print(f"Triton (autotuned): {triton_ms:.3f} ms | Speed-up: {speedup:.2f}x")
+
+        # ---- Sparse benchmark (10% non-zero gate) ----
+        gate_sparse = gate_fp32.clone()
+        mask_sparse = torch.rand_like(gate_sparse) < 0.9  # 90% zeros
+        gate_sparse[mask_sparse] = 0.0
+
+        # Warm-up sparse helper (5 runs)
+        for _ in range(5):
+            _ = fused_up_proj_gate_activation_sparse_triton(
+                x_fp16,
+                up_weight_fp16.t(),
+                up_bias_fp16,
+                gate_sparse,
+                num_blocks,
+                line_size,
+            )
+        torch.cuda.synchronize()
+
+        start_sp = torch.cuda.Event(enable_timing=True)
+        end_sp   = torch.cuda.Event(enable_timing=True)
+        start_sp.record(torch.cuda.current_stream())
+        for _ in range(num_iters):
+            _ = fused_up_proj_gate_activation_sparse_triton(
+                x_fp16,
+                up_weight_fp16.t(),
+                up_bias_fp16,
+                gate_sparse,
+                num_blocks,
+                line_size,
+            )
+        end_sp.record(torch.cuda.current_stream())
+        torch.cuda.synchronize()
+        sparse_ms = start_sp.elapsed_time(end_sp) / num_iters
+
+        print(f"Triton (sparse helper, 10% nnz): {sparse_ms:.3f} ms | Speed-up vs PyTorch: {torch_ms/sparse_ms:.2f}x")
 
 
 if __name__ == "__main__":
