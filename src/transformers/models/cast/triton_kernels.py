@@ -5,6 +5,9 @@ from typing import Optional
 import time
 import warnings
 import torch.nn.functional as F
+from .triton_cast_kernel import (
+    fused_up_proj_gate_activation_sparse_triton_optimized as fused_up_proj_gate_activation_sparse_triton_opt,
+)
 
 
 @triton.autotune(
@@ -391,8 +394,18 @@ def debug_large_scale(use_sparse_gate: bool = False):
             line_size,
         )
 
-        # Sparse Triton helper (may internally fall back)
+        # Baseline sparse Triton helper (may internally fall back)
         out_sparse = fused_up_proj_gate_activation_sparse_triton(
+            x_fp16,
+            up_weight_fp16,
+            up_bias_fp16,
+            gate_fp32,
+            num_blocks,
+            line_size,
+        )
+
+        # Optimized sparse helper
+        out_opt = fused_up_proj_gate_activation_sparse_triton_opt(
             x_fp16,
             up_weight_fp16,
             up_bias_fp16,
@@ -408,8 +421,12 @@ def debug_large_scale(use_sparse_gate: bool = False):
         max_diff_sparse = torch.max(torch.abs(ref_fp32 - out_sparse)).item()
         mean_diff_sparse = torch.mean(torch.abs(ref_fp32 - out_sparse)).item()
 
+        max_diff_opt = torch.max(torch.abs(ref_fp32 - out_opt)).item()
+        mean_diff_opt = torch.mean(torch.abs(ref_fp32 - out_opt)).item()
+
         print(f"Dense   → max diff {max_diff_dense:.6e} | mean diff {mean_diff_dense:.6e}")
         print(f"Sparse  → max diff {max_diff_sparse:.6e} | mean diff {mean_diff_sparse:.6e}")
+        print(f"OptSpa  → max diff {max_diff_opt  :.6e} | mean diff {mean_diff_opt  :.6e}")
 
         overall_max_dense = max(overall_max_dense, max_diff_dense)
         overall_max_sparse = max(overall_max_sparse, max_diff_sparse)

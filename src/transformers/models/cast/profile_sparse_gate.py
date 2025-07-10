@@ -10,6 +10,9 @@ from triton_kernels import (
     fused_up_proj_gate_activation_triton,
     fused_up_proj_gate_activation_sparse_triton,
 )
+from triton_cast_kernel import (
+    fused_up_proj_gate_activation_sparse_triton_optimized as fused_up_proj_gate_activation_sparse_triton_opt,
+)
 
 
 # -----------------------------------------------------------------------------
@@ -79,6 +82,27 @@ def _run_sparse(
     )
 
 
+# Optimized sparse helper
+def _run_opt(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    b: torch.Tensor,
+    gate: torch.Tensor,
+    num_blocks: int,
+    line_size: int,
+    density_threshold: float,
+):
+    fused_up_proj_gate_activation_sparse_triton_opt(
+        x,
+        w,
+        b,
+        gate,
+        num_blocks,
+        line_size,
+        density_threshold=density_threshold,
+    )
+
+
 # -----------------------------------------------------------------------------
 # Main CLI
 # -----------------------------------------------------------------------------
@@ -107,7 +131,10 @@ def main():
         "--profile-dense", action="store_true", help="Include dense helper in the profile",
     )
     parser.add_argument(
-        "--profile-sparse", action="store_true", help="Include sparse helper in the profile",
+        "--profile-sparse", action="store_true", help="Include baseline sparse helper in the profile",
+    )
+    parser.add_argument(
+        "--profile-optimized", action="store_true", help="Include optimized sparse helper in the profile",
     )
     parser.add_argument(
         "--density-threshold",
@@ -133,13 +160,18 @@ def main():
     # By **default** we always profile the sparse helper.  If neither helper
     # is requested explicitly, we profile *both*.  This guarantees that the
     # sparse path is included unless the script is modified to disable it.
-    if not (args.profile_dense or args.profile_sparse):
-        # No flags → profile both
+    if not (args.profile_dense or args.profile_sparse or args.profile_optimized):
+        # No flags → profile all three
         args.profile_dense = True
         args.profile_sparse = True
-    elif args.profile_dense and not args.profile_sparse:
-        # User asked for dense only – still include sparse by default
+        args.profile_optimized = True
+    elif args.profile_dense and not (args.profile_sparse or args.profile_optimized):
+        # User asked for dense only – still include sparse & optimized by default
         args.profile_sparse = True
+        args.profile_optimized = True
+    elif args.profile_sparse and not args.profile_optimized:
+        # baseline sparse only → also add optimized for comparison
+        args.profile_optimized = True
 
     device = torch.device("cuda")
 
@@ -158,6 +190,16 @@ def main():
         _run_dense(x_fp16, w_fp16, b_fp16, gate_fp32, args.blocks, args.line)
     if args.profile_sparse:
         _run_sparse(
+            x_fp16,
+            w_fp16,
+            b_fp16,
+            gate_fp32,
+            args.blocks,
+            args.line,
+            args.density_threshold,
+        )
+    if args.profile_optimized:
+        _run_opt(
             x_fp16,
             w_fp16,
             b_fp16,
@@ -186,6 +228,17 @@ def main():
                         args.line,
                         args.density_threshold,
                     )
+            if args.profile_optimized:
+                with record_function("OPTIMIZED_HELPER"):
+                    _run_opt(
+                        x_fp16,
+                        w_fp16,
+                        b_fp16,
+                        gate_fp32,
+                        args.blocks,
+                        args.line,
+                        args.density_threshold,
+                    )
         torch.cuda.synchronize()
 
     print("\n========= PROFILER SUMMARY =========")
@@ -198,6 +251,8 @@ def main():
         print(
             "\nTip: look for DENSE_HELPER vs SPARSE_HELPER blocks in the table to compare kernel counts/time.",
         )
+    if args.profile_optimized:
+        print("Also compare OPTIMIZED_HELPER for the improved path.")
 
 
 if __name__ == "__main__":
