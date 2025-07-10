@@ -27,6 +27,7 @@ def fused_up_proj_gate_activation_kernel_optimized(
     output_ptr,                  # (B·S, num_blocks*L)    float32 – full output tensor
     num_rows, hidden_size, line_size,
     stride_x_bs, stride_x_h,     # x strides
+    stride_w_h,                 # w_slice stride(0)
     stride_out_bs, stride_out_ls,# output strides
     BLOCK_SIZE_BS: tl.constexpr, BLOCK_SIZE_H: tl.constexpr, BLOCK_SIZE_LS: tl.constexpr,
 ):
@@ -81,7 +82,7 @@ def fused_up_proj_gate_activation_kernel_optimized(
 
         # Build pointer arrays for x and w
         x_ptrs = x_ptr + (row_indices[:, None] * stride_x_bs) + (curr_offs_h[None, :] * stride_x_h)
-        w_ptrs = up_weight_ptr + (curr_offs_h[:, None] * stride_x_h) + (offs_ls[None, :] * 1)
+        w_ptrs = up_weight_ptr + (curr_offs_h[:, None] * stride_w_h) + (offs_ls[None, :] * 1)
         # Note: up_weight is already sliced so stride_w_h = line_size, stride_w_ls = 1
 
         x_block = tl.load(x_ptrs, mask=mask_bs_valid[:, None] & mask_h[None, :], other=0.0)
@@ -184,6 +185,7 @@ def fused_up_proj_gate_activation_sparse_triton_optimized(
             output,
             K, hidden_size, line_size,
             x_reshaped.stride(0), x_reshaped.stride(1),
+            w_slice.stride(0),
             output.stride(0), output.stride(1),
         )
 
