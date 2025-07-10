@@ -25,6 +25,7 @@ def fused_up_proj_gate_activation_kernel_optimized(
     gate_col_ptr,                # (B·S,)                 float32 – gate[:, nb]
     rows_ptr,                    # (K,)                   int32 row indices for this block
     output_ptr,                  # (B·S, num_blocks*L)    float32 – full output tensor
+    col_offset,                  # int32  – nb * line_size
     num_rows, hidden_size, line_size,
     stride_x_bs, stride_x_h,     # x strides
     stride_w_h,                 # w_slice stride(0)
@@ -99,7 +100,10 @@ def fused_up_proj_gate_activation_kernel_optimized(
     acc *= g_vals[:, None]
 
     # Store back to output – need global row index
-    out_ptrs = output_ptr + (row_indices[:, None] * stride_out_bs) + (offs_ls[None, :] * stride_out_ls)
+    col_offs = col_offset + offs_ls            # (BLOCK_SIZE_LS,)
+    out_ptrs = output_ptr \
+             + (row_indices[:, None] * stride_out_bs) \
+             + (col_offs[None, :] * stride_out_ls)
     tl.store(out_ptrs, acc, mask=mask_bs_valid[:, None] & mask_ls[None, :])
 
 
@@ -183,6 +187,7 @@ def fused_up_proj_gate_activation_sparse_triton_optimized(
             gate_col_ptr,
             rows_nb,
             output,
+            col_start,
             K, hidden_size, line_size,
             x_reshaped.stride(0), x_reshaped.stride(1),
             w_slice.stride(0),
