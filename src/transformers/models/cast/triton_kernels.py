@@ -360,6 +360,7 @@ def debug_large_scale(use_sparse_gate: bool = False):
 
     overall_max_dense = 0.0
     overall_max_sparse = 0.0
+    overall_max_opt = 0.0
 
     for batch_size, seq_len, hidden_size, num_blocks, line_size in test_configs:
         intermediate_size = num_blocks * line_size
@@ -430,9 +431,10 @@ def debug_large_scale(use_sparse_gate: bool = False):
 
         overall_max_dense = max(overall_max_dense, max_diff_dense)
         overall_max_sparse = max(overall_max_sparse, max_diff_sparse)
+        overall_max_opt = max(overall_max_opt, max_diff_opt)
 
     print(
-        f"\nOverall max diff across configs | Dense: {overall_max_dense:.6e} | Sparse: {overall_max_sparse:.6e}"
+        f"\nOverall max diff across configs | Dense: {overall_max_dense:.6e} | Sparse: {overall_max_sparse:.6e} | OptSpa: {overall_max_opt:.6e}"
     )
 
 
