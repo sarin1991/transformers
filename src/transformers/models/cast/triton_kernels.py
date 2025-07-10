@@ -170,42 +170,6 @@ def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks
     return output.view(batch_size, seq_len, intermediate_size)
 
 
-def debug_test():
-    """
-    Debug test to isolate the issue by testing just the matrix multiplication part.
-    """
-    print("Debug test - testing matrix multiplication only...")
-    
-    batch_size, seq_len, hidden_size, num_blocks, line_size = 2, 8, 512, 4, 16
-    intermediate_size = num_blocks * line_size
-    
-    # Create test data
-    x_fp16 = torch.randn(batch_size, seq_len, hidden_size, device='cuda', dtype=torch.float16)
-    up_weight_fp16 = torch.randn(intermediate_size, hidden_size, device='cuda', dtype=torch.float16)
-    up_bias_fp16 = torch.randn(intermediate_size, device='cuda', dtype=torch.float16)
-    
-    # PyTorch reference - just the up projection
-    ref_fp16 = F.relu(F.linear(x_fp16, up_weight_fp16, up_bias_fp16))
-    ref_fp32 = ref_fp16.float()
-    
-    # Test our kernel without gate (set gate to all ones)
-    gate_fp32 = torch.ones(batch_size, seq_len, num_blocks, device='cuda', dtype=torch.float32)
-    up_weight_triton_fp16 = up_weight_fp16.t()
-    out_fp32 = fused_up_proj_gate_activation_triton(x_fp16, up_weight_triton_fp16, up_bias_fp16, gate_fp32, num_blocks, line_size)
-    
-    max_diff = torch.max(torch.abs(ref_fp32 - out_fp32)).item()
-    mean_diff = torch.mean(torch.abs(ref_fp32 - out_fp32)).item()
-    print(f"Debug - Max diff = {max_diff:.6f}, Mean diff = {mean_diff:.6f}")
-    
-    # Check if the issue is in the matrix multiplication
-    if max_diff > 1e-3:
-        print("❌ Issue is in the matrix multiplication part")
-        return False
-    else:
-        print("✅ Matrix multiplication is correct")
-        return True
-
-
 def test_fused_up_proj_gate_activation_triton():
     """
     Test the correctness of fused_up_proj_gate_activation_triton against a PyTorch reference implementation.
@@ -264,4 +228,4 @@ if __name__ == "__main__":
         print("❌ Triton is not available. Please install triton.")
         exit(1)
     
-    debug_test() 
+    test_fused_up_proj_gate_activation_triton() 
