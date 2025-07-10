@@ -114,7 +114,7 @@ def fused_up_proj_gate_activation_kernel(
     tl.store(out_ptrs, output, mask=(mask_bs[:, None] & mask_ls[None, :]))
 
 
-def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks, line_size):
+def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks, line_size, block_size: int = 16):
     """
     Fused Triton implementation that performs up projection and gate activation in one kernel.
     Args:
@@ -157,9 +157,9 @@ def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks
                         device=x.device, dtype=torch.float32)
 
     # Launch kernel with 3D blocking across batch_seq, num_blocks, and line_size
-    num_pid_bs = (batch_seq_size + 15) // 16
+    num_pid_bs = (batch_seq_size + block_size - 1) // block_size
     num_pid_nb = num_blocks
-    num_pid_ls = (line_size + 15) // 16
+    num_pid_ls = (line_size + block_size - 1) // block_size
     grid = (num_pid_bs * num_pid_nb * num_pid_ls,)
 
     fused_up_proj_gate_activation_kernel[grid](
@@ -169,7 +169,7 @@ def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks
         up_weight.stride(0), up_weight.stride(1),
         gate_reshaped.stride(0), gate_reshaped.stride(1),
         output.stride(0), output.stride(1),
-        BLOCK_SIZE_BS=16, BLOCK_SIZE_H=16, BLOCK_SIZE_LS=16,
+        BLOCK_SIZE_BS=block_size, BLOCK_SIZE_H=block_size, BLOCK_SIZE_LS=block_size,
     )
 
     # Reshape back to original shape
@@ -282,7 +282,7 @@ def debug_large_scale():
 # --------------------------------------------------
 
 
-def benchmark_fused_vs_pytorch(num_iters: int = 100):
+def benchmark_fused_vs_pytorch(num_iters: int = 100, block_sizes: list = [16, 32, 64, 128]):
     """Time PyTorch reference vs Triton fused kernel on several shapes."""
     if not torch.cuda.is_available():
         print("CUDA not available – skipping benchmark.")
@@ -307,23 +307,11 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100):
         up_bias_fp16 = torch.randn(intermediate_size, device="cuda", dtype=torch.float16)
         gate_fp32 = torch.rand(batch_size, seq_len, num_blocks, device="cuda", dtype=torch.float32)
 
-        # Warm-up
-        _ = fused_up_proj_gate_activation_triton(x_fp16, up_weight_fp16.t(), up_bias_fp16, gate_fp32, num_blocks, line_size)
-        _ = F.relu(F.linear(x_fp16, up_weight_fp16, up_bias_fp16)).float()
-
-        torch.cuda.synchronize()
-
-        # ---- Triton timing ----
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(num_iters):
-            _ = fused_up_proj_gate_activation_triton(x_fp16, up_weight_fp16.t(), up_bias_fp16, gate_fp32, num_blocks, line_size)
-        end.record()
-        torch.cuda.synchronize()
-        triton_ms = start.elapsed_time(end) / num_iters
-
         # ---- PyTorch timing ----
+        # Warm-up for PyTorch
+        _ = F.relu(F.linear(x_fp16, up_weight_fp16, up_bias_fp16)).float()
+        torch.cuda.synchronize()
+
         start_pt = torch.cuda.Event(enable_timing=True)
         end_pt = torch.cuda.Event(enable_timing=True)
         start_pt.record()
@@ -335,8 +323,24 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100):
         torch.cuda.synchronize()
         torch_ms = start_pt.elapsed_time(end_pt) / num_iters
 
-        speedup = torch_ms / triton_ms
-        print(f"PyTorch: {torch_ms:.3f} ms | Triton: {triton_ms:.3f} ms | Speed-up: {speedup:.2f}x")
+        print(f"PyTorch: {torch_ms:.3f} ms")
+        
+        # ---- Triton timing for each block size ----
+        for block_size in block_sizes:
+            # Warm-up for this specific block size
+            _ = fused_up_proj_gate_activation_triton(x_fp16, up_weight_fp16.t(), up_bias_fp16, gate_fp32, num_blocks, line_size, block_size=block_size)
+            torch.cuda.synchronize()
+
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(num_iters):
+                _ = fused_up_proj_gate_activation_triton(x_fp16, up_weight_fp16.t(), up_bias_fp16, gate_fp32, num_blocks, line_size, block_size=block_size)
+            end.record()
+            torch.cuda.synchronize()
+            triton_ms = start.elapsed_time(end) / num_iters
+            speedup = torch_ms / triton_ms
+            print(f"Triton (block_size={block_size}): {triton_ms:.3f} ms | Speed-up: {speedup:.2f}x")
 
 
 # --------------------------------------------------
