@@ -43,9 +43,11 @@ def fused_up_proj_gate_activation_kernel(
         return
     
     # Create offsets for the block - following Triton pattern
-    offs_bs = (pid_bs * BLOCK_SIZE_BS + tl.arange(0, BLOCK_SIZE_BS)) % batch_seq_size
+    # Use linear offsets; mask will guard out-of-bounds indices. Using modulo here
+    # would alias multiple threads to the same in-bounds element and cause races.
+    offs_bs = pid_bs * BLOCK_SIZE_BS + tl.arange(0, BLOCK_SIZE_BS)
     offs_h = tl.arange(0, BLOCK_SIZE_H)
-    offs_ls = (pid_ls * BLOCK_SIZE_LS + tl.arange(0, BLOCK_SIZE_LS)) % line_size
+    offs_ls = pid_ls * BLOCK_SIZE_LS + tl.arange(0, BLOCK_SIZE_LS)
     
     # Create masks
     mask_bs = offs_bs < batch_seq_size
@@ -81,14 +83,18 @@ def fused_up_proj_gate_activation_kernel(
     
     # Matrix multiplication: x @ up_weight
     for h in range(0, hidden_size, BLOCK_SIZE_H):
-        # Load blocks with proper masking
-        x_block = tl.load(x_ptrs, mask=(mask_bs[:, None] & mask_h[None, :]), other=0.0)
-        w_block = tl.load(w_ptrs, mask=(mask_h[:, None] & mask_ls[None, :]), other=0.0)
-        
-        # Matrix multiplication: (BLOCK_SIZE_BS, BLOCK_SIZE_H) @ (BLOCK_SIZE_H, BLOCK_SIZE_LS) -> (BLOCK_SIZE_BS, BLOCK_SIZE_LS)
+        # Build a fresh mask for the K-dimension tail.
+        curr_offs_h = h + offs_h
+        mask_h_iter = curr_offs_h < hidden_size
+
+        # Load blocks with proper masking to avoid OOB reads.
+        x_block = tl.load(x_ptrs, mask=(mask_bs[:, None] & mask_h_iter[None, :]), other=0.0)
+        w_block = tl.load(w_ptrs, mask=(mask_h_iter[:, None] & mask_ls[None, :]), other=0.0)
+
+        # (BLOCK_SIZE_BS x BLOCK_SIZE_H) @ (BLOCK_SIZE_H x BLOCK_SIZE_LS) → (BLOCK_SIZE_BS x BLOCK_SIZE_LS)
         accumulator = tl.dot(x_block, w_block, accumulator)
-        
-        # Advance pointers to next K block - following Triton pattern
+
+        # Advance pointers along K dimension
         x_ptrs += BLOCK_SIZE_H * stride_x_h
         w_ptrs += BLOCK_SIZE_H * stride_w_h
     
