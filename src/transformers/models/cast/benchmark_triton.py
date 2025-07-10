@@ -4,6 +4,9 @@ from triton_kernels import (
     fused_up_proj_gate_activation_triton,
     fused_up_proj_gate_activation_sparse_triton,
 )
+from triton_cast_kernel import (
+    fused_up_proj_gate_activation_sparse_triton_optimized as fused_up_proj_gate_activation_sparse_triton_opt,
+)
 
 
 def benchmark_fused_vs_pytorch(num_iters: int = 100):
@@ -19,6 +22,7 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100):
         (8, 16, 256, 8, 32),
         (128, 32, 512, 8, 64),
         (128, 128, 4096, 64, 64),
+        (128, 128, 4096, 8, 4096),
     ]
 
     for batch_size, seq_len, hidden_size, num_blocks, line_size in configs:
@@ -105,6 +109,36 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100):
         sparse_ms = start_sp.elapsed_time(end_sp) / num_iters
 
         print(f"Triton (sparse helper, 10% nnz): {sparse_ms:.3f} ms | Speed-up vs PyTorch: {torch_ms/sparse_ms:.2f}x")
+
+        # ---- Optimized sparse benchmark (10% non-zero gate) ----
+        for _ in range(5):
+            _ = fused_up_proj_gate_activation_sparse_triton_opt(
+                x_fp16,
+                up_weight_fp16.t(),
+                up_bias_fp16,
+                gate_sparse,
+                num_blocks,
+                line_size,
+            )
+        torch.cuda.synchronize()
+
+        start_opt = torch.cuda.Event(enable_timing=True)
+        end_opt   = torch.cuda.Event(enable_timing=True)
+        start_opt.record(torch.cuda.current_stream())
+        for _ in range(num_iters):
+            _ = fused_up_proj_gate_activation_sparse_triton_opt(
+                x_fp16,
+                up_weight_fp16.t(),
+                up_bias_fp16,
+                gate_sparse,
+                num_blocks,
+                line_size,
+            )
+        end_opt.record(torch.cuda.current_stream())
+        torch.cuda.synchronize()
+        opt_ms = start_opt.elapsed_time(end_opt) / num_iters
+
+        print(f"Triton (optimized sparse, 10% nnz): {opt_ms:.3f} ms | Speed-up vs PyTorch: {torch_ms/opt_ms:.2f}x | Speed-up vs baseline sparse: {sparse_ms/opt_ms:.2f}x")
 
 
 if __name__ == "__main__":
