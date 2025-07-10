@@ -88,7 +88,7 @@ def fused_up_proj_gate_activation_kernel_optimized(
 
         x_block = tl.load(x_ptrs, mask=mask_bs_valid[:, None] & mask_h[None, :], other=0.0)
         w_block = tl.load(w_ptrs, mask=mask_h[:, None] & mask_ls[None, :], other=0.0)
-        acc = tl.dot(x_block, w_block, acc)
+        acc += tl.dot(x_block, w_block)
 
     # Add bias & ReLU
     bias_ptrs = up_bias_ptr + offs_ls
