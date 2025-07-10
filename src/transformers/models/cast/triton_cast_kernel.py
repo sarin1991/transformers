@@ -146,12 +146,6 @@ def fused_up_proj_gate_activation_sparse_triton_optimized(
     if nnz == 0:
         return torch.zeros((batch_size, seq_len, intermediate_size), device=x.device, dtype=torch.float32)
 
-    density = nnz / (batch_seq_size * num_blocks)
-    if density >= density_threshold:
-        # Dense enough – call existing dense helper
-        from .triton_kernels import fused_up_proj_gate_activation_triton
-        return fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks, line_size)
-
     # ------------------------------------------------------------------
     # Sparse path using indexed kernel
     # ------------------------------------------------------------------
