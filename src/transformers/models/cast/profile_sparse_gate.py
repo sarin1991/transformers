@@ -16,6 +16,10 @@ from triton_cast_kernel import (
 from triton_cast_kernel_csr import (
     fused_up_proj_gate_activation_sparse_triton_csr as fused_up_proj_gate_activation_sparse_triton_csr,
 )
+# Unified CSR helper
+from triton_cast_kernel_csr_unified import (
+    fused_up_proj_gate_activation_sparse_triton_csr_unified as fused_up_proj_gate_activation_sparse_triton_csr_unified,
+)
 
 
 # -----------------------------------------------------------------------------
@@ -123,6 +127,26 @@ def _run_csr(
         zero_init=zero_init,
     )
 
+# Unified CSR helper
+def _run_csr_unified(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    b: torch.Tensor,
+    gate: torch.Tensor,
+    num_blocks: int,
+    line_size: int,
+    zero_init: bool,
+):
+    fused_up_proj_gate_activation_sparse_triton_csr_unified(
+        x,
+        w,
+        b,
+        gate,
+        num_blocks,
+        line_size,
+        zero_init=zero_init,
+    )
+
 
 # -----------------------------------------------------------------------------
 # Main CLI
@@ -159,6 +183,9 @@ def main():
     )
     parser.add_argument(
         "--profile-csr", action="store_true", help="Include CSR sparse helper in the profile",
+    )
+    parser.add_argument(
+        "--profile-csr-unified", action="store_true", help="Include unified CSR sparse helper in the profile",
     )
     parser.add_argument(
         "--row-limit",
@@ -201,21 +228,24 @@ def main():
     # By **default** we always profile the sparse helper.  If neither helper
     # is requested explicitly, we profile *both*.  This guarantees that the
     # sparse path is included unless the script is modified to disable it.
-    if not (args.profile_dense or args.profile_sparse or args.profile_optimized or args.profile_csr):
+    if not (args.profile_dense or args.profile_sparse or args.profile_optimized or args.profile_csr or args.profile_csr_unified):
         # No flags → profile all helpers
         args.profile_dense = True
         args.profile_sparse = True
         args.profile_optimized = True
         args.profile_csr = True
-    elif args.profile_dense and not (args.profile_sparse or args.profile_optimized or args.profile_csr):
+        args.profile_csr_unified = True
+    elif args.profile_dense and not (args.profile_sparse or args.profile_optimized or args.profile_csr or args.profile_csr_unified):
         # User asked for dense only – still include all sparse paths by default
         args.profile_sparse = True
         args.profile_optimized = True
         args.profile_csr = True
-    elif args.profile_sparse and not (args.profile_optimized or args.profile_csr):
+        args.profile_csr_unified = True
+    elif args.profile_sparse and not (args.profile_optimized or args.profile_csr or args.profile_csr_unified):
         # baseline sparse only → also add optimized and csr for comparison
         args.profile_optimized = True
         args.profile_csr = True
+        args.profile_csr_unified = True
 
     device = torch.device("cuda")
 
@@ -261,6 +291,16 @@ def main():
             args.line,
             args.zero_init,
         )
+    if args.profile_csr_unified:
+        _run_csr_unified(
+            x_fp16,
+            w_fp16,
+            b_fp16,
+            gate_fp32,
+            args.blocks,
+            args.line,
+            args.zero_init,
+        )
     torch.cuda.synchronize()
 
     activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
@@ -294,6 +334,17 @@ def main():
             if args.profile_csr:
                 with record_function("CSR_HELPER"):
                     _run_csr(
+                        x_fp16,
+                        w_fp16,
+                        b_fp16,
+                        gate_fp32,
+                        args.blocks,
+                        args.line,
+                        args.zero_init,
+                    )
+            if args.profile_csr_unified:
+                with record_function("CSR_UN_HELPER"):
+                    _run_csr_unified(
                         x_fp16,
                         w_fp16,
                         b_fp16,
