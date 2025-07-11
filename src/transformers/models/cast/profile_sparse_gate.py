@@ -13,6 +13,9 @@ from triton_kernels import (
 from triton_cast_kernel import (
     fused_up_proj_gate_activation_sparse_triton_optimized as fused_up_proj_gate_activation_sparse_triton_opt,
 )
+from triton_cast_kernel_csr import (
+    fused_up_proj_gate_activation_sparse_triton_csr as fused_up_proj_gate_activation_sparse_triton_csr,
+)
 
 
 # -----------------------------------------------------------------------------
@@ -69,7 +72,6 @@ def _run_sparse(
     gate: torch.Tensor,
     num_blocks: int,
     line_size: int,
-    density_threshold: float,
 ):
     fused_up_proj_gate_activation_sparse_triton(
         x,
@@ -78,7 +80,6 @@ def _run_sparse(
         gate,
         num_blocks,
         line_size,
-        density_threshold=density_threshold,
     )
 
 
@@ -90,7 +91,6 @@ def _run_opt(
     gate: torch.Tensor,
     num_blocks: int,
     line_size: int,
-    density_threshold: float,
 ):
     fused_up_proj_gate_activation_sparse_triton_opt(
         x,
@@ -99,7 +99,24 @@ def _run_opt(
         gate,
         num_blocks,
         line_size,
-        density_threshold=density_threshold,
+    )
+
+# CSR sparse helper
+def _run_csr(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    b: torch.Tensor,
+    gate: torch.Tensor,
+    num_blocks: int,
+    line_size: int,
+):
+    fused_up_proj_gate_activation_sparse_triton_csr(
+        x,
+        w,
+        b,
+        gate,
+        num_blocks,
+        line_size,
     )
 
 
@@ -137,10 +154,7 @@ def main():
         "--profile-optimized", action="store_true", help="Include optimized sparse helper in the profile",
     )
     parser.add_argument(
-        "--density-threshold",
-        type=float,
-        default=0.5,
-        help="density_threshold parameter forwarded to sparse helper",
+        "--profile-csr", action="store_true", help="Include CSR sparse helper in the profile",
     )
     parser.add_argument(
         "--row-limit",
@@ -149,7 +163,24 @@ def main():
         help="Rows to display in the profiler table",
     )
 
+    # Convenience preset for the large line-size config used in the benchmark
+    parser.add_argument(
+        "--big-config",
+        action="store_true",
+        help="Shortcut – use (batch=128, seq=128, hidden=4096, blocks=8, line=4096)",
+    )
+
     args = parser.parse_args()
+
+    # --------------------------------------------------------------
+    # Apply --big-config preset (overrides individual size flags)
+    # --------------------------------------------------------------
+    if args.big_config:
+        args.batch = 128
+        args.seq = 128
+        args.hidden = 4096
+        args.blocks = 8
+        args.line = 4096
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for Triton profiling, but torch.cuda.is_available() == False")
@@ -160,18 +191,21 @@ def main():
     # By **default** we always profile the sparse helper.  If neither helper
     # is requested explicitly, we profile *both*.  This guarantees that the
     # sparse path is included unless the script is modified to disable it.
-    if not (args.profile_dense or args.profile_sparse or args.profile_optimized):
-        # No flags → profile all three
+    if not (args.profile_dense or args.profile_sparse or args.profile_optimized or args.profile_csr):
+        # No flags → profile all helpers
         args.profile_dense = True
         args.profile_sparse = True
         args.profile_optimized = True
-    elif args.profile_dense and not (args.profile_sparse or args.profile_optimized):
-        # User asked for dense only – still include sparse & optimized by default
+        args.profile_csr = True
+    elif args.profile_dense and not (args.profile_sparse or args.profile_optimized or args.profile_csr):
+        # User asked for dense only – still include all sparse paths by default
         args.profile_sparse = True
         args.profile_optimized = True
-    elif args.profile_sparse and not args.profile_optimized:
-        # baseline sparse only → also add optimized for comparison
+        args.profile_csr = True
+    elif args.profile_sparse and not (args.profile_optimized or args.profile_csr):
+        # baseline sparse only → also add optimized and csr for comparison
         args.profile_optimized = True
+        args.profile_csr = True
 
     device = torch.device("cuda")
 
@@ -196,7 +230,6 @@ def main():
             gate_fp32,
             args.blocks,
             args.line,
-            args.density_threshold,
         )
     if args.profile_optimized:
         _run_opt(
@@ -206,7 +239,15 @@ def main():
             gate_fp32,
             args.blocks,
             args.line,
-            args.density_threshold,
+        )
+    if args.profile_csr:
+        _run_csr(
+            x_fp16,
+            w_fp16,
+            b_fp16,
+            gate_fp32,
+            args.blocks,
+            args.line,
         )
     torch.cuda.synchronize()
 
@@ -226,7 +267,6 @@ def main():
                         gate_fp32,
                         args.blocks,
                         args.line,
-                        args.density_threshold,
                     )
             if args.profile_optimized:
                 with record_function("OPTIMIZED_HELPER"):
@@ -237,7 +277,16 @@ def main():
                         gate_fp32,
                         args.blocks,
                         args.line,
-                        args.density_threshold,
+                    )
+            if args.profile_csr:
+                with record_function("CSR_HELPER"):
+                    _run_csr(
+                        x_fp16,
+                        w_fp16,
+                        b_fp16,
+                        gate_fp32,
+                        args.blocks,
+                        args.line,
                     )
         torch.cuda.synchronize()
 
@@ -253,6 +302,8 @@ def main():
         )
     if args.profile_optimized:
         print("Also compare OPTIMIZED_HELPER for the improved path.")
+    if args.profile_csr:
+        print("CSR_HELPER shows the single-kernel CSR path.")
 
 
 if __name__ == "__main__":

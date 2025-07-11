@@ -2,8 +2,6 @@ import torch
 import triton
 import triton.language as tl
 from typing import Optional
-import time
-import warnings
 import torch.nn.functional as F
 from triton_cast_kernel import (
     fused_up_proj_gate_activation_sparse_triton_optimized as fused_up_proj_gate_activation_sparse_triton_opt,
@@ -204,7 +202,6 @@ def fused_up_proj_gate_activation_sparse_triton(
     gate: torch.Tensor,
     num_blocks: int,
     line_size: int,
-    density_threshold: float = 0.5,
 ):
     """Optimized variant of *fused_up_proj_gate_activation_triton* for sparse ``gate`` tensors.
 
@@ -253,14 +250,6 @@ def fused_up_proj_gate_activation_sparse_triton(
         # Everything is zero – return all-zeros tensor fast
         return torch.zeros((batch_size, seq_len, intermediate_size), device=x.device, dtype=torch.float32)
 
-    density = nnz / (batch_seq_size * num_blocks)
-    if density >= density_threshold:
-        # Not sparse enough – fall back to the dense implementation
-        warnings.warn(
-            f"[sparse_helper] Density {density:.2%} ≥ threshold {density_threshold:.2%}. Falling back to dense path.",
-            stacklevel=2,
-        )
-        return fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks, line_size)
 
     # ------------------------------------------------------------------
     # Sparse path
