@@ -91,6 +91,7 @@ def _run_opt(
     gate: torch.Tensor,
     num_blocks: int,
     line_size: int,
+    zero_init: bool,
 ):
     fused_up_proj_gate_activation_sparse_triton_opt(
         x,
@@ -99,6 +100,7 @@ def _run_opt(
         gate,
         num_blocks,
         line_size,
+        zero_init=zero_init,
     )
 
 # CSR sparse helper
@@ -109,6 +111,7 @@ def _run_csr(
     gate: torch.Tensor,
     num_blocks: int,
     line_size: int,
+    zero_init: bool,
 ):
     fused_up_proj_gate_activation_sparse_triton_csr(
         x,
@@ -117,6 +120,7 @@ def _run_csr(
         gate,
         num_blocks,
         line_size,
+        zero_init=zero_init,
     )
 
 
@@ -168,6 +172,12 @@ def main():
         "--big-config",
         action="store_true",
         help="Shortcut – use (batch=128, seq=128, hidden=4096, blocks=8, line=4096)",
+    )
+
+    parser.add_argument(
+        "--zero-init",
+        action="store_true",
+        help="Pre-zero the output buffer in sparse helpers (default: off for fastest path)",
     )
 
     args = parser.parse_args()
@@ -239,6 +249,7 @@ def main():
             gate_fp32,
             args.blocks,
             args.line,
+            args.zero_init,
         )
     if args.profile_csr:
         _run_csr(
@@ -248,6 +259,7 @@ def main():
             gate_fp32,
             args.blocks,
             args.line,
+            args.zero_init,
         )
     torch.cuda.synchronize()
 
@@ -277,6 +289,7 @@ def main():
                         gate_fp32,
                         args.blocks,
                         args.line,
+                        args.zero_init,
                     )
             if args.profile_csr:
                 with record_function("CSR_HELPER"):
@@ -287,6 +300,7 @@ def main():
                         gate_fp32,
                         args.blocks,
                         args.line,
+                        args.zero_init,
                     )
         torch.cuda.synchronize()
 
