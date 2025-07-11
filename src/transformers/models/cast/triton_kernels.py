@@ -8,6 +8,9 @@ import torch.nn.functional as F
 from triton_cast_kernel import (
     fused_up_proj_gate_activation_sparse_triton_optimized as fused_up_proj_gate_activation_sparse_triton_opt,
 )
+from triton_cast_kernel_csr import (
+    fused_up_proj_gate_activation_sparse_triton_csr as fused_up_proj_gate_activation_sparse_triton_csr,
+)
 
 
 @triton.autotune(
@@ -361,6 +364,7 @@ def debug_large_scale(use_sparse_gate: bool = False):
     overall_max_dense = 0.0
     overall_max_sparse = 0.0
     overall_max_opt = 0.0
+    overall_max_csr = 0.0
 
     for batch_size, seq_len, hidden_size, num_blocks, line_size in test_configs:
         intermediate_size = num_blocks * line_size
@@ -415,6 +419,16 @@ def debug_large_scale(use_sparse_gate: bool = False):
             line_size,
         )
 
+        # CSR sparse helper
+        out_csr = fused_up_proj_gate_activation_sparse_triton_csr(
+            x_fp16,
+            up_weight_fp16,
+            up_bias_fp16,
+            gate_fp32,
+            num_blocks,
+            line_size,
+        )
+
         # Compute diffs
         max_diff_dense = torch.max(torch.abs(ref_fp32 - out_dense)).item()
         mean_diff_dense = torch.mean(torch.abs(ref_fp32 - out_dense)).item()
@@ -425,16 +439,21 @@ def debug_large_scale(use_sparse_gate: bool = False):
         max_diff_opt = torch.max(torch.abs(ref_fp32 - out_opt)).item()
         mean_diff_opt = torch.mean(torch.abs(ref_fp32 - out_opt)).item()
 
+        max_diff_csr = torch.max(torch.abs(ref_fp32 - out_csr)).item()
+        mean_diff_csr = torch.mean(torch.abs(ref_fp32 - out_csr)).item()
+
         print(f"Dense   → max diff {max_diff_dense:.6e} | mean diff {mean_diff_dense:.6e}")
         print(f"Sparse  → max diff {max_diff_sparse:.6e} | mean diff {mean_diff_sparse:.6e}")
         print(f"OptSpa  → max diff {max_diff_opt  :.6e} | mean diff {mean_diff_opt  :.6e}")
+        print(f"CSR     → max diff {max_diff_csr  :.6e} | mean diff {mean_diff_csr  :.6e}")
 
         overall_max_dense = max(overall_max_dense, max_diff_dense)
         overall_max_sparse = max(overall_max_sparse, max_diff_sparse)
         overall_max_opt = max(overall_max_opt, max_diff_opt)
+        overall_max_csr = max(overall_max_csr, max_diff_csr)
 
     print(
-        f"\nOverall max diff across configs | Dense: {overall_max_dense:.6e} | Sparse: {overall_max_sparse:.6e} | OptSpa: {overall_max_opt:.6e}"
+        f"\nOverall max diff across configs | Dense: {overall_max_dense:.6e} | Sparse: {overall_max_sparse:.6e} | OptSpa: {overall_max_opt:.6e} | CSR: {overall_max_csr:.6e}"
     )
 
 
