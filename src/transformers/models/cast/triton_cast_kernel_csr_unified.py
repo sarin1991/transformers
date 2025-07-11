@@ -49,42 +49,25 @@ def _csr_writer_kernel(
     mask_bs = offs_bs < BS
     mask_nb = offs_nb < NB
 
-    # Broadcast to create pointers for a matrix load
-    gate_ptrs = gate_ptr + offs_bs[:, None] * stride_g_bs + offs_nb[None, :] * stride_g_nb
-    gate_tile = tl.load(gate_ptrs, mask=mask_bs[:, None] & mask_nb[None, :], other=0.0)
+    # ---------------- Vectorised per-tile processing -------------------
+    g_tile_ptrs = gate_ptr + offs_bs[:, None] * stride_g_bs + offs_nb[None, :] * stride_g_nb
+    gate_tile = tl.load(g_tile_ptrs, mask=mask_bs[:, None] & mask_nb[None, :], other=0.0)  # (rows, nb)
 
-    nz_mask_tile = gate_tile != 0
+    g_mask = gate_tile != 0                                # (rows, nb)
+    nnz = tl.sum(g_mask, axis=0)                   # (nb,)
 
-    # Loop over blocks inside the tile – static unroll for efficiency
-    for j in tl.static_range(BLOCK_SIZE_NB):
-        nb = blk_start + j
-        if nb >= NB:
-            break  # OOB on blocks dimension
+    # Reserve slices atomically per block (vectorised)
+    tile_offsets = tl.atomic_add(block_write_ptrs_ptr + offs_nb, nnz, mask=mask_nb)
 
-        valid_block = mask_nb[j]
-        if not valid_block:
-            continue
+    block_bases = tl.load(block_offsets_ptr + offs_nb, mask=mask_nb, other=0)  # (nb,)
+    write_bases = block_bases + tile_offsets                                    # (nb,)
 
-        col_mask = nz_mask_tile[:, j] & mask_bs  # (BLOCK_SIZE_BS,)
-        nnz_col = tl.sum(col_mask, axis=0)
+    # Prefix inside each column
+    prefix = tl.cumsum(g_mask.to(tl.int32), axis=0) - 1    # (rows, nb)
 
-        if nnz_col == 0:
-            continue  # nothing to write for this (block, tile)
-
-        # Reserve slice within this block via atomicAdd
-        tile_offset = tl.atomic_add(block_write_ptrs_ptr + nb, nnz_col)
-        block_base = tl.load(block_offsets_ptr + nb)
-        write_base = block_base + tile_offset
-
-        # Compute intra-tile prefix offsets (0-based) for the non-zero rows
-        col_mask_i32 = col_mask.to(tl.int32)
-        prefix = tl.cumsum(col_mask_i32, axis=0) - 1  # -1 so first element is 0
-
-        row_vals = offs_bs  # global row indices (int32)
-        gate_vals = gate_tile[:, j]
-
-        tl.store(rows_index_ptr + write_base + prefix, row_vals, mask=col_mask)
-        tl.store(gates_val_ptr  + write_base + prefix, gate_vals, mask=col_mask)
+    row_vals = offs_bs[:, None]                            # broadcast
+    tl.store(rows_index_ptr + write_bases[None, :] + prefix, row_vals, mask=g_mask)
+    tl.store(gates_val_ptr + write_bases[None, :] + prefix, gate_tile,  mask=g_mask)
 
 
 # =============================================================================
