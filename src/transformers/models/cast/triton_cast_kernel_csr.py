@@ -26,6 +26,7 @@ def fused_up_proj_gate_csr_kernel(
     gates_val_ptr,               # (N,)                 fp32
     block_start_offsets_ptr,     # (NB+1,)              int32
     output_ptr,                  # (B·S, I)             fp32   (pre-allocated, zero)
+    max_rows,                    # int32 – maximum rows per block (host pre-computed)
     # Sizes
     hidden_size, line_size,
     # Strides
@@ -46,7 +47,10 @@ def fused_up_proj_gate_csr_kernel(
 
     C = (line_size + BLOCK_SIZE_LS - 1) // BLOCK_SIZE_LS  # column chunks per block
 
-    num_pid_per_block = C * GROUP_SIZE_R  # row_group rolled into pid value via grid sizing
+    # Reconstruct num_pid_per_block from max_rows & meta – same formula as host
+    row_chunks = (max_rows + BLOCK_SIZE_BS - 1) // BLOCK_SIZE_BS
+    row_groups = (row_chunks + GROUP_SIZE_R - 1) // GROUP_SIZE_R
+    num_pid_per_block = C * GROUP_SIZE_R * row_groups
 
     # Derive block index (slowest-changing)
     block_idx = pid // num_pid_per_block
@@ -72,12 +76,16 @@ def fused_up_proj_gate_csr_kernel(
 
     # Gate values
     gate_vals = tl.load(gates_val_ptr + block_start + offs_bs, mask=mask_bs, other=0.0)
+
+    # Early exit if entire tile is zero – caller is responsible for zero-init
     if tl.sum(gate_vals) == 0:
         return
 
-    # Column offsets and mask
+    # Column-related offsets (only evaluated for non-zero tiles)
     offs_ls = col_chunk * BLOCK_SIZE_LS + tl.arange(0, BLOCK_SIZE_LS)
     mask_ls = offs_ls < line_size
+    col_offset = block_idx * line_size
+    global_cols = col_offset + offs_ls
 
     # Prepare acc
     acc = tl.zeros((BLOCK_SIZE_BS, BLOCK_SIZE_LS), dtype=tl.float32)
@@ -88,15 +96,15 @@ def fused_up_proj_gate_csr_kernel(
         curr_offs_h = h + offs_h
         mask_h = curr_offs_h < hidden_size
 
-        x_ptrs = x_ptr + row_indices[:, None]*stride_x_bs + curr_offs_h[None, :]*stride_x_h
-        w_ptrs = w_ptr + curr_offs_h[:, None]*stride_w_h + offs_ls[None, :]*stride_w_i
+        x_ptrs = x_ptr + row_indices[:, None] * stride_x_bs + curr_offs_h[None, :] * stride_x_h
+        w_ptrs = w_ptr + curr_offs_h[:, None] * stride_w_h + global_cols[None, :] * stride_w_i
 
         x_block = tl.load(x_ptrs, mask=mask_bs[:, None] & mask_h[None, :], other=0.0)
         w_block = tl.load(w_ptrs, mask=mask_h[:, None] & mask_ls[None, :], other=0.0)
         acc += tl.dot(x_block, w_block)
 
     # Bias, relu
-    b_ptrs = b_ptr + offs_ls
+    b_ptrs = b_ptr + global_cols
     bias = tl.load(b_ptrs, mask=mask_ls, other=0.0)
     acc += bias[None, :]
     acc = tl.where(acc > 0, acc, 0.0)
@@ -105,7 +113,7 @@ def fused_up_proj_gate_csr_kernel(
     acc *= gate_vals[:, None]
 
     # Store
-    out_ptrs = output_ptr + row_indices[:, None]*stride_out_bs + offs_ls[None, :]*stride_out_i
+    out_ptrs = output_ptr + row_indices[:, None] * stride_out_bs + global_cols[None, :] * stride_out_i
     tl.store(out_ptrs, acc, mask=mask_bs[:, None] & mask_ls[None, :]) 
 
 # =============================================================================
@@ -120,6 +128,7 @@ def fused_up_proj_gate_activation_sparse_triton_csr(
     num_blocks: int,
     line_size: int,
     GROUP_SIZE_R: int = 4,
+    zero_init: bool = True,
 ):
     """Sparse helper using CSR buffers and single-axis grid launch."""
 
@@ -165,8 +174,11 @@ def fused_up_proj_gate_activation_sparse_triton_csr(
     gates_index = torch.cat(gates_list).contiguous().to(torch.float32)
     block_start_offsets = torch.tensor(block_start_offsets, device=x.device, dtype=torch.int32)
 
-    # Output tensor
-    output = torch.zeros((batch_seq_size, intermediate_size), device=x.device, dtype=torch.float32)
+    # Output buffer initialisation policy controlled by caller
+    if zero_init:
+        output = torch.zeros((batch_seq_size, intermediate_size), device=x.device, dtype=torch.float32)
+    else:
+        output = torch.empty((batch_seq_size, intermediate_size), device=x.device, dtype=torch.float32)
 
     # Pre-compute maximum rows per block (CPU side)
     max_rows = 0
@@ -191,6 +203,7 @@ def fused_up_proj_gate_activation_sparse_triton_csr(
         gates_index,
         block_start_offsets,
         output,
+        max_rows,
         hidden_size, line_size,
         x_reshaped.stride(0), x_reshaped.stride(1),
         up_weight.stride(0), up_weight.stride(1),

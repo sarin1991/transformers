@@ -63,9 +63,12 @@ def fused_up_proj_gate_activation_kernel_optimized(
     g_ptrs = gate_col_ptr + row_indices
     g_vals = tl.load(g_ptrs, mask=mask_bs_valid, other=0.0)
 
-    # Early exit if whole sub-block has zero gates
+    # Early exit if tile has zero gates – caller decides whether output is pre-initialised
     if tl.sum(g_vals) == 0:
         return
+
+    col_offs = col_offset + offs_ls
+    out_ptrs = output_ptr + (row_indices[:, None] * stride_out_bs) + (col_offs[None, :] * stride_out_ls)
 
     # -------------------- matrix multiply --------------------
     # We compute accumulator (BLOCK_SIZE_BS, BLOCK_SIZE_LS)
@@ -100,10 +103,6 @@ def fused_up_proj_gate_activation_kernel_optimized(
     acc *= g_vals[:, None]
 
     # Store back to output – need global row index
-    col_offs = col_offset + offs_ls            # (BLOCK_SIZE_LS,)
-    out_ptrs = output_ptr \
-             + (row_indices[:, None] * stride_out_bs) \
-             + (col_offs[None, :] * stride_out_ls)
     tl.store(out_ptrs, acc, mask=mask_bs_valid[:, None] & mask_ls[None, :])
 
 
@@ -118,7 +117,7 @@ def fused_up_proj_gate_activation_sparse_triton_optimized(
     gate: torch.Tensor,
     num_blocks: int,
     line_size: int,
-    density_threshold: float = 0.5,
+    zero_init: bool = True,
 ):
     """Sparse variant that offloads gather & scatter into the Triton kernel.
 
@@ -154,7 +153,10 @@ def fused_up_proj_gate_activation_sparse_triton_optimized(
     # ------------------------------------------------------------------
     # Sparse path using indexed kernel
     # ------------------------------------------------------------------
-    output = torch.zeros((batch_seq_size, intermediate_size), device=x.device, dtype=torch.float32)
+    if zero_init:
+        output = torch.zeros((batch_seq_size, intermediate_size), device=x.device, dtype=torch.float32)
+    else:
+        output = torch.empty((batch_seq_size, intermediate_size), device=x.device, dtype=torch.float32)
 
     rows, blocks = gate_mask.nonzero(as_tuple=True)
     # Iterate over blocks – still one call per block, but no gather/scatter

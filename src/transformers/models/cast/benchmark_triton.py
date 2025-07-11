@@ -7,6 +7,9 @@ from triton_kernels import (
 from triton_cast_kernel import (
     fused_up_proj_gate_activation_sparse_triton_optimized as fused_up_proj_gate_activation_sparse_triton_opt,
 )
+from triton_cast_kernel_csr import (
+    fused_up_proj_gate_activation_sparse_triton_csr as fused_up_proj_gate_activation_sparse_triton_csr,
+)  # New CSR helper
 
 
 def benchmark_fused_vs_pytorch(num_iters: int = 100):
@@ -139,6 +142,39 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100):
         opt_ms = start_opt.elapsed_time(end_opt) / num_iters
 
         print(f"Triton (optimized sparse, 10% nnz): {opt_ms:.3f} ms | Speed-up vs PyTorch: {torch_ms/opt_ms:.2f}x | Speed-up vs baseline sparse: {sparse_ms/opt_ms:.2f}x")
+
+        # ---- CSR sparse benchmark (10% non-zero gate) ----
+        for _ in range(5):
+            _ = fused_up_proj_gate_activation_sparse_triton_csr(
+                x_fp16,
+                up_weight_fp16.t(),
+                up_bias_fp16,
+                gate_sparse,
+                num_blocks,
+                line_size,
+            )
+        torch.cuda.synchronize()
+
+        start_csr = torch.cuda.Event(enable_timing=True)
+        end_csr   = torch.cuda.Event(enable_timing=True)
+        start_csr.record(torch.cuda.current_stream())
+        for _ in range(num_iters):
+            _ = fused_up_proj_gate_activation_sparse_triton_csr(
+                x_fp16,
+                up_weight_fp16.t(),
+                up_bias_fp16,
+                gate_sparse,
+                num_blocks,
+                line_size,
+            )
+        end_csr.record(torch.cuda.current_stream())
+        torch.cuda.synchronize()
+        csr_ms = start_csr.elapsed_time(end_csr) / num_iters
+
+        print(
+            f"Triton (CSR sparse, 10% nnz): {csr_ms:.3f} ms | Speed-up vs PyTorch: {torch_ms/csr_ms:.2f}x | "
+            f"Speed-up vs baseline sparse: {sparse_ms/csr_ms:.2f}x | Speed-up vs optimized: {opt_ms/csr_ms:.2f}x"
+        )
 
 
 if __name__ == "__main__":
