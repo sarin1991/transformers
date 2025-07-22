@@ -10,9 +10,8 @@ from triton_cast_kernel import (
 from triton_cast_kernel_csr import (
     fused_up_proj_gate_activation_sparse_triton_csr as fused_up_proj_gate_activation_sparse_triton_csr,
 )  # New CSR helper
-# Unified CSR helper (GPU-built buffers)
-from triton_cast_kernel_csr_unified import (
-    fused_up_proj_gate_activation_sparse_triton_csr_unified as fused_up_proj_gate_activation_sparse_triton_csr_unified,
+from triton_cast_kernel_gate_sortpack import (
+    fused_up_proj_gate_activation_sparse_triton_sortpack as fused_up_proj_gate_activation_sparse_triton_sortpack,
 )
 
 
@@ -179,9 +178,9 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100):
         torch.cuda.synchronize()
         csr_ms = start_csr.elapsed_time(end_csr) / num_iters
 
-        # ---- Unified CSR sparse benchmark ----
+        # ---- SortPack sparse benchmark ----
         for _ in range(5):
-            _ = fused_up_proj_gate_activation_sparse_triton_csr_unified(
+            _ = fused_up_proj_gate_activation_sparse_triton_sortpack(
                 x_fp16,
                 up_weight_fp16.t(),
                 up_bias_fp16,
@@ -192,11 +191,11 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100):
             )
         torch.cuda.synchronize()
 
-        start_csr_u = torch.cuda.Event(enable_timing=True)
-        end_csr_u   = torch.cuda.Event(enable_timing=True)
-        start_csr_u.record(torch.cuda.current_stream())
+        start_sortpack = torch.cuda.Event(enable_timing=True)
+        end_sortpack   = torch.cuda.Event(enable_timing=True)
+        start_sortpack.record(torch.cuda.current_stream())
         for _ in range(num_iters):
-            _ = fused_up_proj_gate_activation_sparse_triton_csr_unified(
+            _ = fused_up_proj_gate_activation_sparse_triton_sortpack(
                 x_fp16,
                 up_weight_fp16.t(),
                 up_bias_fp16,
@@ -205,16 +204,16 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100):
                 line_size,
                 zero_init=False,
             )
-        end_csr_u.record(torch.cuda.current_stream())
+        end_sortpack.record(torch.cuda.current_stream())
         torch.cuda.synchronize()
-        csr_u_ms = start_csr_u.elapsed_time(end_csr_u) / num_iters
+        sortpack_ms = start_sortpack.elapsed_time(end_sortpack) / num_iters
 
         print(
             f"Triton (CSR sparse, 10% nnz):      {csr_ms   :.3f} ms | Speed-up vs PyTorch: {torch_ms/csr_ms   :.2f}x"
         )
         print(
-            f"Triton (CSR-Unified, 10% nnz): {csr_u_ms:.3f} ms | Speed-up vs PyTorch: {torch_ms/csr_u_ms:.2f}x | "
-            f"vs baseline sparse: {sparse_ms/csr_u_ms:.2f}x | vs optimized: {opt_ms/csr_u_ms:.2f}x | vs old CSR: {csr_ms/csr_u_ms:.2f}x"
+            f"Triton (SortPack, 10% nnz): {sortpack_ms:.3f} ms | Speed-up vs PyTorch: {torch_ms/sortpack_ms:.2f}x | "
+            f"vs baseline sparse: {sparse_ms/sortpack_ms:.2f}x | vs optimized: {opt_ms/sortpack_ms:.2f}x | vs old CSR: {csr_ms/sortpack_ms:.2f}x"
         )
 
 

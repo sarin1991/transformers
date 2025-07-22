@@ -10,8 +10,8 @@ from triton_cast_kernel_csr import (
     fused_up_proj_gate_activation_sparse_triton_csr as fused_up_proj_gate_activation_sparse_triton_csr,
 )
 # Unified CSR builder+compute helper
-from triton_cast_kernel_csr_unified import (
-    fused_up_proj_gate_activation_sparse_triton_csr_unified as fused_up_proj_gate_activation_sparse_triton_csr_unified,
+from triton_cast_kernel_gate_sortpack import (
+    fused_up_proj_gate_activation_sparse_triton_sortpack as fused_up_proj_gate_activation_sparse_triton_sortpack,
 )
 
 
@@ -358,7 +358,7 @@ def debug_large_scale(use_sparse_gate: bool = False):
     overall_max_sparse = 0.0
     overall_max_opt = 0.0
     overall_max_csr = 0.0
-    overall_max_csr_unified = 0.0
+    overall_max_sortpack = 0.0
 
     for batch_size, seq_len, hidden_size, num_blocks, line_size in test_configs:
         intermediate_size = num_blocks * line_size
@@ -423,8 +423,8 @@ def debug_large_scale(use_sparse_gate: bool = False):
             line_size,
         )
 
-        # Unified CSR helper (GPU-built CSR)
-        out_csr_unified = fused_up_proj_gate_activation_sparse_triton_csr_unified(
+        # SortPack helper
+        out_sortpack = fused_up_proj_gate_activation_sparse_triton_sortpack(
             x_fp16,
             up_weight_fp16,
             up_bias_fp16,
@@ -446,23 +446,23 @@ def debug_large_scale(use_sparse_gate: bool = False):
         max_diff_csr = torch.max(torch.abs(ref_fp32 - out_csr)).item()
         mean_diff_csr = torch.mean(torch.abs(ref_fp32 - out_csr)).item()
 
-        max_diff_csr_u = torch.max(torch.abs(ref_fp32 - out_csr_unified)).item()
-        mean_diff_csr_u = torch.mean(torch.abs(ref_fp32 - out_csr_unified)).item()
+        max_diff_sortpack = torch.max(torch.abs(ref_fp32 - out_sortpack)).item()
+        mean_diff_sortpack = torch.mean(torch.abs(ref_fp32 - out_sortpack)).item()
 
         print(f"Dense   → max diff {max_diff_dense:.6e} | mean diff {mean_diff_dense:.6e}")
         print(f"Sparse  → max diff {max_diff_sparse:.6e} | mean diff {mean_diff_sparse:.6e}")
         print(f"OptSpa  → max diff {max_diff_opt  :.6e} | mean diff {mean_diff_opt  :.6e}")
         print(f"CSR     → max diff {max_diff_csr  :.6e} | mean diff {mean_diff_csr  :.6e}")
-        print(f"CSR-Un  → max diff {max_diff_csr_u:.6e} | mean diff {mean_diff_csr_u:.6e}")
+        print(f"SortPk  → max diff {max_diff_sortpack:.6e} | mean diff {mean_diff_sortpack:.6e}")
 
         overall_max_dense = max(overall_max_dense, max_diff_dense)
         overall_max_sparse = max(overall_max_sparse, max_diff_sparse)
         overall_max_opt = max(overall_max_opt, max_diff_opt)
         overall_max_csr = max(overall_max_csr, max_diff_csr)
-        overall_max_csr_unified = max(overall_max_csr_unified, max_diff_csr_u)
+        overall_max_sortpack = max(overall_max_sortpack, max_diff_sortpack)
 
     print(
-        f"\nOverall max diff across configs | Dense: {overall_max_dense:.6e} | Sparse: {overall_max_sparse:.6e} | OptSpa: {overall_max_opt:.6e} | CSR: {overall_max_csr:.6e} | CSR-Un: {overall_max_csr_unified:.6e}"
+        f"\nOverall max diff across configs | Dense: {overall_max_dense:.6e} | Sparse: {overall_max_sparse:.6e} | OptSpa: {overall_max_opt:.6e} | CSR: {overall_max_csr:.6e} | SortPk: {overall_max_sortpack:.6e}"
     )
 
 

@@ -16,9 +16,9 @@ from triton_cast_kernel import (
 from triton_cast_kernel_csr import (
     fused_up_proj_gate_activation_sparse_triton_csr as fused_up_proj_gate_activation_sparse_triton_csr,
 )
-# Unified CSR helper
-from triton_cast_kernel_csr_unified import (
-    fused_up_proj_gate_activation_sparse_triton_csr_unified as fused_up_proj_gate_activation_sparse_triton_csr_unified,
+# SortPack helper
+from triton_cast_kernel_gate_sortpack import (
+    fused_up_proj_gate_activation_sparse_triton_sortpack as fused_up_proj_gate_activation_sparse_triton_sortpack,
 )
 
 
@@ -127,8 +127,8 @@ def _run_csr(
         zero_init=zero_init,
     )
 
-# Unified CSR helper
-def _run_csr_unified(
+# SortPack helper
+def _run_sortpack(
     x: torch.Tensor,
     w: torch.Tensor,
     b: torch.Tensor,
@@ -137,7 +137,7 @@ def _run_csr_unified(
     line_size: int,
     zero_init: bool,
 ):
-    fused_up_proj_gate_activation_sparse_triton_csr_unified(
+    fused_up_proj_gate_activation_sparse_triton_sortpack(
         x,
         w,
         b,
@@ -185,7 +185,7 @@ def main():
         "--profile-csr", action="store_true", help="Include CSR sparse helper in the profile",
     )
     parser.add_argument(
-        "--profile-csr-unified", action="store_true", help="Include unified CSR sparse helper in the profile",
+        "--profile-sortpack", action="store_true", help="Include SortPack sparse helper in the profile",
     )
     parser.add_argument(
         "--row-limit",
@@ -228,24 +228,24 @@ def main():
     # By **default** we always profile the sparse helper.  If neither helper
     # is requested explicitly, we profile *both*.  This guarantees that the
     # sparse path is included unless the script is modified to disable it.
-    if not (args.profile_dense or args.profile_sparse or args.profile_optimized or args.profile_csr or args.profile_csr_unified):
+    if not (args.profile_dense or args.profile_sparse or args.profile_optimized or args.profile_csr or args.profile_sortpack):
         # No flags → profile all helpers
         args.profile_dense = True
         args.profile_sparse = True
         args.profile_optimized = True
         args.profile_csr = True
-        args.profile_csr_unified = True
-    elif args.profile_dense and not (args.profile_sparse or args.profile_optimized or args.profile_csr or args.profile_csr_unified):
+        args.profile_sortpack = True
+    elif args.profile_dense and not (args.profile_sparse or args.profile_optimized or args.profile_csr or args.profile_sortpack):
         # User asked for dense only – still include all sparse paths by default
         args.profile_sparse = True
         args.profile_optimized = True
         args.profile_csr = True
-        args.profile_csr_unified = True
-    elif args.profile_sparse and not (args.profile_optimized or args.profile_csr or args.profile_csr_unified):
+        args.profile_sortpack = True
+    elif args.profile_sparse and not (args.profile_optimized or args.profile_csr or args.profile_sortpack):
         # baseline sparse only → also add optimized and csr for comparison
         args.profile_optimized = True
         args.profile_csr = True
-        args.profile_csr_unified = True
+        args.profile_sortpack = True
 
     device = torch.device("cuda")
 
@@ -291,8 +291,8 @@ def main():
             args.line,
             args.zero_init,
         )
-    if args.profile_csr_unified:
-        _run_csr_unified(
+    if args.profile_sortpack:
+        _run_sortpack(
             x_fp16,
             w_fp16,
             b_fp16,
@@ -342,9 +342,9 @@ def main():
                         args.line,
                         args.zero_init,
                     )
-            if args.profile_csr_unified:
-                with record_function("CSR_UN_HELPER"):
-                    _run_csr_unified(
+            if args.profile_sortpack:
+                with record_function("SORTPACK_HELPER"):
+                    _run_sortpack(
                         x_fp16,
                         w_fp16,
                         b_fp16,
@@ -369,6 +369,8 @@ def main():
         print("Also compare OPTIMIZED_HELPER for the improved path.")
     if args.profile_csr:
         print("CSR_HELPER shows the single-kernel CSR path.")
+    if args.profile_sortpack:
+        print("SORTPACK_HELPER shows the sort-pack path.")
 
 
 if __name__ == "__main__":
