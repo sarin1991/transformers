@@ -13,9 +13,10 @@ from triton_cast_kernel_csr import (
 from triton_cast_kernel_gate_sortpack import (
     fused_up_proj_gate_activation_sparse_triton_sortpack as fused_up_proj_gate_activation_sparse_triton_sortpack,
 )
+import argparse
 
 
-def benchmark_fused_vs_pytorch(num_iters: int = 100):
+def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
     """Time PyTorch reference vs Triton fused kernel on several shapes."""
     if not torch.cuda.is_available():
         print("CUDA not available – skipping benchmark.")
@@ -28,6 +29,10 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100):
         (8, 16, 256, 8, 32),
         (128, 32, 512, 8, 64),
         (128, 128, 4096, 64, 64),
+        (128, 128, 4096, 256, 128),
+        (128, 128, 4096, 128, 256),
+        (128, 128, 4096, 64, 512),
+        (128, 128, 4096, 32, 1024),
         (128, 128, 4096, 8, 4096),
     ]
 
@@ -63,122 +68,126 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100):
 
         print(f"PyTorch: {torch_ms:.3f} ms")
         
-        # ---- Triton timing (autotuned) ----
-        # Warm-up for Triton (5 runs)
-        for _ in range(5):
-            _ = fused_up_proj_gate_activation_triton(x_fp16, up_weight_fp16.t(), up_bias_fp16, gate_fp32, num_blocks, line_size)
-        torch.cuda.synchronize()
+        if run_all:
+            # ---- Triton timing (autotuned) ----
+            for _ in range(5):
+                _ = fused_up_proj_gate_activation_triton(x_fp16, up_weight_fp16.t(), up_bias_fp16, gate_fp32, num_blocks, line_size)
+            torch.cuda.synchronize()
 
-        start_tri = torch.cuda.Event(enable_timing=True)
-        end_tri   = torch.cuda.Event(enable_timing=True)
-        start_tri.record(torch.cuda.current_stream())
-        for _ in range(num_iters):
-            _ = fused_up_proj_gate_activation_triton(x_fp16, up_weight_fp16.t(), up_bias_fp16, gate_fp32, num_blocks, line_size)
-        end_tri.record(torch.cuda.current_stream())
-        torch.cuda.synchronize()
-        triton_ms = start_tri.elapsed_time(end_tri) / num_iters
+            start_tri = torch.cuda.Event(enable_timing=True)
+            end_tri   = torch.cuda.Event(enable_timing=True)
+            start_tri.record(torch.cuda.current_stream())
+            for _ in range(num_iters):
+                _ = fused_up_proj_gate_activation_triton(x_fp16, up_weight_fp16.t(), up_bias_fp16, gate_fp32, num_blocks, line_size)
+            end_tri.record(torch.cuda.current_stream())
+            torch.cuda.synchronize()
+            triton_ms = start_tri.elapsed_time(end_tri) / num_iters
 
-        speedup = torch_ms / triton_ms
-        print(f"Triton (autotuned): {triton_ms:.3f} ms | Speed-up: {speedup:.2f}x")
+            print(f"Triton (autotuned): {triton_ms:.3f} ms | Speed-up: {torch_ms/triton_ms:.2f}x")
 
-        # ---- Sparse benchmark (10% non-zero gate) ----
+        if run_all:
+            # ---- Sparse benchmark (10% non-zero gate) ----
+            gate_sparse = gate_fp32.clone()
+            mask_sparse = torch.rand_like(gate_sparse) < 0.9  # 90% zeros
+            gate_sparse[mask_sparse] = 0.0
+
+            # Warm-up sparse helper (5 runs)
+            for _ in range(5):
+                _ = fused_up_proj_gate_activation_sparse_triton(
+                    x_fp16,
+                    up_weight_fp16.t(),
+                    up_bias_fp16,
+                    gate_sparse,
+                    num_blocks,
+                    line_size,
+                )
+            torch.cuda.synchronize()
+
+            start_sp = torch.cuda.Event(enable_timing=True)
+            end_sp   = torch.cuda.Event(enable_timing=True)
+            start_sp.record(torch.cuda.current_stream())
+            for _ in range(num_iters):
+                _ = fused_up_proj_gate_activation_sparse_triton(
+                    x_fp16,
+                    up_weight_fp16.t(),
+                    up_bias_fp16,
+                    gate_sparse,
+                    num_blocks,
+                    line_size,
+                )
+            end_sp.record(torch.cuda.current_stream())
+            torch.cuda.synchronize()
+            sparse_ms = start_sp.elapsed_time(end_sp) / num_iters
+
+            print(f"Triton (sparse helper, 10% nnz): {sparse_ms:.3f} ms | Speed-up vs PyTorch: {torch_ms/sparse_ms:.2f}x")
+
+            # ---- Optimized sparse benchmark (10% non-zero gate) ----
+            for _ in range(5):
+                _ = fused_up_proj_gate_activation_sparse_triton_opt(
+                    x_fp16,
+                    up_weight_fp16.t(),
+                    up_bias_fp16,
+                    gate_sparse,
+                    num_blocks,
+                    line_size,
+                    zero_init=False,
+                )
+            torch.cuda.synchronize()
+
+            start_opt = torch.cuda.Event(enable_timing=True)
+            end_opt   = torch.cuda.Event(enable_timing=True)
+            start_opt.record(torch.cuda.current_stream())
+            for _ in range(num_iters):
+                _ = fused_up_proj_gate_activation_sparse_triton_opt(
+                    x_fp16,
+                    up_weight_fp16.t(),
+                    up_bias_fp16,
+                    gate_sparse,
+                    num_blocks,
+                    line_size,
+                    zero_init=False,
+                )
+            end_opt.record(torch.cuda.current_stream())
+            torch.cuda.synchronize()
+            opt_ms = start_opt.elapsed_time(end_opt) / num_iters
+
+            print(f"Triton (optimized sparse, 10% nnz): {opt_ms:.3f} ms | Speed-up vs PyTorch: {torch_ms/opt_ms:.2f}x | Speed-up vs baseline sparse: {sparse_ms/opt_ms:.2f}x")
+
+            # ---- CSR sparse benchmark (10% non-zero gate) ----
+            for _ in range(5):
+                _ = fused_up_proj_gate_activation_sparse_triton_csr(
+                    x_fp16,
+                    up_weight_fp16.t(),
+                    up_bias_fp16,
+                    gate_sparse,
+                    num_blocks,
+                    line_size,
+                    zero_init=False,
+                )
+            torch.cuda.synchronize()
+
+            start_csr = torch.cuda.Event(enable_timing=True)
+            end_csr   = torch.cuda.Event(enable_timing=True)
+            start_csr.record(torch.cuda.current_stream())
+            for _ in range(num_iters):
+                _ = fused_up_proj_gate_activation_sparse_triton_csr(
+                    x_fp16,
+                    up_weight_fp16.t(),
+                    up_bias_fp16,
+                    gate_sparse,
+                    num_blocks,
+                    line_size,
+                    zero_init=False,
+                )
+            end_csr.record(torch.cuda.current_stream())
+            torch.cuda.synchronize()
+            csr_ms = start_csr.elapsed_time(end_csr) / num_iters
+
+        # ---- SortPack benchmark (always) ----
         gate_sparse = gate_fp32.clone()
-        mask_sparse = torch.rand_like(gate_sparse) < 0.9  # 90% zeros
+        mask_sparse = torch.rand_like(gate_sparse) < 0.9
         gate_sparse[mask_sparse] = 0.0
 
-        # Warm-up sparse helper (5 runs)
-        for _ in range(5):
-            _ = fused_up_proj_gate_activation_sparse_triton(
-                x_fp16,
-                up_weight_fp16.t(),
-                up_bias_fp16,
-                gate_sparse,
-                num_blocks,
-                line_size,
-            )
-        torch.cuda.synchronize()
-
-        start_sp = torch.cuda.Event(enable_timing=True)
-        end_sp   = torch.cuda.Event(enable_timing=True)
-        start_sp.record(torch.cuda.current_stream())
-        for _ in range(num_iters):
-            _ = fused_up_proj_gate_activation_sparse_triton(
-                x_fp16,
-                up_weight_fp16.t(),
-                up_bias_fp16,
-                gate_sparse,
-                num_blocks,
-                line_size,
-            )
-        end_sp.record(torch.cuda.current_stream())
-        torch.cuda.synchronize()
-        sparse_ms = start_sp.elapsed_time(end_sp) / num_iters
-
-        print(f"Triton (sparse helper, 10% nnz): {sparse_ms:.3f} ms | Speed-up vs PyTorch: {torch_ms/sparse_ms:.2f}x")
-
-        # ---- Optimized sparse benchmark (10% non-zero gate) ----
-        for _ in range(5):
-            _ = fused_up_proj_gate_activation_sparse_triton_opt(
-                x_fp16,
-                up_weight_fp16.t(),
-                up_bias_fp16,
-                gate_sparse,
-                num_blocks,
-                line_size,
-                zero_init=False,
-            )
-        torch.cuda.synchronize()
-
-        start_opt = torch.cuda.Event(enable_timing=True)
-        end_opt   = torch.cuda.Event(enable_timing=True)
-        start_opt.record(torch.cuda.current_stream())
-        for _ in range(num_iters):
-            _ = fused_up_proj_gate_activation_sparse_triton_opt(
-                x_fp16,
-                up_weight_fp16.t(),
-                up_bias_fp16,
-                gate_sparse,
-                num_blocks,
-                line_size,
-                zero_init=False,
-            )
-        end_opt.record(torch.cuda.current_stream())
-        torch.cuda.synchronize()
-        opt_ms = start_opt.elapsed_time(end_opt) / num_iters
-
-        print(f"Triton (optimized sparse, 10% nnz): {opt_ms:.3f} ms | Speed-up vs PyTorch: {torch_ms/opt_ms:.2f}x | Speed-up vs baseline sparse: {sparse_ms/opt_ms:.2f}x")
-
-        # ---- CSR sparse benchmark (10% non-zero gate) ----
-        for _ in range(5):
-            _ = fused_up_proj_gate_activation_sparse_triton_csr(
-                x_fp16,
-                up_weight_fp16.t(),
-                up_bias_fp16,
-                gate_sparse,
-                num_blocks,
-                line_size,
-                zero_init=False,
-            )
-        torch.cuda.synchronize()
-
-        start_csr = torch.cuda.Event(enable_timing=True)
-        end_csr   = torch.cuda.Event(enable_timing=True)
-        start_csr.record(torch.cuda.current_stream())
-        for _ in range(num_iters):
-            _ = fused_up_proj_gate_activation_sparse_triton_csr(
-                x_fp16,
-                up_weight_fp16.t(),
-                up_bias_fp16,
-                gate_sparse,
-                num_blocks,
-                line_size,
-                zero_init=False,
-            )
-        end_csr.record(torch.cuda.current_stream())
-        torch.cuda.synchronize()
-        csr_ms = start_csr.elapsed_time(end_csr) / num_iters
-
-        # ---- SortPack sparse benchmark ----
         for _ in range(5):
             _ = fused_up_proj_gate_activation_sparse_triton_sortpack(
                 x_fp16,
@@ -208,19 +217,17 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100):
         torch.cuda.synchronize()
         sortpack_ms = start_sortpack.elapsed_time(end_sortpack) / num_iters
 
-        print(
-            f"Triton (CSR sparse, 10% nnz):      {csr_ms   :.3f} ms | Speed-up vs PyTorch: {torch_ms/csr_ms   :.2f}x"
-        )
-        print(
-            f"Triton (SortPack, 10% nnz): {sortpack_ms:.3f} ms | Speed-up vs PyTorch: {torch_ms/sortpack_ms:.2f}x | "
-            f"vs baseline sparse: {sparse_ms/sortpack_ms:.2f}x | vs optimized: {opt_ms/sortpack_ms:.2f}x | vs old CSR: {csr_ms/sortpack_ms:.2f}x"
-        )
+        base_line = f"Triton (SortPack, 10% nnz): {sortpack_ms:.3f} ms | Speed-up vs PyTorch: {torch_ms/sortpack_ms:.2f}x"
+        if run_all:
+            base_line += f" | vs baseline sparse: {sparse_ms/sortpack_ms:.2f}x | vs optimized: {opt_ms/sortpack_ms:.2f}x | vs old CSR: {csr_ms/sortpack_ms:.2f}x"
+        print(base_line)
 
 
 if __name__ == "__main__":
-    if not torch.cuda.is_available():
-        print("❌ CUDA is not available – exiting.")
-        exit(1)
+    parser = argparse.ArgumentParser(description="Benchmark Cast up-proj kernels")
+    parser.add_argument("--all", action="store_true", help="Run all helper variants (dense, sparse, etc.)")
+    parser.add_argument("--iters", type=int, default=100, help="Iterations per config")
+    args = parser.parse_args()
 
     try:
         import triton
@@ -229,5 +236,4 @@ if __name__ == "__main__":
         print("❌ Triton is not available. Please install it.")
         exit(1)
 
-    # Run benchmark
-    benchmark_fused_vs_pytorch(num_iters=100) 
+    benchmark_fused_vs_pytorch(num_iters=args.iters, run_all=args.all) 
