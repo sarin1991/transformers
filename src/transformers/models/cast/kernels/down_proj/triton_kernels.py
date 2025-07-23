@@ -3,6 +3,7 @@ import triton
 import triton.language as tl
 from typing import Optional
 import torch.nn.functional as F
+from triton_cast_kernel_gate_sortpack import fused_down_proj_sparse_triton_sortpack
 
 
 @triton.autotune(
@@ -174,7 +175,8 @@ def debug_large_scale(use_sparse_gate: bool = False):
         (32, 32, 512, 8, 64),
     ]
 
-    overall_max_diff = 0.0
+    overall_max_diff_dense = 0.0
+    overall_max_diff_sortpack = 0.0
 
     for batch_size, seq_len, hidden_size, num_blocks, line_size in configs:
         intermediate_size = num_blocks * line_size
@@ -192,8 +194,8 @@ def debug_large_scale(use_sparse_gate: bool = False):
         # Reference PyTorch result (fp32)
         ref_fp32 = F.linear(x_fp16.float(), down_weight_fp16.t().float()).float()
 
-        # Triton
-        out_triton = fused_down_proj_triton(
+        # Triton dense helper
+        out_dense = fused_down_proj_triton(
             x_fp16,
             down_weight_fp16,
             gate,
@@ -201,13 +203,30 @@ def debug_large_scale(use_sparse_gate: bool = False):
             line_size,
         )
 
-        max_diff = torch.max(torch.abs(ref_fp32 - out_triton)).item()
-        mean_diff = torch.mean(torch.abs(ref_fp32 - out_triton)).item()
-        overall_max_diff = max(overall_max_diff, max_diff)
+        # Triton SortPack sparse helper
+        out_sortpack = fused_down_proj_sparse_triton_sortpack(
+            x_fp16,
+            down_weight_fp16,
+            gate,
+            num_blocks,
+            line_size,
+        )
 
-        print(f"max diff {max_diff:.6e} | mean diff {mean_diff:.6e}")
+        max_diff_dense = torch.max(torch.abs(ref_fp32 - out_dense)).item()
+        mean_diff_dense = torch.mean(torch.abs(ref_fp32 - out_dense)).item()
 
-    print(f"\nOverall max diff across configs: {overall_max_diff:.6e}")
+        max_diff_sort = torch.max(torch.abs(ref_fp32 - out_sortpack)).item()
+        mean_diff_sort = torch.mean(torch.abs(ref_fp32 - out_sortpack)).item()
+
+        overall_max_diff_dense = max(overall_max_diff_dense, max_diff_dense)
+        overall_max_diff_sortpack = max(overall_max_diff_sortpack, max_diff_sort)
+
+        print(f"Dense   → max diff {max_diff_dense:.6e} | mean diff {mean_diff_dense:.6e}")
+        print(f"SortPk  → max diff {max_diff_sort:.6e} | mean diff {mean_diff_sort:.6e}")
+
+    print(
+        f"\nOverall max diff across configs | Dense: {overall_max_diff_dense:.6e} | SortPk: {overall_max_diff_sortpack:.6e}"
+    )
 
 
 if __name__ == "__main__":
