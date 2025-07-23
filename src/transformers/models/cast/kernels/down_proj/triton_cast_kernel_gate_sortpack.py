@@ -132,7 +132,7 @@ def fused_down_proj_sortpack_kernel(
         w_ptrs = w_ptr + (block_idx * line_size + curr_offs_ls)[:, None] * stride_w_ls + offs_h[None, :] * stride_w_h
 
         row_active = gate_vals > 0.0
-        x_block = tl.load(x_ptrs, mask=row_active[:, None] & mask_ls[None, :], other=0.0)
+        x_block = tl.load(x_ptrs, mask=mask_bs[:, None] & row_active[:, None] & mask_ls[None, :], other=0.0)
         w_block = tl.load(w_ptrs, mask=mask_ls[:, None] & mask_h[None, :], other=0.0)
 
         acc += tl.dot(x_block, w_block)
