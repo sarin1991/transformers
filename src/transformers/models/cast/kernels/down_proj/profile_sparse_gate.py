@@ -72,13 +72,26 @@ def main():
     parser.add_argument("--seq", type=int, default=128)
     parser.add_argument("--hidden", type=int, default=4096)
     parser.add_argument("--num-blocks", type=int, default=64)
-    parser.add_argument("--line-size", type=int, default=64)
+    parser.add_argument("--line-size", type=int, default=64, help="Line size",)
+    parser.add_argument(
+        "--big-config",
+        action="store_true",
+        help="Shortcut – use (batch=128, seq=128, hidden=4096, num_blocks=8, line_size=4096)",
+    )
     parser.add_argument("--sparsity", type=float, default=0.9, help="Fraction of zeros in gate tensor")
     parser.add_argument("--steps", type=int, default=50, help="Profiler steps")
     parser.add_argument("--profile-dense", action="store_true", help="Profile dense Triton helper")
     parser.add_argument("--profile-sortpack", action="store_true", help="Profile SortPack Triton helper")
     parser.add_argument("--profile-pytorch", action="store_true", help="Profile PyTorch baseline")
     args = parser.parse_args()
+
+    # Apply --big-config preset (overrides individual size flags)
+    if args.big_config:
+        args.batch = 128
+        args.seq = 128
+        args.hidden = 4096
+        args.num_blocks = 8
+        args.line_size = 4096
 
     if not torch.cuda.is_available():
         print("CUDA not available – exiting.")
