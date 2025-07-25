@@ -187,9 +187,11 @@ def debug_large_scale(use_sparse_gate: bool = False):
         down_weight_fp16 = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=torch.float16)
         gate = _make_sparse_gate(batch_size, seq_len, num_blocks, sparsity=0.9 if use_sparse_gate else 0.0)
 
-        # Zero-out fully gated rows in x (simulate real pipeline)
-        row_mask = (gate.view(-1, num_blocks).abs().sum(dim=1) != 0).view(batch_size, seq_len, 1)
-        x_fp16 = x_fp16 * row_mask.to(dtype=torch.float16)
+        # Zero-out gated blocks in x (simulate real pipeline)
+        # (B, S, I) where I = NB · LS
+        x_fp16 = x_fp16.view(batch_size, seq_len, num_blocks, line_size)
+        x_fp16 = x_fp16 * gate.unsqueeze(-1).to(dtype=x_fp16.dtype)   # element-wise multiply
+        x_fp16 = x_fp16.view(batch_size, seq_len, intermediate_size)
 
         # Reference PyTorch result (fp32)
         ref_fp32 = F.linear(x_fp16.float(), down_weight_fp16.t().float()).float()

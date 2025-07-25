@@ -99,6 +99,7 @@ def fused_down_proj_sortpack_kernel(
     base_ptr = block_idx * stride_row_blk  # stride_row_blk == max_rows
     row_indices = tl.load(row_idx_ptr + base_ptr + rows_in_block, mask=mask_bs, other=0)
     gate_vals = tl.load(gate_vals_ptr + base_ptr + rows_in_block, mask=mask_bs, other=0.0)
+    row_active = gate_vals > 0.0  # bool mask per row
 
     # If tile is fully padded or all gate values are zero, exit early
     if tl.sum(gate_vals) == 0:
@@ -131,8 +132,7 @@ def fused_down_proj_sortpack_kernel(
         # weight slice: (LS, H)
         w_ptrs = w_ptr + (block_idx * line_size + curr_offs_ls)[:, None] * stride_w_ls + offs_h[None, :] * stride_w_h
 
-        row_active = gate_vals > 0.0
-        x_block = tl.load(x_ptrs, mask=mask_bs[:, None] & row_active[:, None] & mask_ls[None, :], other=0.0)
+        x_block = tl.load(x_ptrs, mask=row_active[:, None] & mask_ls[None, :], other=0.0)
         w_block = tl.load(w_ptrs, mask=mask_ls[:, None] & mask_h[None, :], other=0.0)
 
         acc += tl.dot(x_block, w_block)
@@ -141,7 +141,7 @@ def fused_down_proj_sortpack_kernel(
     # Atomic add into output tensor
     # --------------------------------------------------------------
     out_ptrs = output_ptr + row_indices[:, None] * stride_out_bs + offs_h[None, :] * stride_out_h
-    tl.atomic_add(out_ptrs, acc, mask=mask_bs[:, None] & mask_h[None, :])
+    tl.atomic_add(out_ptrs, acc, mask=row_active[:, None] & mask_h[None, :])
 
 
 # =============================================================================
@@ -156,7 +156,6 @@ def fused_down_proj_sparse_triton_sortpack(
     num_blocks: int,
     line_size: int,
     GROUP_SIZE_R: int = 4,
-    zero_init: bool = True,
 ):
     """Sort-pack sparse helper for Cast down-projection.
 
@@ -166,7 +165,6 @@ def fused_down_proj_sparse_triton_sortpack(
         gate:        (B, S, NB)       – fp32 gate tensor (values > 0 indicate active)
         num_blocks:  NB
         line_size:   LS
-        zero_init:   if True the output buffer is zero-initialised (required here).
     """
 
     batch_size, seq_len, intermediate_size = x.shape
@@ -199,11 +197,8 @@ def fused_down_proj_sparse_triton_sortpack(
     gate_vals_flat = gate_vals.view(-1)
     row_idx_flat = row_idx.view(-1)
 
-    # Allocate output (fp32)
-    if zero_init:
-        output = torch.zeros((batch_seq_size, hidden_size), device=x.device, dtype=torch.float32)
-    else:
-        output = torch.empty((batch_seq_size, hidden_size), device=x.device, dtype=torch.float32)
+    # Allocate output (fp32) – must start at zeros because kernel writes via atomic_add.
+    output = torch.zeros((batch_seq_size, hidden_size), device=x.device, dtype=torch.float32)
 
     # Grid helper
     def grid(meta):
