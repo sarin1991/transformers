@@ -1,6 +1,8 @@
 import torch
 import triton
 import triton.language as tl
+from typing import Optional
+from ..utils import _TRITON_DTYPE_MAP
 
 # =============================================================================
 # Sort-pack (ELLPACK-like) fused up-proj + gate + activation kernel
@@ -34,6 +36,7 @@ def fused_up_proj_gate_sortpack_kernel(
     # meta-params
     BLOCK_SIZE_BS: tl.constexpr, BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_LS: tl.constexpr, GROUP_SIZE_R: tl.constexpr,
+    OUT_DTYPE: tl.constexpr,
 ):
     """Each CTA processes a tile of size (BLOCK_SIZE_BS rows × BLOCK_SIZE_LS cols)
     for a given (block column, row chunk, column chunk) triple encoded into the
@@ -115,7 +118,7 @@ def fused_up_proj_gate_sortpack_kernel(
     acc *= gate_vals[:, None]
 
     out_ptrs = output_ptr + row_indices[:, None] * stride_out_bs + global_cols[None, :] * stride_out_i
-    tl.store(out_ptrs, acc, mask=mask_bs[:, None] & mask_ls[None, :])
+    tl.store(out_ptrs, acc.to(OUT_DTYPE), mask=mask_bs[:, None] & mask_ls[None, :])
 
 
 # =============================================================================
@@ -131,6 +134,7 @@ def fused_up_proj_gate_activation_sparse_triton_sortpack(
     line_size: int,
     GROUP_SIZE_R: int = 4,
     zero_init: bool = True,
+    out_dtype: Optional[torch.dtype] = None,
 ):
     """Sort-pack (ELLPACK) sparse fused MLP helper.
 
@@ -162,9 +166,16 @@ def fused_up_proj_gate_activation_sparse_triton_sortpack(
     block_counts = mask.sum(dim=0, dtype=torch.int32)          # (NB,)
     max_rows = int(block_counts.max().item())
 
+    # Determine output dtype
+    if out_dtype is None:
+        out_dtype = torch.float32
+
+    if out_dtype not in _TRITON_DTYPE_MAP:
+        raise ValueError(f"Unsupported out_dtype {out_dtype}")
+
     # Early exit: gate is entirely zero
     if max_rows == 0:
-        return torch.zeros((batch_size, seq_len, intermediate_size), device=x.device, dtype=torch.float32)
+        return torch.zeros((batch_size, seq_len, intermediate_size), device=x.device, dtype=out_dtype)
 
     # Sort each column in descending order – positive values first.
     gate_vals_sorted, row_idx_sorted = torch.sort(gate_reshaped, dim=0, descending=True)
@@ -181,9 +192,9 @@ def fused_up_proj_gate_activation_sparse_triton_sortpack(
     # Allocate / zero-initialise output buffer
     # ------------------------------------------------------------------
     if zero_init:
-        output = torch.zeros((batch_seq_size, intermediate_size), device=x.device, dtype=torch.float32)
+        output = torch.zeros((batch_seq_size, intermediate_size), device=x.device, dtype=out_dtype)
     else:
-        output = torch.empty((batch_seq_size, intermediate_size), device=x.device, dtype=torch.float32)
+        output = torch.empty((batch_seq_size, intermediate_size), device=x.device, dtype=out_dtype)
 
     # ------------------------------------------------------------------
     # Grid size helper (same logic as CSR variant)
@@ -212,6 +223,7 @@ def fused_up_proj_gate_activation_sparse_triton_sortpack(
         up_weight.stride(0), up_weight.stride(1),
         max_rows,  # stride between blocks in row_idx / gate_vals
         output.stride(0), output.stride(1),
+        OUT_DTYPE=_TRITON_DTYPE_MAP[out_dtype],
     )
 
     return output.view(batch_size, seq_len, intermediate_size) 

@@ -3,8 +3,8 @@ import triton
 import triton.language as tl
 from typing import Optional
 import torch.nn.functional as F
-from triton_cast_kernel_gate_sortpack import fused_down_proj_sparse_triton_sortpack
-
+from .triton_cast_kernel_gate_sortpack import fused_down_proj_sparse_triton_sortpack
+from ..utils import _TRITON_DTYPE_MAP
 
 @triton.autotune(
     configs=[
@@ -23,6 +23,7 @@ def fused_down_proj_kernel(
     stride_mask_bs,
     stride_out_bs, stride_out_h,
     BLOCK_SIZE_BS: tl.constexpr, BLOCK_SIZE_I: tl.constexpr, BLOCK_SIZE_H: tl.constexpr,
+    OUT_DTYPE: tl.constexpr,
 ):
     """Dense down-projection kernel (matmul) with optional early exit when an entire
     intermediate vector is zero.  *row_mask_ptr* is a 1-D array containing 1 for
@@ -88,7 +89,7 @@ def fused_down_proj_kernel(
     # Write back
     # ------------------------------------------------------------------
     out_ptrs = out_ptr + offs_bs[:, None] * stride_out_bs + offs_h[None, :] * stride_out_h
-    tl.store(out_ptrs, acc, mask=mask_bs[:, None] & mask_h[None, :])
+    tl.store(out_ptrs, acc.to(OUT_DTYPE), mask=mask_bs[:, None] & mask_h[None, :])
 
 
 # ===============================================================
@@ -101,6 +102,7 @@ def fused_down_proj_triton(
     gate: torch.Tensor,
     num_blocks: int,
     line_size: int,
+    out_dtype: Optional[torch.dtype] = None,
 ):
     """Fused dense down-projection using Triton.
 
@@ -132,8 +134,15 @@ def fused_down_proj_triton(
     batch_seq_size = batch_size * seq_len
     x_reshaped = x.contiguous().view(batch_seq_size, intermediate_size)
 
-    # Allocate output (fp32)
-    output = torch.empty((batch_seq_size, hidden_size), device=x.device, dtype=torch.float32)
+    # Determine output dtype
+    if out_dtype is None:
+        out_dtype = torch.float32
+
+    if out_dtype not in _TRITON_DTYPE_MAP:
+        raise ValueError(f"Unsupported out_dtype {out_dtype}")
+
+    # Allocate output tensor
+    output = torch.empty((batch_seq_size, hidden_size), device=x.device, dtype=out_dtype)
 
     grid = lambda meta: (
         triton.cdiv(batch_seq_size, meta['BLOCK_SIZE_BS']) * triton.cdiv(hidden_size, meta['BLOCK_SIZE_H']),
@@ -151,6 +160,7 @@ def fused_down_proj_triton(
         down_weight.stride(0), down_weight.stride(1),
         row_mask.stride(0),
         output.stride(0), output.stride(1),
+        OUT_DTYPE=_TRITON_DTYPE_MAP[out_dtype],
     )
 
     return output.view(batch_size, seq_len, hidden_size)
@@ -168,15 +178,17 @@ def _make_sparse_gate(batch_size: int, seq_len: int, num_blocks: int, sparsity: 
 
 
 def debug_large_scale(use_sparse_gate: bool = False):
-    """Run numerical correctness checks on several shapes."""
+    """Run numerical correctness checks on several shapes with both fp16 and fp32 output dtypes."""
     configs = [
         (4, 8, 128, 4, 32),      # (B, S, H, NB, LS)
         (8, 16, 256, 8, 32),
         (32, 32, 512, 8, 64),
     ]
+    
+    dtypes_to_test = [torch.float16, torch.float32]
 
-    overall_max_diff_dense = 0.0
-    overall_max_diff_sortpack = 0.0
+    overall_max_diff_dense = {dtype: 0.0 for dtype in dtypes_to_test}
+    overall_max_diff_sortpack = {dtype: 0.0 for dtype in dtypes_to_test}
 
     for batch_size, seq_len, hidden_size, num_blocks, line_size in configs:
         intermediate_size = num_blocks * line_size
@@ -196,39 +208,48 @@ def debug_large_scale(use_sparse_gate: bool = False):
         # Reference PyTorch result (fp32)
         ref_fp32 = F.linear(x_fp16.float(), down_weight_fp16.t().float()).float()
 
-        # Triton dense helper
-        out_dense = fused_down_proj_triton(
-            x_fp16,
-            down_weight_fp16,
-            gate,
-            num_blocks,
-            line_size,
-        )
+        for out_dtype in dtypes_to_test:
+            print(f"  Testing dtype: {out_dtype}")
+            
+            # Triton dense helper
+            out_dense = fused_down_proj_triton(
+                x_fp16,
+                down_weight_fp16,
+                gate,
+                num_blocks,
+                line_size,
+                out_dtype=out_dtype,
+            )
 
-        # Triton SortPack sparse helper
-        out_sortpack = fused_down_proj_sparse_triton_sortpack(
-            x_fp16,
-            down_weight_fp16,
-            gate,
-            num_blocks,
-            line_size,
-        )
+            # Triton SortPack sparse helper
+            out_sortpack = fused_down_proj_sparse_triton_sortpack(
+                x_fp16,
+                down_weight_fp16,
+                gate,
+                num_blocks,
+                line_size,
+                out_dtype=out_dtype,
+            )
 
-        max_diff_dense = torch.max(torch.abs(ref_fp32 - out_dense)).item()
-        mean_diff_dense = torch.mean(torch.abs(ref_fp32 - out_dense)).item()
+            # Convert to fp32 for comparison if needed
+            out_dense_fp32 = out_dense.float() if out_dtype != torch.float32 else out_dense
+            out_sortpack_fp32 = out_sortpack.float() if out_dtype != torch.float32 else out_sortpack
 
-        max_diff_sort = torch.max(torch.abs(ref_fp32 - out_sortpack)).item()
-        mean_diff_sort = torch.mean(torch.abs(ref_fp32 - out_sortpack)).item()
+            max_diff_dense = torch.max(torch.abs(ref_fp32 - out_dense_fp32)).item()
+            mean_diff_dense = torch.mean(torch.abs(ref_fp32 - out_dense_fp32)).item()
 
-        overall_max_diff_dense = max(overall_max_diff_dense, max_diff_dense)
-        overall_max_diff_sortpack = max(overall_max_diff_sortpack, max_diff_sort)
+            max_diff_sort = torch.max(torch.abs(ref_fp32 - out_sortpack_fp32)).item()
+            mean_diff_sort = torch.mean(torch.abs(ref_fp32 - out_sortpack_fp32)).item()
 
-        print(f"Dense   → max diff {max_diff_dense:.6e} | mean diff {mean_diff_dense:.6e}")
-        print(f"SortPk  → max diff {max_diff_sort:.6e} | mean diff {mean_diff_sort:.6e}")
+            overall_max_diff_dense[out_dtype] = max(overall_max_diff_dense[out_dtype], max_diff_dense)
+            overall_max_diff_sortpack[out_dtype] = max(overall_max_diff_sortpack[out_dtype], max_diff_sort)
 
-    print(
-        f"\nOverall max diff across configs | Dense: {overall_max_diff_dense:.6e} | SortPk: {overall_max_diff_sortpack:.6e}"
-    )
+            print(f"    Dense   → max diff {max_diff_dense:.6e} | mean diff {mean_diff_dense:.6e}")
+            print(f"    SortPk  → max diff {max_diff_sort:.6e} | mean diff {mean_diff_sort:.6e}")
+
+    print("\nOverall max diff across configs:")
+    for dtype in dtypes_to_test:
+        print(f"  {dtype}: Dense: {overall_max_diff_dense[dtype]:.6e} | SortPk: {overall_max_diff_sortpack[dtype]:.6e}")
 
 
 if __name__ == "__main__":

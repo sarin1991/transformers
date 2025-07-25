@@ -3,6 +3,7 @@ import triton
 import triton.language as tl
 from typing import Optional
 import torch.nn.functional as F
+from ..utils import _TRITON_DTYPE_MAP
 from triton_cast_kernel import (
     fused_up_proj_gate_activation_sparse_triton_optimized as fused_up_proj_gate_activation_sparse_triton_opt,
 )
@@ -32,6 +33,7 @@ def fused_up_proj_gate_activation_kernel(
     stride_g_bs, stride_g_nb,
     stride_out_bs, stride_out_ls,
     BLOCK_SIZE_BS: tl.constexpr, BLOCK_SIZE_H: tl.constexpr, BLOCK_SIZE_LS: tl.constexpr,
+    OUT_DTYPE: tl.constexpr,
 ):
     """
     Fused kernel that performs:
@@ -85,7 +87,7 @@ def fused_up_proj_gate_activation_kernel(
         # Store zeros in output for this block
         out_ptrs = output_ptr + (offs_bs[:, None] * stride_out_bs + 
                                (pid_nb * line_size + offs_ls)[None, :] * stride_out_ls)
-        tl.store(out_ptrs, tl.zeros((BLOCK_SIZE_BS, BLOCK_SIZE_LS), dtype=tl.float32), 
+        tl.store(out_ptrs, tl.zeros((BLOCK_SIZE_BS, BLOCK_SIZE_LS), dtype=OUT_DTYPE), 
                 mask=(mask_bs[:, None] & mask_ls[None, :]))
         return
     
@@ -128,10 +130,10 @@ def fused_up_proj_gate_activation_kernel(
     # Store output
     out_ptrs = output_ptr + (offs_bs[:, None] * stride_out_bs + 
                            (pid_nb * line_size + offs_ls)[None, :] * stride_out_ls)
-    tl.store(out_ptrs, output, mask=(mask_bs[:, None] & mask_ls[None, :]))
+    tl.store(out_ptrs, output.to(OUT_DTYPE), mask=(mask_bs[:, None] & mask_ls[None, :]))
 
 
-def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks, line_size):
+def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks, line_size, out_dtype: Optional[torch.dtype] = None):
     """
     Fused Triton implementation that performs up projection and gate activation in one kernel.
     Args:
@@ -169,9 +171,16 @@ def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks
     x_reshaped = x.view(batch_seq_size, hidden_size)
     gate_reshaped = gate.view(batch_seq_size, num_blocks)
 
-    # Allocate output as 2D tensor (float32)
+    # Determine output dtype
+    if out_dtype is None:
+        out_dtype = torch.float32
+
+    if out_dtype not in _TRITON_DTYPE_MAP:
+        raise ValueError(f"Unsupported out_dtype {out_dtype}")
+
+    # Allocate output as 2D tensor
     output = torch.empty((batch_seq_size, num_blocks * line_size), 
-                        device=x.device, dtype=torch.float32)
+                        device=x.device, dtype=out_dtype)
 
     # Launch kernel with a grid derived from the chosen autotune config.
     grid = lambda meta: (
@@ -187,7 +196,7 @@ def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks
         up_weight.stride(0), up_weight.stride(1),
         gate_reshaped.stride(0), gate_reshaped.stride(1),
         output.stride(0), output.stride(1),
-        # BLOCK_SIZE_BS=block_size, BLOCK_SIZE_H=block_size, BLOCK_SIZE_LS=block_size, # Removed as Triton picks
+        OUT_DTYPE=_TRITON_DTYPE_MAP[out_dtype],
     )
 
     # Reshape back to original shape
@@ -206,6 +215,7 @@ def fused_up_proj_gate_activation_sparse_triton(
     gate: torch.Tensor,
     num_blocks: int,
     line_size: int,
+    out_dtype: Optional[torch.dtype] = None,
 ):
     """Optimized variant of *fused_up_proj_gate_activation_triton* for sparse ``gate`` tensors.
 
@@ -250,9 +260,16 @@ def fused_up_proj_gate_activation_sparse_triton(
     gate_mask = gate_reshaped != 0
     nnz = int(gate_mask.sum().item())
 
+    # Determine output dtype
+    if out_dtype is None:
+        out_dtype = torch.float32
+
+    if out_dtype not in _TRITON_DTYPE_MAP:
+        raise ValueError(f"Unsupported out_dtype {out_dtype}")
+
     if nnz == 0:
         # Everything is zero – return all-zeros tensor fast
-        return torch.zeros((batch_size, seq_len, intermediate_size), device=x.device, dtype=torch.float32)
+        return torch.zeros((batch_size, seq_len, intermediate_size), device=x.device, dtype=out_dtype)
 
 
     # ------------------------------------------------------------------
@@ -260,7 +277,7 @@ def fused_up_proj_gate_activation_sparse_triton(
     # ------------------------------------------------------------------
 
     # Pre-allocate full output (zero-initialised)
-    output = torch.zeros((batch_seq_size, intermediate_size), device=x.device, dtype=torch.float32)
+    output = torch.zeros((batch_seq_size, intermediate_size), device=x.device, dtype=out_dtype)
 
     # Indices of (row, block) pairs that have non-zero gate values
     active_pairs = gate_mask.nonzero(as_tuple=False)          # (N, 2)
@@ -291,7 +308,7 @@ def fused_up_proj_gate_activation_sparse_triton(
         K = x_subset.size(0)
 
         # Allocate per-block output buffer
-        out_subset = torch.empty((K, line_size), device=x.device, dtype=torch.float32)
+        out_subset = torch.empty((K, line_size), device=x.device, dtype=out_dtype)
 
         # Kernel grid – num_blocks = 1 for this invocation
         grid = lambda meta: (
@@ -312,6 +329,7 @@ def fused_up_proj_gate_activation_sparse_triton(
             w_slice.stride(0), w_slice.stride(1),
             gate_subset.stride(0), gate_subset.stride(1),
             out_subset.stride(0), out_subset.stride(1),
+            OUT_DTYPE=_TRITON_DTYPE_MAP[out_dtype],
         )
 
         # Scatter results back into the full output tensor

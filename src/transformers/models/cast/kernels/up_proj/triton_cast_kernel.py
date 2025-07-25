@@ -2,6 +2,7 @@ import torch
 import triton
 import triton.language as tl
 from typing import Optional
+from ..utils import _TRITON_DTYPE_MAP
 
 
 # =============================================================================
@@ -31,6 +32,7 @@ def fused_up_proj_gate_activation_kernel_optimized(
     stride_w_h,                 # w_slice stride(0)
     stride_out_bs, stride_out_ls,# output strides
     BLOCK_SIZE_BS: tl.constexpr, BLOCK_SIZE_H: tl.constexpr, BLOCK_SIZE_LS: tl.constexpr,
+    OUT_DTYPE: tl.constexpr,
 ):
     """Compute fused up-proj * gate for selected rows of **one** block.
 
@@ -103,7 +105,7 @@ def fused_up_proj_gate_activation_kernel_optimized(
     acc *= g_vals[:, None]
 
     # Store back to output – need global row index
-    tl.store(out_ptrs, acc, mask=mask_bs_valid[:, None] & mask_ls[None, :])
+    tl.store(out_ptrs, acc.to(OUT_DTYPE), mask=mask_bs_valid[:, None] & mask_ls[None, :])
 
 
 # =============================================================================
@@ -118,6 +120,7 @@ def fused_up_proj_gate_activation_sparse_triton_optimized(
     num_blocks: int,
     line_size: int,
     zero_init: bool = True,
+    out_dtype: Optional[torch.dtype] = None,
 ):
     """Sparse variant that offloads gather & scatter into the Triton kernel.
 
@@ -146,17 +149,24 @@ def fused_up_proj_gate_activation_sparse_triton_optimized(
     # Determine sparsity – fallback if too dense
     # ------------------------------------------------------------------
     gate_mask = gate_reshaped != 0
+    # Determine output dtype
+    if out_dtype is None:
+        out_dtype = torch.float32
+
+    if out_dtype not in _TRITON_DTYPE_MAP:
+        raise ValueError(f"Unsupported out_dtype {out_dtype}")
+
     nnz = int(gate_mask.sum().item())
     if nnz == 0:
-        return torch.zeros((batch_size, seq_len, intermediate_size), device=x.device, dtype=torch.float32)
+        return torch.zeros((batch_size, seq_len, intermediate_size), device=x.device, dtype=out_dtype)
 
     # ------------------------------------------------------------------
     # Sparse path using indexed kernel
     # ------------------------------------------------------------------
     if zero_init:
-        output = torch.zeros((batch_seq_size, intermediate_size), device=x.device, dtype=torch.float32)
+        output = torch.zeros((batch_seq_size, intermediate_size), device=x.device, dtype=out_dtype)
     else:
-        output = torch.empty((batch_seq_size, intermediate_size), device=x.device, dtype=torch.float32)
+        output = torch.empty((batch_seq_size, intermediate_size), device=x.device, dtype=out_dtype)
 
     rows, blocks = gate_mask.nonzero(as_tuple=True)
     # Iterate over blocks – still one call per block, but no gather/scatter
@@ -194,6 +204,7 @@ def fused_up_proj_gate_activation_sparse_triton_optimized(
             x_reshaped.stride(0), x_reshaped.stride(1),
             w_slice.stride(0),
             output.stride(0), output.stride(1),
+            OUT_DTYPE=_TRITON_DTYPE_MAP[out_dtype],
         )
 
     return output.view(batch_size, seq_len, intermediate_size) 
