@@ -39,6 +39,8 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
         # Random tensors
         x_fp16 = torch.randn(batch_size, seq_len, intermediate_size, device="cuda", dtype=torch.float16)
         weight_fp16 = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=torch.float16)
+        # Pre-compute transposed weight (fp16) – F.linear will return fp16, we cast to fp32 once.
+        weight_t_fp16 = weight_fp16.t().contiguous()
         gate_fp32 = torch.rand(batch_size, seq_len, num_blocks, device="cuda", dtype=torch.float32)
         # Introduce sparsity (90 % zeros) to emulate typical gating pattern
         mask_sparse = torch.rand_like(gate_fp32) < 0.9
@@ -48,16 +50,16 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
         row_mask = (gate_fp32.view(-1, num_blocks).abs().sum(dim=1) != 0).view(batch_size, seq_len, 1)
         x_fp16_masked = x_fp16 * row_mask.to(dtype=torch.float16)
 
-        # ---- PyTorch timing ----
+        # ---- PyTorch timing (half×half→half) ----
         for _ in range(5):
-            _ = F.linear(x_fp16_masked.float(), weight_fp16.t().float())
+            _ = F.linear(x_fp16_masked, weight_t_fp16)
         torch.cuda.synchronize()
 
         start_pt = torch.cuda.Event(enable_timing=True)
         end_pt = torch.cuda.Event(enable_timing=True)
         start_pt.record(torch.cuda.current_stream())
         for _ in range(num_iters):
-            _ = F.linear(x_fp16_masked.float(), weight_fp16.t().float())
+            _ = F.linear(x_fp16_masked, weight_t_fp16)
         end_pt.record(torch.cuda.current_stream())
         torch.cuda.synchronize()
         torch_ms = start_pt.elapsed_time(end_pt) / num_iters
