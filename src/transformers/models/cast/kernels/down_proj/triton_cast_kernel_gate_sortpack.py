@@ -44,6 +44,7 @@ import triton.language as tl
         ),
     ],
     key=["hidden_size", "line_size"],
+    reset_to_zero=['output_ptr'],
 )
 @triton.jit
 def fused_down_proj_sortpack_kernel(
@@ -58,6 +59,7 @@ def fused_down_proj_sortpack_kernel(
     stride_row_blk,
     stride_out_bs, stride_out_h,
     # meta
+    out_dtype: tl.constexpr,
     BLOCK_SIZE_BS: tl.constexpr, BLOCK_SIZE_LS: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr, GROUP_SIZE_R: tl.constexpr,
 ):
@@ -141,7 +143,7 @@ def fused_down_proj_sortpack_kernel(
     # Atomic add into output tensor
     # --------------------------------------------------------------
     out_ptrs = output_ptr + row_indices[:, None] * stride_out_bs + offs_h[None, :] * stride_out_h
-    tl.atomic_add(out_ptrs, acc, mask=row_active[:, None] & mask_h[None, :])
+    tl.atomic_add(out_ptrs, acc.to(out_dtype), mask=row_active[:, None] & mask_h[None, :])
 
 
 # =============================================================================
@@ -156,6 +158,7 @@ def fused_down_proj_sparse_triton_sortpack(
     num_blocks: int,
     line_size: int,
     GROUP_SIZE_R: int = 4,
+    out_dtype: torch.dtype = torch.float32,
 ):
     """Sort-pack sparse helper for Cast down-projection.
 
@@ -188,7 +191,7 @@ def fused_down_proj_sparse_triton_sortpack(
     max_rows = int(block_counts.max().item())
 
     if max_rows == 0:
-        return torch.zeros((batch_size, seq_len, hidden_size), device=x.device, dtype=torch.float32)
+        return torch.zeros((batch_size, seq_len, hidden_size), device=x.device, dtype=out_dtype)
 
     gate_vals_sorted, row_idx_sorted = torch.sort(gate_reshaped, dim=0, descending=True)
     gate_vals = gate_vals_sorted[:max_rows, :].t().contiguous()  # (NB, max_rows)
@@ -197,8 +200,8 @@ def fused_down_proj_sparse_triton_sortpack(
     gate_vals_flat = gate_vals.view(-1)
     row_idx_flat = row_idx.view(-1)
 
-    # Allocate output (fp32) – must start at zeros because kernel writes via atomic_add.
-    output = torch.zeros((batch_seq_size, hidden_size), device=x.device, dtype=torch.float32)
+    # Allocate output tensor – must start at zeros because kernel writes via atomic_add.
+    output = torch.zeros((batch_seq_size, hidden_size), device=x.device, dtype=out_dtype)
 
     # Grid helper
     def grid(meta):
@@ -224,6 +227,7 @@ def fused_down_proj_sparse_triton_sortpack(
         down_weight.stride(0), down_weight.stride(1),
         max_rows,
         output.stride(0), output.stride(1),
+        out_dtype=tl.float16 if out_dtype == torch.float16 else tl.float32,
     )
 
     return output.view(batch_size, seq_len, hidden_size) 

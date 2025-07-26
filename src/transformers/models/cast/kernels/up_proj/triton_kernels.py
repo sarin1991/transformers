@@ -31,6 +31,7 @@ def fused_up_proj_gate_activation_kernel(
     stride_w_h, stride_w_ls,
     stride_g_bs, stride_g_nb,
     stride_out_bs, stride_out_ls,
+    out_dtype: tl.constexpr,
     BLOCK_SIZE_BS: tl.constexpr, BLOCK_SIZE_H: tl.constexpr, BLOCK_SIZE_LS: tl.constexpr,
 ):
     """
@@ -85,7 +86,7 @@ def fused_up_proj_gate_activation_kernel(
         # Store zeros in output for this block
         out_ptrs = output_ptr + (offs_bs[:, None] * stride_out_bs + 
                                (pid_nb * line_size + offs_ls)[None, :] * stride_out_ls)
-        tl.store(out_ptrs, tl.zeros((BLOCK_SIZE_BS, BLOCK_SIZE_LS), dtype=tl.float32), 
+        tl.store(out_ptrs, tl.zeros((BLOCK_SIZE_BS, BLOCK_SIZE_LS), dtype=tl.out_dtype), 
                 mask=(mask_bs[:, None] & mask_ls[None, :]))
         return
     
@@ -128,10 +129,10 @@ def fused_up_proj_gate_activation_kernel(
     # Store output
     out_ptrs = output_ptr + (offs_bs[:, None] * stride_out_bs + 
                            (pid_nb * line_size + offs_ls)[None, :] * stride_out_ls)
-    tl.store(out_ptrs, output, mask=(mask_bs[:, None] & mask_ls[None, :]))
+    tl.store(out_ptrs, output.to(out_dtype), mask=(mask_bs[:, None] & mask_ls[None, :]))
 
 
-def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks, line_size):
+def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks, line_size, out_dtype: torch.dtype = torch.float32):
     """
     Fused Triton implementation that performs up projection and gate activation in one kernel.
     Args:
@@ -169,9 +170,9 @@ def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks
     x_reshaped = x.view(batch_seq_size, hidden_size)
     gate_reshaped = gate.view(batch_seq_size, num_blocks)
 
-    # Allocate output as 2D tensor (float32)
+    # Allocate output as 2D tensor with requested dtype
     output = torch.empty((batch_seq_size, num_blocks * line_size), 
-                        device=x.device, dtype=torch.float32)
+                        device=x.device, dtype=out_dtype)
 
     # Launch kernel with a grid derived from the chosen autotune config.
     grid = lambda meta: (
@@ -187,7 +188,7 @@ def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks
         up_weight.stride(0), up_weight.stride(1),
         gate_reshaped.stride(0), gate_reshaped.stride(1),
         output.stride(0), output.stride(1),
-        # BLOCK_SIZE_BS=block_size, BLOCK_SIZE_H=block_size, BLOCK_SIZE_LS=block_size, # Removed as Triton picks
+        out_dtype=tl.float16 if out_dtype == torch.float16 else tl.float32,
     )
 
     # Reshape back to original shape
