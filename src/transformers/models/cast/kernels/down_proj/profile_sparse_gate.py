@@ -47,7 +47,7 @@ def _generate_tensors(
 
 def _run_dense(x: torch.Tensor, w: torch.Tensor, gate: torch.Tensor, num_blocks: int, line_size: int):
     """Triton dense helper – mirrors up_proj naming (_run_dense)."""
-    fused_down_proj_triton(x, w, gate, num_blocks, line_size)
+    fused_down_proj_triton(x, w, gate, num_blocks, line_size, out_dtype=torch.float16)
 
 
 def _run_pytorch(x: torch.Tensor, w: torch.Tensor):
@@ -56,7 +56,7 @@ def _run_pytorch(x: torch.Tensor, w: torch.Tensor):
 
 # SortPack
 def _run_sortpack(x: torch.Tensor, w: torch.Tensor, gate: torch.Tensor, num_blocks: int, line_size: int):
-    fused_down_proj_sparse_triton_sortpack(x, w, gate, num_blocks, line_size)
+    fused_down_proj_sparse_triton_sortpack(x, w, gate, num_blocks, line_size, out_dtype=torch.float16)
 
 
 # -----------------------------------------------------------------------------

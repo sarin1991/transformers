@@ -66,7 +66,7 @@ def _run_dense(
     num_blocks: int,
     line_size: int,
 ):
-    fused_up_proj_gate_activation_triton(x, w, b, gate, num_blocks, line_size)
+    fused_up_proj_gate_activation_triton(x, w, b, gate, num_blocks, line_size, out_dtype=torch.float16)
 
 
 def _run_sparse(
@@ -84,6 +84,7 @@ def _run_sparse(
         gate,
         num_blocks,
         line_size,
+        out_dtype=torch.float16,
     )
 
 
@@ -105,6 +106,7 @@ def _run_opt(
         num_blocks,
         line_size,
         zero_init=zero_init,
+        out_dtype=torch.float16,
     )
 
 # CSR sparse helper
@@ -125,6 +127,7 @@ def _run_csr(
         num_blocks,
         line_size,
         zero_init=zero_init,
+        out_dtype=torch.float16,
     )
 
 # SortPack helper
@@ -145,6 +148,7 @@ def _run_sortpack(
         num_blocks,
         line_size,
         zero_init=zero_init,
+        out_dtype=torch.float16,
     )
 
 

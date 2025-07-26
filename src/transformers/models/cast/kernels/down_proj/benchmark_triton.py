@@ -75,6 +75,7 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                     gate_fp32,
                     num_blocks,
                     line_size,
+                    out_dtype=torch.float16,
                 )
             torch.cuda.synchronize()
 
@@ -88,6 +89,7 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                     gate_fp32,
                     num_blocks,
                     line_size,
+                    out_dtype=torch.float16,
                 )
             end_tri.record(torch.cuda.current_stream())
             torch.cuda.synchronize()
@@ -103,6 +105,7 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                     gate_fp32,
                     num_blocks,
                     line_size,
+                    out_dtype=torch.float16,
                 )
             torch.cuda.synchronize()
 
@@ -116,6 +119,7 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                     gate_fp32,
                     num_blocks,
                     line_size,
+                    out_dtype=torch.float16,
                 )
             end_sp.record(torch.cuda.current_stream())
             torch.cuda.synchronize()
