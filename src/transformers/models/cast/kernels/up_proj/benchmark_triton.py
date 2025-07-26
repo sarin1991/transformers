@@ -71,14 +71,30 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
         if run_all:
             # ---- Triton timing (autotuned) ----
             for _ in range(5):
-                _ = fused_up_proj_gate_activation_triton(x_fp16, up_weight_fp16.t(), up_bias_fp16, gate_fp32, num_blocks, line_size)
+                _ = fused_up_proj_gate_activation_triton(
+                    x_fp16,
+                    up_weight_fp16.t(),
+                    up_bias_fp16,
+                    gate_fp32,
+                    num_blocks,
+                    line_size,
+                    out_dtype=torch.float16,
+                )
             torch.cuda.synchronize()
 
             start_tri = torch.cuda.Event(enable_timing=True)
             end_tri   = torch.cuda.Event(enable_timing=True)
             start_tri.record(torch.cuda.current_stream())
             for _ in range(num_iters):
-                _ = fused_up_proj_gate_activation_triton(x_fp16, up_weight_fp16.t(), up_bias_fp16, gate_fp32, num_blocks, line_size)
+                _ = fused_up_proj_gate_activation_triton(
+                    x_fp16,
+                    up_weight_fp16.t(),
+                    up_bias_fp16,
+                    gate_fp32,
+                    num_blocks,
+                    line_size,
+                    out_dtype=torch.float16,
+                )
             end_tri.record(torch.cuda.current_stream())
             torch.cuda.synchronize()
             triton_ms = start_tri.elapsed_time(end_tri) / num_iters
@@ -100,6 +116,7 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                     gate_sparse,
                     num_blocks,
                     line_size,
+                    out_dtype=torch.float16,
                 )
             torch.cuda.synchronize()
 
@@ -114,6 +131,7 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                     gate_sparse,
                     num_blocks,
                     line_size,
+                    out_dtype=torch.float16,
                 )
             end_sp.record(torch.cuda.current_stream())
             torch.cuda.synchronize()
@@ -131,6 +149,7 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                     num_blocks,
                     line_size,
                     zero_init=False,
+                    out_dtype=torch.float16,
                 )
             torch.cuda.synchronize()
 
@@ -146,6 +165,7 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                     num_blocks,
                     line_size,
                     zero_init=False,
+                    out_dtype=torch.float16,
                 )
             end_opt.record(torch.cuda.current_stream())
             torch.cuda.synchronize()
@@ -163,6 +183,7 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                     num_blocks,
                     line_size,
                     zero_init=False,
+                    out_dtype=torch.float16,
                 )
             torch.cuda.synchronize()
 
@@ -178,6 +199,7 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                     num_blocks,
                     line_size,
                     zero_init=False,
+                    out_dtype=torch.float16,
                 )
             end_csr.record(torch.cuda.current_stream())
             torch.cuda.synchronize()
@@ -197,6 +219,7 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                 num_blocks,
                 line_size,
                 zero_init=False,
+                out_dtype=torch.float16,
             )
         torch.cuda.synchronize()
 
@@ -212,6 +235,7 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                 num_blocks,
                 line_size,
                 zero_init=False,
+                out_dtype=torch.float16,
             )
         end_sortpack.record(torch.cuda.current_stream())
         torch.cuda.synchronize()
