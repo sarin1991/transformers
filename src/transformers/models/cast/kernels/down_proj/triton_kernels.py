@@ -16,12 +16,12 @@ from triton_cast_kernel_gate_sortpack import fused_down_proj_sparse_triton_sortp
 )
 @triton.jit
 def fused_down_proj_kernel(
-    x_ptr, w_ptr, row_mask_ptr, out_ptr,
+    x_ptr, w_ptr, out_ptr,
     batch_seq_size, intermediate_size, hidden_size,
     stride_x_bs, stride_x_i,
     stride_w_i, stride_w_h,
-    stride_mask_bs,
     stride_out_bs, stride_out_h,
+    out_dtype: tl.constexpr,
     BLOCK_SIZE_BS: tl.constexpr, BLOCK_SIZE_I: tl.constexpr, BLOCK_SIZE_H: tl.constexpr,
 ):
     """Dense down-projection kernel (matmul) with optional early exit when an entire
@@ -51,15 +51,6 @@ def fused_down_proj_kernel(
     mask_h  = offs_h  < hidden_size
 
     # ------------------------------------------------------------------
-    # Row activity mask – if all selected rows are inactive, write zeros.
-    # ------------------------------------------------------------------
-    row_mask_vals = tl.load(row_mask_ptr + offs_bs * stride_mask_bs, mask=mask_bs, other=0.0)
-    if tl.sum(row_mask_vals) == 0:
-        out_ptrs = out_ptr + offs_bs[:, None] * stride_out_bs + offs_h[None, :] * stride_out_h
-        tl.store(out_ptrs, tl.zeros((BLOCK_SIZE_BS, BLOCK_SIZE_H), dtype=tl.float32), mask=mask_bs[:, None] & mask_h[None, :])
-        return
-
-    # ------------------------------------------------------------------
     # Accumulator initialisation (float32)
     # ------------------------------------------------------------------
     acc = tl.zeros((BLOCK_SIZE_BS, BLOCK_SIZE_H), dtype=tl.float32)
@@ -80,15 +71,12 @@ def fused_down_proj_kernel(
         acc += tl.dot(x_block, w_block)
 
     # ------------------------------------------------------------------
-    # Multiply by row mask to zero-out inactive rows (cheaper than branching per row).
-    # ------------------------------------------------------------------
-    acc *= row_mask_vals[:, None]
-
-    # ------------------------------------------------------------------
     # Write back
     # ------------------------------------------------------------------
     out_ptrs = out_ptr + offs_bs[:, None] * stride_out_bs + offs_h[None, :] * stride_out_h
-    tl.store(out_ptrs, acc, mask=mask_bs[:, None] & mask_h[None, :])
+
+    # Cast accumulator to the requested output dtype and store
+    tl.store(out_ptrs, acc.to(out_dtype), mask=mask_bs[:, None] & mask_h[None, :])
 
 
 # ===============================================================
@@ -101,6 +89,7 @@ def fused_down_proj_triton(
     gate: torch.Tensor,
     num_blocks: int,
     line_size: int,
+    out_dtype: torch.dtype = torch.float32,
 ):
     """Fused dense down-projection using Triton.
 
@@ -122,18 +111,16 @@ def fused_down_proj_triton(
     assert gate.shape == (batch_size, seq_len, num_blocks)
     assert x.dtype == torch.float16 and down_weight.dtype == torch.float16, "x and weight must be fp16"
 
-    # ------------------------------------------------------------------
-    # Build per-row activity mask: 1 if any gate > 0 else 0.
-    # ------------------------------------------------------------------
-    gate_reshaped = gate.contiguous().view(-1, num_blocks)
-    row_mask = (gate_reshaped.abs().sum(dim=1) != 0).float().contiguous()
+    # Validate output dtype
+    if out_dtype not in (torch.float32, torch.float16):
+        raise ValueError("out_dtype must be either torch.float32 (default) or torch.float16")
 
     # Flatten x to 2-D (B·S, I)
     batch_seq_size = batch_size * seq_len
     x_reshaped = x.contiguous().view(batch_seq_size, intermediate_size)
 
-    # Allocate output (fp32)
-    output = torch.empty((batch_seq_size, hidden_size), device=x.device, dtype=torch.float32)
+    # Allocate output with desired dtype
+    output = torch.empty((batch_seq_size, hidden_size), device=x.device, dtype=out_dtype)
 
     grid = lambda meta: (
         triton.cdiv(batch_seq_size, meta['BLOCK_SIZE_BS']) * triton.cdiv(hidden_size, meta['BLOCK_SIZE_H']),
@@ -142,15 +129,14 @@ def fused_down_proj_triton(
     fused_down_proj_kernel[grid](
         x_reshaped,
         down_weight,
-        row_mask,
         output,
         batch_seq_size,
         intermediate_size,
         hidden_size,
         x_reshaped.stride(0), x_reshaped.stride(1),
         down_weight.stride(0), down_weight.stride(1),
-        row_mask.stride(0),
         output.stride(0), output.stride(1),
+        out_dtype=tl.float16 if out_dtype == torch.float16 else tl.float32,
     )
 
     return output.view(batch_size, seq_len, hidden_size)

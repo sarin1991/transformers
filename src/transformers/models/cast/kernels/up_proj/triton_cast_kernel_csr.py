@@ -34,6 +34,7 @@ def fused_up_proj_gate_csr_kernel(
     stride_w_h, stride_w_i,      # w  (H major)
     stride_out_bs, stride_out_i, # output
     # Meta
+    out_dtype: tl.constexpr,
     BLOCK_SIZE_BS: tl.constexpr, BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_LS: tl.constexpr, GROUP_SIZE_R: tl.constexpr,
 ):
@@ -114,7 +115,7 @@ def fused_up_proj_gate_csr_kernel(
 
     # Store
     out_ptrs = output_ptr + row_indices[:, None] * stride_out_bs + global_cols[None, :] * stride_out_i
-    tl.store(out_ptrs, acc, mask=mask_bs[:, None] & mask_ls[None, :]) 
+    tl.atomic_add(out_ptrs, acc.to(out_dtype), mask=mask_bs[:, None] & mask_ls[None, :]) 
 
 # =============================================================================
 # Python helper – CSR sparse path
@@ -129,6 +130,7 @@ def fused_up_proj_gate_activation_sparse_triton_csr(
     line_size: int,
     GROUP_SIZE_R: int = 4,
     zero_init: bool = True,
+    out_dtype: torch.dtype = torch.float32,
 ):
     """Sparse helper using CSR buffers and single-axis grid launch."""
 
@@ -168,7 +170,7 @@ def fused_up_proj_gate_activation_sparse_triton_csr(
     N_total = block_start_offsets[-1]
     if N_total == 0:
         # all gates zero
-        return torch.zeros((batch_size, seq_len, intermediate_size), device=x.device, dtype=torch.float32)
+        return torch.zeros((batch_size, seq_len, intermediate_size), device=x.device, dtype=out_dtype)
 
     rows_index = torch.cat(rows_list).contiguous().to(torch.int32)
     gates_index = torch.cat(gates_list).contiguous().to(torch.float32)
@@ -176,9 +178,9 @@ def fused_up_proj_gate_activation_sparse_triton_csr(
 
     # Output buffer initialisation policy controlled by caller
     if zero_init:
-        output = torch.zeros((batch_seq_size, intermediate_size), device=x.device, dtype=torch.float32)
+        output = torch.zeros((batch_seq_size, intermediate_size), device=x.device, dtype=out_dtype)
     else:
-        output = torch.empty((batch_seq_size, intermediate_size), device=x.device, dtype=torch.float32)
+        output = torch.empty((batch_seq_size, intermediate_size), device=x.device, dtype=out_dtype)
 
     # Pre-compute maximum rows per block (CPU side)
     max_rows = 0
@@ -208,6 +210,7 @@ def fused_up_proj_gate_activation_sparse_triton_csr(
         x_reshaped.stride(0), x_reshaped.stride(1),
         up_weight.stride(0), up_weight.stride(1),
         output.stride(0), output.stride(1),
+        out_dtype=tl.float16 if out_dtype == torch.float16 else tl.float32,
     )
 
     return output.view(batch_size, seq_len, intermediate_size) 

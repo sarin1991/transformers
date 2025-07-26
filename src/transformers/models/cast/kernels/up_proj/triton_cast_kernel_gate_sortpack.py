@@ -32,6 +32,7 @@ def fused_up_proj_gate_sortpack_kernel(
     stride_row_blk,                    # max_rows – distance between consecutive blocks in row_idx / gate_vals
     stride_out_bs, stride_out_i,
     # meta-params
+    out_dtype: tl.constexpr,
     BLOCK_SIZE_BS: tl.constexpr, BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_LS: tl.constexpr, GROUP_SIZE_R: tl.constexpr,
 ):
@@ -115,7 +116,7 @@ def fused_up_proj_gate_sortpack_kernel(
     acc *= gate_vals[:, None]
 
     out_ptrs = output_ptr + row_indices[:, None] * stride_out_bs + global_cols[None, :] * stride_out_i
-    tl.store(out_ptrs, acc, mask=mask_bs[:, None] & mask_ls[None, :])
+    tl.store(out_ptrs, acc.to(out_dtype), mask=mask_bs[:, None] & mask_ls[None, :])
 
 
 # =============================================================================
@@ -131,6 +132,7 @@ def fused_up_proj_gate_activation_sparse_triton_sortpack(
     line_size: int,
     GROUP_SIZE_R: int = 4,
     zero_init: bool = True,
+    out_dtype: torch.dtype = torch.float32,
 ):
     """Sort-pack (ELLPACK) sparse fused MLP helper.
 
@@ -164,7 +166,7 @@ def fused_up_proj_gate_activation_sparse_triton_sortpack(
 
     # Early exit: gate is entirely zero
     if max_rows == 0:
-        return torch.zeros((batch_size, seq_len, intermediate_size), device=x.device, dtype=torch.float32)
+        return torch.zeros((batch_size, seq_len, intermediate_size), device=x.device, dtype=out_dtype)
 
     # Sort each column in descending order – positive values first.
     gate_vals_sorted, row_idx_sorted = torch.sort(gate_reshaped, dim=0, descending=True)
@@ -181,9 +183,9 @@ def fused_up_proj_gate_activation_sparse_triton_sortpack(
     # Allocate / zero-initialise output buffer
     # ------------------------------------------------------------------
     if zero_init:
-        output = torch.zeros((batch_seq_size, intermediate_size), device=x.device, dtype=torch.float32)
+        output = torch.zeros((batch_seq_size, intermediate_size), device=x.device, dtype=out_dtype)
     else:
-        output = torch.empty((batch_seq_size, intermediate_size), device=x.device, dtype=torch.float32)
+        output = torch.empty((batch_seq_size, intermediate_size), device=x.device, dtype=out_dtype)
 
     # ------------------------------------------------------------------
     # Grid size helper (same logic as CSR variant)
@@ -212,6 +214,7 @@ def fused_up_proj_gate_activation_sparse_triton_sortpack(
         up_weight.stride(0), up_weight.stride(1),
         max_rows,  # stride between blocks in row_idx / gate_vals
         output.stride(0), output.stride(1),
+        out_dtype=tl.float16 if out_dtype == torch.float16 else tl.float32,
     )
 
     return output.view(batch_size, seq_len, intermediate_size) 
