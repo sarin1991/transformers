@@ -42,6 +42,46 @@ import triton.language as tl
             num_warps=8,
             num_stages=2,
         ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_BS": 32,
+                "BLOCK_SIZE_LS": 128,
+                "BLOCK_SIZE_H": 64,
+                "GROUP_SIZE_R": 4,
+            },
+            num_warps=8,
+            num_stages=2,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_BS": 64,
+                "BLOCK_SIZE_LS": 128,
+                "BLOCK_SIZE_H": 64,
+                "GROUP_SIZE_R": 4,
+            },
+            num_warps=8,
+            num_stages=2,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_BS": 32,
+                "BLOCK_SIZE_LS": 256,
+                "BLOCK_SIZE_H": 64,
+                "GROUP_SIZE_R": 4,
+            },
+            num_warps=8,
+            num_stages=3,
+        ),
+        triton.Config(
+            {
+                "BLOCK_SIZE_BS": 64,
+                "BLOCK_SIZE_LS": 256,
+                "BLOCK_SIZE_H": 64,
+                "GROUP_SIZE_R": 4,
+            },
+            num_warps=16,
+            num_stages=3,
+        ),
     ],
     key=["hidden_size", "line_size"],
     reset_to_zero=['output_ptr'],

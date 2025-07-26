@@ -5,12 +5,22 @@ from typing import Optional
 import torch.nn.functional as F
 from triton_cast_kernel_gate_sortpack import fused_down_proj_sparse_triton_sortpack
 
-
 @triton.autotune(
     configs=[
         triton.Config({'BLOCK_SIZE_BS': 16, 'BLOCK_SIZE_I': 16, 'BLOCK_SIZE_H': 16}, num_warps=4),
         triton.Config({'BLOCK_SIZE_BS': 32, 'BLOCK_SIZE_I': 32, 'BLOCK_SIZE_H': 32}, num_warps=8),
         triton.Config({'BLOCK_SIZE_BS': 64, 'BLOCK_SIZE_I': 64, 'BLOCK_SIZE_H': 64}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE_BS': 32,  'BLOCK_SIZE_I': 128, 'BLOCK_SIZE_H': 64},  num_warps=8,  num_stages=2),
+        triton.Config({'BLOCK_SIZE_BS': 64,  'BLOCK_SIZE_I': 128, 'BLOCK_SIZE_H': 64},  num_warps=8,  num_stages=2),
+        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_I': 128, 'BLOCK_SIZE_H': 64},  num_warps=16, num_stages=3),
+        triton.Config({'BLOCK_SIZE_BS': 32,  'BLOCK_SIZE_I': 256, 'BLOCK_SIZE_H': 64},  num_warps=8,  num_stages=2),
+        triton.Config({'BLOCK_SIZE_BS': 64,  'BLOCK_SIZE_I': 256, 'BLOCK_SIZE_H': 64},  num_warps=8,  num_stages=2),
+        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_I': 256, 'BLOCK_SIZE_H': 64},  num_warps=16, num_stages=3),
+        triton.Config({'BLOCK_SIZE_BS': 64,  'BLOCK_SIZE_I': 256, 'BLOCK_SIZE_H': 128}, num_warps=16, num_stages=3),
+        # Very large K-tile (512) for extreme dense cases
+        triton.Config({'BLOCK_SIZE_BS': 32,  'BLOCK_SIZE_I': 512, 'BLOCK_SIZE_H': 64},  num_warps=8,  num_stages=2),
+        triton.Config({'BLOCK_SIZE_BS': 64,  'BLOCK_SIZE_I': 512, 'BLOCK_SIZE_H': 64},  num_warps=8,  num_stages=3),
+        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_I': 512, 'BLOCK_SIZE_H': 64},  num_warps=16, num_stages=4),
     ],
     key=['batch_seq_size', 'intermediate_size', 'hidden_size'],
 )
