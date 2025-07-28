@@ -11,78 +11,34 @@ import triton.language as tl
 #     writes results via tl.atomic_add to merge contributions of multiple blocks.
 # =============================================================================
 
+# -----------------------------------------------------------------------------
+# Dynamically build Triton autotune configurations
+#   – Two tile sizes: 64 and 128
+#   – Try several warp counts (4, 8, 16, 32) for each size
+#   – Try several num_stages (1, 2, 3) for each size
+# -----------------------------------------------------------------------------
+_CONFIG_WARPS = (4, 8, 16, 32)
+_TILE_SIZES   = (64, 128)
+_NUM_STAGES = (1, 2, 3)
 
+CONFIGS = []
+for tile in _TILE_SIZES:
+    for warps in _CONFIG_WARPS:
+        for num_stages in _NUM_STAGES:
+            CONFIGS.append(
+                triton.Config(
+                    {
+                        'BLOCK_SIZE_BS': tile,
+                        'BLOCK_SIZE_LS':  tile,
+                        'BLOCK_SIZE_H':  tile,
+                        'GROUP_SIZE_R': 16,
+                    },
+                    num_warps=warps,
+                    num_stages=num_stages,
+                )
+            )
 @triton.autotune(
-    configs=[
-        triton.Config(
-            {
-                "BLOCK_SIZE_BS": 16,
-                "BLOCK_SIZE_LS": 16,
-                "BLOCK_SIZE_H": 16,
-                "GROUP_SIZE_R": 4,
-            },
-            num_warps=4,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_BS": 32,
-                "BLOCK_SIZE_LS": 32,
-                "BLOCK_SIZE_H": 32,
-                "GROUP_SIZE_R": 4,
-            },
-            num_warps=8,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_BS": 64,
-                "BLOCK_SIZE_LS": 64,
-                "BLOCK_SIZE_H": 64,
-                "GROUP_SIZE_R": 4,
-            },
-            num_warps=8,
-            num_stages=2,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_BS": 32,
-                "BLOCK_SIZE_LS": 128,
-                "BLOCK_SIZE_H": 64,
-                "GROUP_SIZE_R": 4,
-            },
-            num_warps=8,
-            num_stages=2,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_BS": 64,
-                "BLOCK_SIZE_LS": 128,
-                "BLOCK_SIZE_H": 64,
-                "GROUP_SIZE_R": 4,
-            },
-            num_warps=8,
-            num_stages=2,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_BS": 32,
-                "BLOCK_SIZE_LS": 256,
-                "BLOCK_SIZE_H": 64,
-                "GROUP_SIZE_R": 4,
-            },
-            num_warps=8,
-            num_stages=3,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_BS": 64,
-                "BLOCK_SIZE_LS": 256,
-                "BLOCK_SIZE_H": 64,
-                "GROUP_SIZE_R": 4,
-            },
-            num_warps=16,
-            num_stages=3,
-        ),
-    ],
+    configs=CONFIGS,
     key=["hidden_size", "line_size"],
     reset_to_zero=['output_ptr'],
 )
@@ -247,10 +203,13 @@ def fused_down_proj_sparse_triton_sortpack(
     def grid(meta):
         BLK_BS = meta["BLOCK_SIZE_BS"]
         BLK_H = meta["BLOCK_SIZE_H"]
+        G_SIZE_R = meta["GROUP_SIZE_R"]
+
         C = triton.cdiv(hidden_size, BLK_H)
         row_chunks = triton.cdiv(max_rows, BLK_BS)
-        row_groups = triton.cdiv(row_chunks, GROUP_SIZE_R)
-        num_pid_per_block = C * GROUP_SIZE_R * row_groups
+        row_groups = triton.cdiv(row_chunks, G_SIZE_R)
+        num_pid_per_block = C * G_SIZE_R * row_groups
+
         return (num_pid_per_block * num_blocks,)
 
     fused_down_proj_sortpack_kernel[grid](

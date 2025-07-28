@@ -5,23 +5,36 @@ from typing import Optional
 import torch.nn.functional as F
 from triton_cast_kernel_gate_sortpack import fused_down_proj_sparse_triton_sortpack
 
+# -----------------------------------------------------------------------------
+# Dynamically build Triton autotune configurations
+#   – Two tile sizes: 64 and 128
+#   – Try several warp counts (4, 8, 16, 32) for each size
+#   – Try several num_stages (1, 2, 3) for each size
+# -----------------------------------------------------------------------------
+_CONFIG_WARPS = (4, 8, 16, 32)
+_TILE_SIZES   = (64, 128)
+_NUM_STAGES = (1, 2, 3)
+
+CONFIGS = []
+for tile in _TILE_SIZES:
+    for warps in _CONFIG_WARPS:
+        for num_stages in _NUM_STAGES:
+            CONFIGS.append(
+                triton.Config(
+                    {
+                        'BLOCK_SIZE_BS': tile,
+                        'BLOCK_SIZE_I':  tile,
+                        'BLOCK_SIZE_H':  tile,
+                        'GROUP_SIZE_BS': 16,
+                    },
+                    num_warps=warps,
+                    num_stages=num_stages,
+                )
+            )
+
+
 @triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_SIZE_BS': 16, 'BLOCK_SIZE_I': 16, 'BLOCK_SIZE_H': 16}, num_warps=4),
-        triton.Config({'BLOCK_SIZE_BS': 32, 'BLOCK_SIZE_I': 32, 'BLOCK_SIZE_H': 32}, num_warps=8),
-        triton.Config({'BLOCK_SIZE_BS': 64, 'BLOCK_SIZE_I': 64, 'BLOCK_SIZE_H': 64}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_SIZE_BS': 32,  'BLOCK_SIZE_I': 128, 'BLOCK_SIZE_H': 64},  num_warps=8,  num_stages=2),
-        triton.Config({'BLOCK_SIZE_BS': 64,  'BLOCK_SIZE_I': 128, 'BLOCK_SIZE_H': 64},  num_warps=8,  num_stages=2),
-        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_I': 128, 'BLOCK_SIZE_H': 64},  num_warps=16, num_stages=3),
-        triton.Config({'BLOCK_SIZE_BS': 32,  'BLOCK_SIZE_I': 256, 'BLOCK_SIZE_H': 64},  num_warps=8,  num_stages=2),
-        triton.Config({'BLOCK_SIZE_BS': 64,  'BLOCK_SIZE_I': 256, 'BLOCK_SIZE_H': 64},  num_warps=8,  num_stages=2),
-        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_I': 256, 'BLOCK_SIZE_H': 64},  num_warps=16, num_stages=3),
-        triton.Config({'BLOCK_SIZE_BS': 64,  'BLOCK_SIZE_I': 256, 'BLOCK_SIZE_H': 128}, num_warps=16, num_stages=3),
-        # Very large K-tile (512) for extreme dense cases
-        triton.Config({'BLOCK_SIZE_BS': 32,  'BLOCK_SIZE_I': 512, 'BLOCK_SIZE_H': 64},  num_warps=8,  num_stages=2),
-        triton.Config({'BLOCK_SIZE_BS': 64,  'BLOCK_SIZE_I': 512, 'BLOCK_SIZE_H': 64},  num_warps=8,  num_stages=3),
-        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_I': 512, 'BLOCK_SIZE_H': 64},  num_warps=16, num_stages=4),
-    ],
+    configs=CONFIGS,
     key=['batch_seq_size', 'intermediate_size', 'hidden_size'],
 )
 @triton.jit
@@ -32,7 +45,7 @@ def fused_down_proj_kernel(
     stride_w_i, stride_w_h,
     stride_out_bs, stride_out_h,
     out_dtype: tl.constexpr,
-    BLOCK_SIZE_BS: tl.constexpr, BLOCK_SIZE_I: tl.constexpr, BLOCK_SIZE_H: tl.constexpr,
+    BLOCK_SIZE_BS: tl.constexpr, BLOCK_SIZE_I: tl.constexpr, BLOCK_SIZE_H: tl.constexpr, GROUP_SIZE_BS: tl.constexpr,
 ):
     """Dense down-projection kernel (matmul) with optional early exit when an entire
     intermediate vector is zero.  *row_mask_ptr* is a 1-D array containing 1 for
@@ -44,17 +57,22 @@ def fused_down_proj_kernel(
 
     pid = tl.program_id(0)
 
-    num_pid_bs = (batch_seq_size + BLOCK_SIZE_BS - 1) // BLOCK_SIZE_BS
-    num_pid_h  = (hidden_size     + BLOCK_SIZE_H  - 1) // BLOCK_SIZE_H
+    # --------------------------------------------------------------
+    # Decompose pid into (row_chunk, hidden_chunk) with row grouping
+    # --------------------------------------------------------------
+    num_col_chunks = (hidden_size + BLOCK_SIZE_H - 1) // BLOCK_SIZE_H  # hidden chunks
+    row_chunks = (batch_seq_size + BLOCK_SIZE_BS - 1) // BLOCK_SIZE_BS
 
-    pid_h  = pid % num_pid_h
-    pid_bs = pid // num_pid_h
+    col_chunk = pid % num_col_chunks  # hidden chunk index
+    row_in_group = (pid // num_col_chunks) % GROUP_SIZE_BS
+    row_group = (pid // (num_col_chunks * GROUP_SIZE_BS))
+    row_chunk = row_group * GROUP_SIZE_BS + row_in_group
 
-    if pid_bs >= num_pid_bs:
+    if row_chunk >= row_chunks:
         return
 
-    offs_bs = pid_bs * BLOCK_SIZE_BS + tl.arange(0, BLOCK_SIZE_BS)
-    offs_h  = pid_h  * BLOCK_SIZE_H  + tl.arange(0, BLOCK_SIZE_H)
+    offs_bs = row_chunk * BLOCK_SIZE_BS + tl.arange(0, BLOCK_SIZE_BS)
+    offs_h  = col_chunk * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)
     offs_i  = tl.arange(0, BLOCK_SIZE_I)
 
     mask_bs = offs_bs < batch_seq_size
@@ -132,9 +150,14 @@ def fused_down_proj_triton(
     # Allocate output with desired dtype
     output = torch.empty((batch_seq_size, hidden_size), device=x.device, dtype=out_dtype)
 
-    grid = lambda meta: (
-        triton.cdiv(batch_seq_size, meta['BLOCK_SIZE_BS']) * triton.cdiv(hidden_size, meta['BLOCK_SIZE_H']),
-    )
+    def grid(meta):
+        BLK_BS = meta['BLOCK_SIZE_BS']
+        BLK_H = meta['BLOCK_SIZE_H']
+        GROUP_SIZE_BS = meta['GROUP_SIZE_BS']
+        num_col_chunks = triton.cdiv(hidden_size, BLK_H)
+        row_chunks = triton.cdiv(batch_seq_size, BLK_BS)
+        row_groups = triton.cdiv(row_chunks, GROUP_SIZE_BS)
+        return (num_col_chunks * GROUP_SIZE_BS * row_groups,)
 
     fused_down_proj_kernel[grid](
         x_reshaped,
