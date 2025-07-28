@@ -140,9 +140,11 @@ def fused_up_proj_gate_activation_sparse_triton_csr(
     # Validate
     assert up_weight.shape == (hidden_size, intermediate_size)
     assert gate.shape == (batch_size, seq_len, num_blocks)
-    assert x.dtype == torch.float16
-    assert up_weight.dtype == torch.float16
-    assert up_bias.dtype == torch.float16
+
+    supported_dtypes = (torch.float16, torch.bfloat16)
+    assert x.dtype in supported_dtypes, "x must be fp16 or bf16"
+    assert up_weight.dtype in supported_dtypes, "up_weight must be fp16 or bf16"
+    assert up_bias.dtype in supported_dtypes, "up_bias must be fp16 or bf16"
 
     if gate.dtype != torch.float32:
         gate = gate.float()

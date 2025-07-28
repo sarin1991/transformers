@@ -122,8 +122,8 @@ def fused_down_proj_triton(
     """Fused dense down-projection using Triton.
 
     Args:
-        x:            (batch, seq_len, intermediate_size) – *float16*
-        down_weight:  (intermediate_size, hidden_size)    – *float16* (note: pass ``model.down_proj.weight.t()``)
+        x:            (batch, seq_len, intermediate_size) – *float16* or *bfloat16*
+        down_weight:  (intermediate_size, hidden_size)    – *float16*/*bfloat16*  (pass ``model.down_proj.weight.t()``)
         gate:         (batch, seq_len, num_blocks)        – *float32* (or any type, will be upcast)
         num_blocks:   ``NB``
         line_size:    ``LS`` (``intermediate_size = NB·LS``)
@@ -134,10 +134,17 @@ def fused_down_proj_triton(
     batch_size, seq_len, intermediate_size = x.shape
     hidden_size = down_weight.shape[1]
 
+    # --------------------------------------------------------------
+    # Shape & dtype validations
+    # --------------------------------------------------------------
     assert intermediate_size == num_blocks * line_size, "Mismatch intermediate size"
     assert down_weight.shape == (intermediate_size, hidden_size)
     assert gate.shape == (batch_size, seq_len, num_blocks)
-    assert x.dtype == torch.float16 and down_weight.dtype == torch.float16, "x and weight must be fp16"
+
+    supported_dtypes = (torch.float16, torch.bfloat16)
+    assert (
+        x.dtype in supported_dtypes and down_weight.dtype in supported_dtypes
+    ), "x and weight must be fp16 or bf16"
 
     # Validate output dtype
     if out_dtype not in (torch.float32, torch.float16):

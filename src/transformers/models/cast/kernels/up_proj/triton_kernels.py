@@ -136,9 +136,9 @@ def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks
     """
     Fused Triton implementation that performs up projection and gate activation in one kernel.
     Args:
-        x: Input tensor of shape (batch_size, seq_len, hidden_size) - must be float16
-        up_weight: Up projection weight of shape (hidden_size, intermediate_size) - must be float16
-        up_bias: Up projection bias of shape (intermediate_size,) - must be float16
+        x: Input tensor of shape (batch_size, seq_len, hidden_size) – *float16* or *bfloat16*
+        up_weight: Up projection weight of shape (hidden_size, intermediate_size) – *float16*/*bfloat16*
+        up_bias: Up projection bias of shape (intermediate_size,) – *float16*/*bfloat16*
         gate: Pre-calculated gate tensor of shape (batch_size, seq_len, num_blocks) - must be float32
         num_blocks: Number of blocks
         line_size: Size of each line within a block
@@ -150,10 +150,11 @@ def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks
     assert up_weight.shape == (hidden_size, intermediate_size), "Incompatible up_weight shape"
     assert gate.shape == (batch_size, seq_len, num_blocks), "Incompatible gate shape"
     
-    # Check that inputs are correct dtypes
-    assert x.dtype == torch.float16, f"Input x must be float16, got {x.dtype}"
-    assert up_weight.dtype == torch.float16, f"up_weight must be float16, got {up_weight.dtype}"
-    assert up_bias.dtype == torch.float16, f"up_bias must be float16, got {up_bias.dtype}"
+    # Check that inputs are correct dtypes (fp16 or bf16)
+    supported_dtypes = (torch.float16, torch.bfloat16)
+    assert x.dtype in supported_dtypes, f"Input x must be fp16/bf16, got {x.dtype}"
+    assert up_weight.dtype in supported_dtypes, f"up_weight must be fp16/bf16, got {up_weight.dtype}"
+    assert up_bias.dtype in supported_dtypes, f"up_bias must be fp16/bf16, got {up_bias.dtype}"
     
     # Optionally upcast gate to float32 if not already
     if gate.dtype != torch.float32:
@@ -216,9 +217,9 @@ def fused_up_proj_gate_activation_sparse_triton(
     falls back to the original dense implementation.
 
     Args:
-        x:              ``(batch, seq_len, hidden_size)``, *float16*
-        up_weight:      ``(hidden_size, intermediate_size)``, *float16*
-        up_bias:        ``(intermediate_size,)``, *float16*
+        x:              ``(batch, seq_len, hidden_size)``, *float16*/*bfloat16*
+        up_weight:      ``(hidden_size, intermediate_size)``, *float16*/*bfloat16*
+        up_bias:        ``(intermediate_size,)``, *float16*/*bfloat16*
         gate:           ``(batch, seq_len, num_blocks)``, *float32* or *float16/bf16*
         num_blocks:     number of blocks in the gated FFN
         line_size:      size of each block line (``intermediate_size = num_blocks * line_size``)
@@ -233,9 +234,10 @@ def fused_up_proj_gate_activation_sparse_triton(
     # Ensure the same validations as in the dense path
     assert up_weight.shape == (hidden_size, intermediate_size), "Incompatible up_weight shape"
     assert gate.shape == (batch_size, seq_len, num_blocks), "Incompatible gate shape"
-    assert x.dtype == torch.float16, f"Input x must be float16, got {x.dtype}"
-    assert up_weight.dtype == torch.float16, f"up_weight must be float16, got {up_weight.dtype}"
-    assert up_bias.dtype == torch.float16, f"up_bias must be float16, got {up_bias.dtype}"
+    supported_dtypes = (torch.float16, torch.bfloat16)
+    assert x.dtype in supported_dtypes, f"Input x must be fp16/bf16, got {x.dtype}"
+    assert up_weight.dtype in supported_dtypes, f"up_weight must be fp16/bf16, got {up_weight.dtype}"
+    assert up_bias.dtype in supported_dtypes, f"up_bias must be fp16/bf16, got {up_bias.dtype}"
 
     if gate.dtype != torch.float32:
         gate = gate.float()
