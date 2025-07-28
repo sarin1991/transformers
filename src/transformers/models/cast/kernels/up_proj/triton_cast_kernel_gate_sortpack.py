@@ -146,7 +146,11 @@ def fused_up_proj_gate_activation_sparse_triton_sortpack(
     # Shape / dtype validation (same as the original helpers)
     assert up_weight.shape == (hidden_size, intermediate_size)
     assert gate.shape == (batch_size, seq_len, num_blocks)
-    assert x.dtype == torch.float16 and up_weight.dtype == torch.float16 and up_bias.dtype == torch.float16
+
+    supported_dtypes = (torch.float16, torch.bfloat16)
+    assert (
+        x.dtype in supported_dtypes and up_weight.dtype in supported_dtypes and up_bias.dtype in supported_dtypes
+    ), "x, up_weight, up_bias must be fp16 or bf16"
 
     # Promote gate to fp32 for better precision in sorting / multiplication
     if gate.dtype != torch.float32:

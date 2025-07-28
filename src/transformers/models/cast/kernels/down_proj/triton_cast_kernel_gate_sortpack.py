@@ -159,9 +159,9 @@ def fused_down_proj_sparse_triton_sortpack(
     """Sort-pack sparse helper for Cast down-projection.
 
     Args:
-        x:           (B, S, I)        – fp16, I = NB·LS
-        down_weight: (I, H)           – fp16 (pass Linear.weight)
-        gate:        (B, S, NB)       – fp32 gate tensor (values > 0 indicate active)
+        x:           (B, S, I)        – *float16* or *bfloat16*, with I = NB·LS
+        down_weight: (I, H)           – *float16*/*bfloat16* (pass Linear.weight)
+        gate:        (B, S, NB)       – *float32* gate tensor (non-zero → active)
         num_blocks:  NB
         line_size:   LS
     """
@@ -171,7 +171,11 @@ def fused_down_proj_sparse_triton_sortpack(
 
     assert intermediate_size == num_blocks * line_size
     assert gate.shape == (batch_size, seq_len, num_blocks)
-    assert x.dtype == torch.float16 and down_weight.dtype == torch.float16
+
+    supported_dtypes = (torch.float16, torch.bfloat16)
+    assert (
+        x.dtype in supported_dtypes and down_weight.dtype in supported_dtypes
+    ), "x and weight must be fp16 or bf16"
 
     if gate.dtype != torch.float32:
         gate = gate.float()
