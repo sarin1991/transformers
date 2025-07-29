@@ -208,6 +208,7 @@ def fused_up_proj_gate_activation_sparse_triton(
     gate: torch.Tensor,
     num_blocks: int,
     line_size: int,
+    out_dtype: torch.dtype = torch.float32,
 ):
     """Optimized variant of *fused_up_proj_gate_activation_triton* for sparse ``gate`` tensors.
 
@@ -239,6 +240,9 @@ def fused_up_proj_gate_activation_sparse_triton(
     assert up_weight.dtype in supported_dtypes, f"up_weight must be fp16/bf16, got {up_weight.dtype}"
     assert up_bias.dtype in supported_dtypes, f"up_bias must be fp16/bf16, got {up_bias.dtype}"
 
+    if out_dtype not in (torch.float32, torch.float16):
+        raise ValueError("out_dtype must be either torch.float32 (default) or torch.float16")
+
     if gate.dtype != torch.float32:
         gate = gate.float()
 
@@ -255,7 +259,7 @@ def fused_up_proj_gate_activation_sparse_triton(
 
     if nnz == 0:
         # Everything is zero – return all-zeros tensor fast
-        return torch.zeros((batch_size, seq_len, intermediate_size), device=x.device, dtype=torch.float32)
+        return torch.zeros((batch_size, seq_len, intermediate_size), device=x.device, dtype=out_dtype)
 
 
     # ------------------------------------------------------------------
@@ -263,7 +267,7 @@ def fused_up_proj_gate_activation_sparse_triton(
     # ------------------------------------------------------------------
 
     # Pre-allocate full output (zero-initialised)
-    output = torch.zeros((batch_seq_size, intermediate_size), device=x.device, dtype=torch.float32)
+    output = torch.zeros((batch_seq_size, intermediate_size), device=x.device, dtype=out_dtype)
 
     # Indices of (row, block) pairs that have non-zero gate values
     active_pairs = gate_mask.nonzero(as_tuple=False)          # (N, 2)
@@ -294,7 +298,7 @@ def fused_up_proj_gate_activation_sparse_triton(
         K = x_subset.size(0)
 
         # Allocate per-block output buffer
-        out_subset = torch.empty((K, line_size), device=x.device, dtype=torch.float32)
+        out_subset = torch.empty((K, line_size), device=x.device, dtype=out_dtype)
 
         # Kernel grid – num_blocks = 1 for this invocation
         grid = lambda meta: (
@@ -315,6 +319,7 @@ def fused_up_proj_gate_activation_sparse_triton(
             w_slice.stride(0), w_slice.stride(1),
             gate_subset.stride(0), gate_subset.stride(1),
             out_subset.stride(0), out_subset.stride(1),
+            out_dtype=tl.float16 if out_dtype == torch.float16 else tl.float32,
         )
 
         # Scatter results back into the full output tensor
