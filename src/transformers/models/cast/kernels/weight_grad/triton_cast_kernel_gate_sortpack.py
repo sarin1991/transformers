@@ -34,7 +34,6 @@ for tile in _TILE_SIZES:
 @triton.autotune(
     configs=CONFIGS,
     key=["hidden_size", "line_size"],
-    reset_to_zero=["output_ptr"],
 )
 @triton.jit
 def fused_weight_grad_sortpack_kernel(
@@ -120,13 +119,13 @@ def fused_weight_grad_sortpack_kernel(
                           mask=mask_rows, other=0)
 
         # Load slice from intermediate → shape (BS, LS)
-        inter_ptrs = (
+        inter_ptrs_t = (
             inter_ptr
-            + row_idx[:, None] * stride_inter_bs
-            + global_cols[None, :] * stride_inter_ls
+            + row_idx[None, :] * stride_inter_bs
+            + global_cols[:, None] * stride_inter_ls
         )
-        inter_blk = tl.load(inter_ptrs,
-                            mask=mask_rows[:, None] & mask_ls[None, :],
+        inter_blk_t = tl.load(inter_ptrs_t,
+                            mask=mask_rows[None, :] & mask_ls[:, None],
                             other=0.0)
 
         # Load slice from other → shape (BS, H)
@@ -139,7 +138,7 @@ def fused_weight_grad_sortpack_kernel(
                             mask=mask_rows[:, None] & mask_h[None, :],
                             other=0.0)
 
-        acc += tl.dot(tl.trans(inter_blk), other_blk)
+        acc += tl.dot(inter_blk_t, other_blk)
 
     # ------------------------------------------------------------------
     # Write back (no atomics required)
@@ -209,7 +208,7 @@ def fused_weight_grad_sparse_triton_sortpack(
     row_idx_flat = row_idx.view(-1)
 
     # Output tensor
-    output = torch.zeros((I, hidden_size), device=intermediate.device, dtype=out_dtype)
+    output = torch.empty((I, hidden_size), device=intermediate.device, dtype=out_dtype)
 
     # Strides
     stride_inter_bs, stride_inter_ls = inter_flat.stride()
