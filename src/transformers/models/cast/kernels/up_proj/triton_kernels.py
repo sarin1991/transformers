@@ -86,7 +86,7 @@ def fused_up_proj_gate_activation_kernel(
         # Store zeros in output for this block
         out_ptrs = output_ptr + (offs_bs[:, None] * stride_out_bs + 
                                (pid_nb * line_size + offs_ls)[None, :] * stride_out_ls)
-        tl.store(out_ptrs, tl.zeros((BLOCK_SIZE_BS, BLOCK_SIZE_LS), dtype=tl.out_dtype), 
+        tl.store(out_ptrs, tl.zeros((BLOCK_SIZE_BS, BLOCK_SIZE_LS), dtype=out_dtype), 
                 mask=(mask_bs[:, None] & mask_ls[None, :]))
         return
     
