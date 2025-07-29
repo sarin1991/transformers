@@ -139,7 +139,7 @@ def fused_down_proj_sortpack_kernel(
     # Atomic add into output tensor
     # --------------------------------------------------------------
     out_ptrs = output_ptr + row_indices[:, None] * stride_out_bs + offs_h[None, :] * stride_out_h
-    tl.atomic_add(out_ptrs, acc.to(out_dtype), mask=row_active[:, None] & mask_h[None, :])
+    tl.atomic_add(out_ptrs, acc.to(out_dtype), mask=row_active[:, None] & mask_h[None, :], sem= "relaxed")
 
 
 # =============================================================================
