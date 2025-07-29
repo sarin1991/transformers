@@ -83,18 +83,18 @@ def fused_weight_grad_kernel(
     # absolute LS chunk index inside this block column
     ls_chunk_in_block = ls_group * GROUP_SIZE_I + ls_chunk_in_group  # 0 … ls_chunks_per_blk-1
 
-    # Guard – ensure indices map inside the valid ranges
-    if (
-        h_chunk * BLOCK_SIZE_H >= hidden_size
-        or ls_chunk_in_block * BLOCK_SIZE_I >= line_size
-        or block_idx >= num_blocks
-    ):
+    # Guard – ensure indices map inside the valid ranges (avoid chained boolean ops)
+    invalid_h  = h_chunk * BLOCK_SIZE_H >= hidden_size
+    invalid_ls = ls_chunk_in_block * BLOCK_SIZE_I >= line_size
+    invalid_b  = block_idx >= num_blocks
+
+    if (invalid_h or invalid_ls) or invalid_b:
         return
 
-    i_chunk = block_idx * ls_chunks_per_blk + ls_chunk_in_block
+    i_start = block_idx * line_size + ls_chunk_in_block * BLOCK_SIZE_I
 
-    # update offs
-    offs_i = i_chunk * BLOCK_SIZE_I + tl.arange(0, BLOCK_SIZE_I)
+    # update offs (row indices this CTA is responsible for)
+    offs_i = i_start + tl.arange(0, BLOCK_SIZE_I)
     offs_h = h_chunk * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)
     offs_bs = tl.arange(0, BLOCK_SIZE_BS)
 
@@ -198,22 +198,24 @@ def debug_large_scale():
     """Run numerical correctness checks on several shapes with block sparsity."""
 
     configs = [
-        (64,  128, 256, 4,  32),   # (N, H, hidden, NB, LS)  -> I = NB*LS
-        (256, 256, 512, 8,  32),
-        (512, 512, 768, 8,  64),
+        # (N, hidden_size, NB, LS)  -> I = NB*LS
+        (64,   256, 4,  32),
+        (256,  512, 8,  32),
+        (512,  768, 8,  64),
+        (1024,  1024, 4,  1024),
     ]
 
     overall_max_diff_dense = 0.0
     overall_max_diff_sortpack = 0.0
 
-    for batch_seq, hidden_size, h_out, num_blocks, line_size in configs:
+    for batch_seq, hidden_size, num_blocks, line_size in configs:
         intermediate_size = num_blocks * line_size
         print(
-            f"\nConfig: N={batch_seq} | H_in={hidden_size} | I={intermediate_size} | H_out={h_out} | NB={num_blocks} | LS={line_size}"
+            f"\nConfig: N={batch_seq} | H={hidden_size} | I={intermediate_size} | NB={num_blocks} | LS={line_size}"
         )
 
         # Random activations and gradients
-        other = torch.randn(batch_seq, h_out, device="cuda", dtype=torch.float16)  # acts or grads (N,H)
+        other = torch.randn(batch_seq, hidden_size, device="cuda", dtype=torch.float16)  # acts or grads (N,H)
 
         # Build sparse intermediate matrix following gate mask
         gate = _make_sparse_gate(batch_seq, num_blocks, sparsity=0.9)
@@ -227,9 +229,9 @@ def debug_large_scale():
 
         # Triton SortPack sparse helper
         tri_sortpack = fused_weight_grad_sparse_triton_sortpack(
-            intermediate.view(1, batch_seq, intermediate_size),   # (B=1, S=N, I)
-            other.view(1, batch_seq, h_out),                      # (B=1, S=N, H)
-            gate.view(1, batch_seq, num_blocks),                  # (B=1, S=N, NB)
+            intermediate,   # (BS, I)
+            other,          # (BS, H)
+            gate,           # (BS, NB)
             num_blocks,
             line_size,
         )
