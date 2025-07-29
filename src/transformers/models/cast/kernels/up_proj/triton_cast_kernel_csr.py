@@ -115,7 +115,7 @@ def fused_up_proj_gate_csr_kernel(
 
     # Store
     out_ptrs = output_ptr + row_indices[:, None] * stride_out_bs + global_cols[None, :] * stride_out_i
-    tl.atomic_add(out_ptrs, acc.to(out_dtype), mask=mask_bs[:, None] & mask_ls[None, :]) 
+    tl.store(out_ptrs, acc.to(out_dtype), mask=mask_bs[:, None] & mask_ls[None, :])
 
 # =============================================================================
 # Python helper – CSR sparse path
