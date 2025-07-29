@@ -9,9 +9,9 @@ import triton.language as tl
 # =============================================================================
 
 # ----------------------------- autotune configs -----------------------------
-_CONFIG_WARPS  = (4, 8, 16)
+_CONFIG_WARPS  = (2, 4, 8)
 _TILE_SIZES    = (64, 128)
-_NUM_STAGES    = (1, 2, 3)
+_NUM_STAGES    = (2, 4)
 
 CONFIGS = []
 for tile in _TILE_SIZES:
@@ -117,13 +117,10 @@ def fused_weight_grad_sortpack_kernel(
     if blk_rows == 0:
         return
 
-    for r in range(0, max_rows, BLOCK_SIZE_BS):
+    for r in range(0, blk_rows, BLOCK_SIZE_BS):
         row_offs   = r + offs_bs
         # Mask rows using **per-block** active count instead of global max_rows
         mask_rows  = row_offs < blk_rows
-        # Skip this tile entirely if it contains no active rows
-        if tl.sum(mask_rows) == 0:
-            continue
 
         row_idx = tl.load(row_idx_ptr + base_row_ptr + row_offs,
                           mask=mask_rows, other=0)
