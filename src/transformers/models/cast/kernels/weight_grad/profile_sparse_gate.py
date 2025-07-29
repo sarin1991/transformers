@@ -134,7 +134,7 @@ def main():
                     run_fn()
             torch.cuda.synchronize()
 
-        print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=20))
+        print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=20, max_name_column_width=80))
 
     if args.profile_dense:
         _profile("triton_weight_grad_dense", lambda: _run_dense(intermediate_fp16, other_fp16, args.num_blocks, args.line_size))
