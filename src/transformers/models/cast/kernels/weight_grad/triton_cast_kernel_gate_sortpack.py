@@ -39,6 +39,7 @@ for tile in _TILE_SIZES:
 def fused_weight_grad_sortpack_kernel(
     inter_ptr, other_ptr,
     row_idx_ptr,               # (NB, max_rows)
+    row_counts_ptr,            # (NB,) – number of active rows per block
     output_ptr,                # (I, H) – fp32/fp16
     # sizes
     hidden_size: tl.constexpr, line_size: tl.constexpr, max_rows: tl.constexpr,
@@ -111,9 +112,18 @@ def fused_weight_grad_sortpack_kernel(
     # ------------------------------------------------------------------
     # Main reduction loop over packed rows
     # ------------------------------------------------------------------
+    blk_rows = tl.load(row_counts_ptr + block_idx)
+    # Early exit if block has no active rows
+    if blk_rows == 0:
+        return
+
     for r in range(0, max_rows, BLOCK_SIZE_BS):
         row_offs   = r + offs_bs
-        mask_rows  = row_offs < max_rows
+        # Mask rows using **per-block** active count instead of global max_rows
+        mask_rows  = row_offs < blk_rows
+        # Skip this tile entirely if it contains no active rows
+        if tl.sum(mask_rows) == 0:
+            continue
 
         row_idx = tl.load(row_idx_ptr + base_row_ptr + row_offs,
                           mask=mask_rows, other=0)
@@ -229,6 +239,7 @@ def fused_weight_grad_sparse_triton_sortpack(
         inter_flat,
         other_flat,
         row_idx_flat,
+        block_counts.contiguous(),
         output,
         hidden_size,
         line_size,
