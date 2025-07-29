@@ -45,18 +45,18 @@ def fused_up_proj_gate_sortpack_kernel(
     # ------------------------------------------------------------------
     # Decompose pid into (block_idx, row_chunk, col_chunk)
     # ------------------------------------------------------------------
-    C = (line_size + BLOCK_SIZE_LS - 1) // BLOCK_SIZE_LS  # column tiles per block
+    num_col_chunks = tl.cdiv(line_size, BLOCK_SIZE_LS)  # column tiles per block
 
-    row_chunks = (max_rows + BLOCK_SIZE_BS - 1) // BLOCK_SIZE_BS
-    row_groups = (row_chunks + GROUP_SIZE_R - 1) // GROUP_SIZE_R
-    num_pid_per_block = C * GROUP_SIZE_R * row_groups
+    row_chunks = tl.cdiv(max_rows, BLOCK_SIZE_BS)
+    row_groups = tl.cdiv(row_chunks, GROUP_SIZE_R)
+    num_pid_per_block = num_col_chunks * GROUP_SIZE_R * row_groups
 
     block_idx = pid // num_pid_per_block
     pid_rem   = pid % num_pid_per_block
 
-    col_chunk    = (pid_rem // GROUP_SIZE_R) % C
+    col_chunk    = (pid_rem // GROUP_SIZE_R) % num_col_chunks
     row_in_group = pid_rem % GROUP_SIZE_R
-    row_group    = pid_rem // (C * GROUP_SIZE_R)
+    row_group    = pid_rem // (num_col_chunks * GROUP_SIZE_R)
     row_chunk    = row_group * GROUP_SIZE_R + row_in_group
 
     if row_chunk >= row_chunks:
@@ -195,12 +195,15 @@ def fused_up_proj_gate_activation_sparse_triton_sortpack(
     # Grid size helper (same logic as CSR variant)
     # ------------------------------------------------------------------
     def grid(meta):
-        BLK_BS = meta['BLOCK_SIZE_BS']
-        BLK_LS = meta['BLOCK_SIZE_LS']
-        C = triton.cdiv(line_size, BLK_LS)
+        BLK_BS = meta["BLOCK_SIZE_BS"]
+        BLK_LS = meta["BLOCK_SIZE_LS"]
+        G_SIZE_R = meta["GROUP_SIZE_R"]
+
+        num_col_chunks = triton.cdiv(line_size, BLK_LS)
         row_chunks = triton.cdiv(max_rows, BLK_BS)
-        row_groups = triton.cdiv(row_chunks, GROUP_SIZE_R)
-        num_pid_per_block = C * GROUP_SIZE_R * row_groups
+        row_groups = triton.cdiv(row_chunks, G_SIZE_R)
+        num_pid_per_block = num_col_chunks * G_SIZE_R * row_groups
+
         return (num_pid_per_block * num_blocks,)
 
     # ------------------------------------------------------------------

@@ -65,7 +65,7 @@ def fused_weight_grad_kernel(
     num_blocks        = tl.cdiv(intermediate_size, line_size)
 
     # Total CTAs per block column
-    num_pid_per_block = num_ls_groups * num_hidden_chunks * GROUP_SIZE_I
+    num_pid_per_block = ls_chunks_per_blk * num_hidden_chunks
 
     # -------- program-id decomposition --------
     block_idx = pid // num_pid_per_block

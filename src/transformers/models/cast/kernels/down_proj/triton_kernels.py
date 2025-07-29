@@ -60,8 +60,8 @@ def fused_down_proj_kernel(
     # --------------------------------------------------------------
     # Decompose pid into (row_chunk, hidden_chunk) with row grouping
     # --------------------------------------------------------------
-    num_col_chunks = (hidden_size + BLOCK_SIZE_H - 1) // BLOCK_SIZE_H  # hidden chunks
-    row_chunks = (batch_seq_size + BLOCK_SIZE_BS - 1) // BLOCK_SIZE_BS
+    num_col_chunks = tl.cdiv(hidden_size, BLOCK_SIZE_H)  # hidden chunks
+    row_chunks = tl.cdiv(batch_seq_size, BLOCK_SIZE_BS)
 
     col_chunk = pid % num_col_chunks  # hidden chunk index
     row_in_group = (pid // num_col_chunks) % GROUP_SIZE_BS
