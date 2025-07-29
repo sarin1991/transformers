@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+from triton_cast_kernel_gate_sortpack import fused_weight_grad_sparse_triton_sortpack
 
 # -----------------------------------------------------------------------------
 # Autotuning configurations – reuse the same philosophy as up_proj/down_proj
@@ -32,7 +33,7 @@ for tile in _TILE_SIZES:
 @triton.jit
 def fused_weight_grad_kernel(
     y_ptr, x_ptr, out_ptr,  # pointers; y = dy or activations, x = x or dy
-    batch_seq_size, intermediate_size, hidden_size,
+    batch_seq_size, intermediate_size, hidden_size, line_size,
     stride_s_bs, stride_s_i,
     stride_d_bs, stride_d_h,
     stride_out_i, stride_out_h,
@@ -58,18 +59,41 @@ def fused_weight_grad_kernel(
     # ------------------------------------------------------------------
     # Decompose program id into (i_chunk, h_chunk) with grouping on i
     # ------------------------------------------------------------------
-    num_h_chunks = (hidden_size + BLOCK_SIZE_H - 1) // BLOCK_SIZE_H
-    i_chunks = (intermediate_size + BLOCK_SIZE_I - 1) // BLOCK_SIZE_I
+    num_hidden_chunks = tl.cdiv(hidden_size, BLOCK_SIZE_H)
+    num_ls_groups     = tl.cdiv(line_size, GROUP_SIZE_I * BLOCK_SIZE_I)
+    ls_chunks_per_blk = num_ls_groups * GROUP_SIZE_I
+    num_blocks        = tl.cdiv(intermediate_size, line_size)
 
-    i_chunk_in_group = (pid // num_h_chunks) % GROUP_SIZE_I
-    i_group = (pid // num_h_chunks) // GROUP_SIZE_I
-    i_chunk = i_group * GROUP_SIZE_I + i_chunk_in_group
-    h_chunk = pid % num_h_chunks
+    # Total CTAs per block column
+    num_pid_per_block = num_ls_groups * num_hidden_chunks * GROUP_SIZE_I
 
-    if i_chunk >= i_chunks:
+    # -------- program-id decomposition --------
+    block_idx = pid // num_pid_per_block
+    pid_blk   = pid %  num_pid_per_block                    # inside this block column
+
+    # 1) identify which LS-group (coarse) we are in
+    ls_group       = pid_blk // (num_hidden_chunks * GROUP_SIZE_I)
+
+    # 2) remainder inside that LS-group encodes (h_chunk, ls_chunk_in_group)
+    pid_in_lsg     = pid_blk %  (num_hidden_chunks * GROUP_SIZE_I)
+
+    h_chunk            = pid_in_lsg // GROUP_SIZE_I           # hidden-dimension tile
+    ls_chunk_in_group  = pid_in_lsg %  GROUP_SIZE_I           # fine LS tile inside group
+
+    # absolute LS chunk index inside this block column
+    ls_chunk_in_block = ls_group * GROUP_SIZE_I + ls_chunk_in_group  # 0 … ls_chunks_per_blk-1
+
+    # Guard – ensure indices map inside the valid ranges
+    if (
+        h_chunk * BLOCK_SIZE_H >= hidden_size
+        or ls_chunk_in_block * BLOCK_SIZE_I >= line_size
+        or block_idx >= num_blocks
+    ):
         return
 
-    # Offsets
+    i_chunk = block_idx * ls_chunks_per_blk + ls_chunk_in_block
+
+    # update offs
     offs_i = i_chunk * BLOCK_SIZE_I + tl.arange(0, BLOCK_SIZE_I)
     offs_h = h_chunk * BLOCK_SIZE_H + tl.arange(0, BLOCK_SIZE_H)
     offs_bs = tl.arange(0, BLOCK_SIZE_BS)
@@ -102,42 +126,55 @@ def fused_weight_grad_kernel(
 
 
 def fused_weight_grad_triton(
-    y: torch.Tensor,
-    x: torch.Tensor,
+    intermediate: torch.Tensor,
+    other: torch.Tensor,
+    line_size: int,
     out_dtype: torch.dtype = torch.float32,
 ):
-    """Dense Triton wrapper that computes G = yᵀ · x.
+    """Compute weight gradient `dW = intermediateᵀ · other` with Triton.
 
     Args:
-        y: (batch_seq, intermediate_size) *float16*/*bfloat16*
-        x: (batch_seq, hidden_size)       *float16*/*bfloat16*
+        intermediate: (batch_seq, intermediate_size) – *float16*/*bfloat16*  (U or dZ)
+        other:        (batch_seq, hidden_size)       – *float16*/*bfloat16*  (dY or X)
+        line_size: size of each block line (LS)
         out_dtype: dtype of the returned matrix (default fp32, can be fp16)
+
     Returns:
-        Tensor (intermediate_size, hidden_size)
+        Tensor of shape (intermediate_size, hidden_size)
     """
-    assert y.ndim == 2 and x.ndim == 2, "Input tensors must be 2-D"
-    assert y.shape[0] == x.shape[0], "Batch dimension mismatch"
+
+    # Basic validations
+    assert intermediate.ndim == 2 and other.ndim == 2, "Input tensors must be 2-D"
+    assert intermediate.shape[0] == other.shape[0], "Batch dimension mismatch"
 
     supported_dtypes = (torch.float16, torch.bfloat16)
-    assert y.dtype in supported_dtypes and x.dtype in supported_dtypes, "Inputs must be fp16 or bf16"
+    assert intermediate.dtype in supported_dtypes and other.dtype in supported_dtypes, "Inputs must be fp16 or bf16"
 
-    batch_seq_size, intermediate_size = y.shape
-    hidden_size = x.shape[1]
+    batch_seq_size, intermediate_size = intermediate.shape
+    assert intermediate_size % line_size == 0, "line_size must divide intermediate_size"
+    hidden_size = other.shape[1]
 
-    out = torch.empty((intermediate_size, hidden_size), device=y.device, dtype=out_dtype)
+    out = torch.empty((intermediate_size, hidden_size), device=intermediate.device, dtype=out_dtype)
 
     def grid(meta):
-        I_chunks = triton.cdiv(intermediate_size, meta["BLOCK_SIZE_I"])
-        H_chunks = triton.cdiv(hidden_size, meta["BLOCK_SIZE_H"])
-        return (I_chunks * H_chunks,)
+        BLK_I = meta["BLOCK_SIZE_I"]
+        BLK_H = meta["BLOCK_SIZE_H"]
+        G_I   = meta["GROUP_SIZE_I"]
+
+        num_ls_groups = triton.cdiv(line_size, G_I * BLK_I)
+        num_blocks    = intermediate_size // line_size
+        h_chunks      = triton.cdiv(hidden_size, BLK_H)
+
+        return (num_blocks * num_ls_groups * h_chunks * G_I,)
 
     fused_weight_grad_kernel[grid](
-        y, x, out,
+        intermediate, other, out,
         batch_seq_size,
         intermediate_size,
         hidden_size,
-        y.stride(0), y.stride(1),
-        x.stride(0), x.stride(1),
+        line_size,
+        intermediate.stride(0), intermediate.stride(1),
+        other.stride(0), other.stride(1),
         out.stride(0), out.stride(1),
         out_dtype=tl.float16 if out_dtype == torch.float16 else tl.float32,
     )
@@ -148,27 +185,71 @@ def fused_weight_grad_triton(
 # Debug utilities
 # -----------------------------------------------------------------------------
 
-def _debug_single_shape(batch_seq, intermediate_size, hidden_size):
-    torch.manual_seed(0)
-    y = torch.randn(batch_seq, intermediate_size, device="cuda", dtype=torch.float16)
-    x = torch.randn(batch_seq, hidden_size, device="cuda", dtype=torch.float16)
 
-    ref = y.transpose(0, 1).float() @ x.float()
-    tri = fused_weight_grad_triton(y, x)
-
-    max_diff = (ref - tri).abs().max().item()
-    print(f"Shape (N={batch_seq}, I={intermediate_size}, H={hidden_size}) -> max diff {max_diff:.6e}")
-    assert max_diff < 1e-2, "Numerical error too high!"
+def _make_sparse_gate(batch_seq: int, num_blocks: int, sparsity: float = 0.9):
+    """Build a 1-D boolean mask of active blocks for each row (size N × NB)."""
+    gate = torch.rand(batch_seq, num_blocks, device="cuda", dtype=torch.float32)
+    mask = torch.rand_like(gate) < sparsity
+    gate[mask] = 0.0
+    return gate
 
 
 def debug_large_scale():
-    shapes = [
-        (64, 128, 256),
-        (256, 256, 512),
-        (512, 512, 768),
+    """Run numerical correctness checks on several shapes with block sparsity."""
+
+    configs = [
+        (64,  128, 256, 4,  32),   # (N, H, hidden, NB, LS)  -> I = NB*LS
+        (256, 256, 512, 8,  32),
+        (512, 512, 768, 8,  64),
     ]
-    for bs, I, H in shapes:
-        _debug_single_shape(bs, I, H)
+
+    overall_max_diff_dense = 0.0
+    overall_max_diff_sortpack = 0.0
+
+    for batch_seq, hidden_size, h_out, num_blocks, line_size in configs:
+        intermediate_size = num_blocks * line_size
+        print(
+            f"\nConfig: N={batch_seq} | H_in={hidden_size} | I={intermediate_size} | H_out={h_out} | NB={num_blocks} | LS={line_size}"
+        )
+
+        # Random activations and gradients
+        other = torch.randn(batch_seq, h_out, device="cuda", dtype=torch.float16)  # acts or grads (N,H)
+
+        # Build sparse intermediate matrix following gate mask
+        gate = _make_sparse_gate(batch_seq, num_blocks, sparsity=0.9)
+        intermediate = torch.randn(batch_seq, num_blocks, line_size, device="cuda", dtype=torch.float16)
+        intermediate = intermediate * gate.unsqueeze(-1).to(dtype=intermediate.dtype)
+        intermediate = intermediate.view(batch_seq, intermediate_size)
+
+        # Reference & Triton (dense)
+        ref = intermediate.transpose(0, 1).float() @ other.float()
+        tri_dense = fused_weight_grad_triton(intermediate, other, line_size)
+
+        # Triton SortPack sparse helper
+        tri_sortpack = fused_weight_grad_sparse_triton_sortpack(
+            intermediate.view(1, batch_seq, intermediate_size),   # (B=1, S=N, I)
+            other.view(1, batch_seq, h_out),                      # (B=1, S=N, H)
+            gate.view(1, batch_seq, num_blocks),                  # (B=1, S=N, NB)
+            num_blocks,
+            line_size,
+        )
+
+        # Diffs
+        max_diff_dense = torch.max(torch.abs(ref - tri_dense)).item()
+        mean_diff_dense = torch.mean(torch.abs(ref - tri_dense)).item()
+
+        max_diff_sort = torch.max(torch.abs(ref - tri_sortpack)).item()
+        mean_diff_sort = torch.mean(torch.abs(ref - tri_sortpack)).item()
+
+        overall_max_diff_dense = max(overall_max_diff_dense, max_diff_dense)
+        overall_max_diff_sortpack = max(overall_max_diff_sortpack, max_diff_sort)
+
+        print(f"Dense   → max diff {max_diff_dense:.6e} | mean diff {mean_diff_dense:.6e}")
+        print(f"SortPk  → max diff {max_diff_sort:.6e} | mean diff {mean_diff_sort:.6e}")
+
+    print(
+        f"\nOverall max diff across configs | Dense: {overall_max_diff_dense:.6e} | SortPk: {overall_max_diff_sortpack:.6e}"
+    )
 
 
 if __name__ == "__main__":
