@@ -69,18 +69,18 @@ def fused_down_proj_sortpack_kernel(
     # --------------------------------------------------------------
     # Decompose pid into (block_idx, row_chunk, col_chunk)
     # --------------------------------------------------------------
-    C = (hidden_size + BLOCK_SIZE_H - 1) // BLOCK_SIZE_H  # hidden chunks per block
+    num_col_chunks = tl.cdiv(hidden_size, BLOCK_SIZE_H)  # hidden chunks per block
 
-    row_chunks = (max_rows + BLOCK_SIZE_BS - 1) // BLOCK_SIZE_BS
-    row_groups = (row_chunks + GROUP_SIZE_R - 1) // GROUP_SIZE_R
-    num_pid_per_block = C * GROUP_SIZE_R * row_groups
+    row_chunks = tl.cdiv(max_rows, BLOCK_SIZE_BS)
+    row_groups = tl.cdiv(row_chunks, GROUP_SIZE_R)
+    num_pid_per_block = num_col_chunks * GROUP_SIZE_R * row_groups
 
     block_idx = pid // num_pid_per_block
     pid_rem = pid % num_pid_per_block
 
-    col_chunk = (pid_rem // GROUP_SIZE_R) % C  # hidden chunk
+    col_chunk = (pid_rem // GROUP_SIZE_R) % num_col_chunks  # hidden chunk
     row_in_group = pid_rem % GROUP_SIZE_R
-    row_group = pid_rem // (C * GROUP_SIZE_R)
+    row_group = pid_rem // (num_col_chunks * GROUP_SIZE_R)
     row_chunk = row_group * GROUP_SIZE_R + row_in_group
 
     if row_chunk >= row_chunks:
@@ -209,10 +209,10 @@ def fused_down_proj_sparse_triton_sortpack(
         BLK_H = meta["BLOCK_SIZE_H"]
         G_SIZE_R = meta["GROUP_SIZE_R"]
 
-        C = triton.cdiv(hidden_size, BLK_H)
+        num_col_chunks = triton.cdiv(hidden_size, BLK_H)
         row_chunks = triton.cdiv(max_rows, BLK_BS)
         row_groups = triton.cdiv(row_chunks, G_SIZE_R)
-        num_pid_per_block = C * G_SIZE_R * row_groups
+        num_pid_per_block = num_col_chunks * G_SIZE_R * row_groups
 
         return (num_pid_per_block * num_blocks,)
 

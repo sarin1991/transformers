@@ -48,9 +48,9 @@ def fused_up_proj_gate_activation_kernel(
     
     # Calculate block indices - block across batch_seq, num_blocks, and line_size
     # Similar to reference Triton pattern: pid = pid_m * num_pid_n + pid_n
-    num_pid_bs = (batch_seq_size + BLOCK_SIZE_BS - 1) // BLOCK_SIZE_BS
+    num_pid_bs = tl.cdiv(batch_seq_size, BLOCK_SIZE_BS)
     num_pid_nb = num_blocks
-    num_pid_ls = (line_size + BLOCK_SIZE_LS - 1) // BLOCK_SIZE_LS
+    num_pid_ls = tl.cdiv(line_size, BLOCK_SIZE_LS)
     
     # Calculate 3D block indices
     pid_ls = pid % num_pid_ls
