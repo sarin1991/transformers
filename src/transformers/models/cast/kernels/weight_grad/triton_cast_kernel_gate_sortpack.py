@@ -53,90 +53,103 @@ def fused_weight_grad_sortpack_kernel(
     BLOCK_SIZE_BS: tl.constexpr, BLOCK_SIZE_LS: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr, GROUP_SIZE_R: tl.constexpr,
 ):
-    """CTA computes (LS × Htile) slice of dW for one block column."""
+    """CTA computes one (LS × H) tile of dW for a block column.
+
+    Each CTA owns its output tile exclusively and therefore stores its result
+    with tl.store (no atomic add). The full reduction over the packed row list
+    is executed inside the CTA.
+    """
 
     pid = tl.program_id(0)
 
-    # Decompose pid → (block_idx, row_chunk, col_chunk)
-    num_col_chunks = tl.cdiv(hidden_size, BLOCK_SIZE_H)
+    # ------------------------------------------------------------------
+    # Decompose program-id → (block_idx, ls_chunk_in_block, h_chunk)
+    # ------------------------------------------------------------------
+    num_hidden_chunks = tl.cdiv(hidden_size, BLOCK_SIZE_H)
+    num_ls_groups     = tl.cdiv(line_size, GROUP_SIZE_R * BLOCK_SIZE_LS)
+    ls_chunks_per_blk = num_ls_groups * GROUP_SIZE_R
+    num_pid_per_block = num_hidden_chunks * ls_chunks_per_blk
 
-    row_chunks  = tl.cdiv(max_rows, BLOCK_SIZE_BS)
-    row_groups  = tl.cdiv(row_chunks, GROUP_SIZE_R)
+    block_idx  = pid // num_pid_per_block
+    pid_in_blk = pid %  num_pid_per_block
 
-    num_pid_per_block = num_col_chunks * GROUP_SIZE_R * row_groups
+    ls_group        = pid_in_blk // (num_hidden_chunks * GROUP_SIZE_R)
+    pid_in_group    = pid_in_blk %  (num_hidden_chunks * GROUP_SIZE_R)
 
-    block_idx = pid // num_pid_per_block
-    pid_rem   = pid %  num_pid_per_block
+    h_chunk         = pid_in_group // GROUP_SIZE_R
+    ls_chunk_in_grp = pid_in_group %  GROUP_SIZE_R
+    ls_chunk_in_blk = ls_group * GROUP_SIZE_R + ls_chunk_in_grp
 
-    # --- indices inside the row-group ---
-    pid_row_group = pid_rem % (num_col_chunks * GROUP_SIZE_R)
-    row_in_group  = pid_row_group % GROUP_SIZE_R
-    col_chunk     = pid_row_group // GROUP_SIZE_R  # 0 … num_col_chunks-1
-
-    row_group = pid_rem // (num_col_chunks * GROUP_SIZE_R)
-    row_chunk = row_group * GROUP_SIZE_R + row_in_group
-
-    if row_chunk >= row_chunks:
+    # Guard CTAs that map outside of the valid LS/H ranges
+    if (h_chunk * BLOCK_SIZE_H >= hidden_size) or (
+        ls_chunk_in_blk * BLOCK_SIZE_LS >= line_size):
         return
 
-    # ----- gather packed rows -----
-    row_start = row_chunk * BLOCK_SIZE_BS
-    offs_bs   = tl.arange(0, BLOCK_SIZE_BS)
-    rows_in_block = row_start + offs_bs
-    mask_bs   = rows_in_block < max_rows
+    # ------------------------------------------------------------------
+    # Coordinate helpers
+    # ------------------------------------------------------------------
+    offs_ls = tl.arange(0, BLOCK_SIZE_LS)
+    offs_h  = tl.arange(0, BLOCK_SIZE_H)
+    offs_bs = tl.arange(0, BLOCK_SIZE_BS)
 
-    base_ptr  = block_idx * stride_row_blk  # stride_row_blk == max_rows
-    row_indices = tl.load(row_idx_ptr + base_ptr + rows_in_block, mask=mask_bs, other=0)
+    ls_global  = ls_chunk_in_blk * BLOCK_SIZE_LS + offs_ls
+    h_global   = h_chunk * BLOCK_SIZE_H + offs_h
 
-    # Early exit if tile is fully padded.
-    if tl.sum(row_indices) == 0:
-        return
+    mask_ls = ls_global < line_size
+    mask_h  = h_global  < hidden_size
 
-    # ----- column offsets -----
-    offs_ls = col_offs = tl.arange(0, BLOCK_SIZE_LS)
-    col_chunk_offset = block_idx * line_size
-    global_cols = col_chunk_offset + col_offs + col_chunk * 0  # placeholder
+    col_offset  = block_idx * line_size
+    global_cols = col_offset + ls_global
 
-    # Create proper offs_ls considering col_chunk
-    offs_ls = col_chunk * BLOCK_SIZE_LS + tl.arange(0, BLOCK_SIZE_LS)
-    mask_ls = offs_ls < line_size
-    global_cols = col_chunk_offset + offs_ls
+    # Pointer into the packed row index buffer (column-major, max_rows per block)
+    base_row_ptr = block_idx * stride_row_blk  # stride_row_blk == max_rows
 
-    # ----- accumulator -----
+    # ------------------------------------------------------------------
+    # Accumulator for this (LS × H) tile
+    # ------------------------------------------------------------------
     acc = tl.zeros((BLOCK_SIZE_LS, BLOCK_SIZE_H), dtype=tl.float32)
 
-    # K-loop over rows in BS tiles
-    for b in range(0, BLOCK_SIZE_BS):
-        row_mask = mask_bs[b]
-        row_idx  = row_indices[b]
-        if not row_mask:
-            continue
+    # ------------------------------------------------------------------
+    # Main reduction loop over packed rows
+    # ------------------------------------------------------------------
+    for r in range(0, max_rows, BLOCK_SIZE_BS):
+        row_offs   = r + offs_bs
+        mask_rows  = row_offs < max_rows
 
-    # We will iterate over hidden_size in H-chunks
-    offs_h = tl.arange(0, BLOCK_SIZE_H)
-    for h in range(0, hidden_size, BLOCK_SIZE_H):
-        curr_offs_h = h + offs_h
-        mask_h = curr_offs_h < hidden_size
+        row_idx = tl.load(row_idx_ptr + base_row_ptr + row_offs,
+                          mask=mask_rows, other=0)
 
-        # ---- load inter_block: shape (LS, 1) for current row subset ----
-        # We accumulate over rows, so use tl.dot later with transpose.
-        inter_ptrs = inter_ptr + row_indices[:, None] * stride_inter_bs + (col_chunk_offset + offs_ls)[None, :] * stride_inter_ls
-        inter_block = tl.load(inter_ptrs, mask=mask_bs[:, None] & mask_ls[None, :], other=0.0)  # (BS, LS)
+        # Load slice from intermediate → shape (BS, LS)
+        inter_ptrs = (
+            inter_ptr
+            + row_idx[:, None] * stride_inter_bs
+            + global_cols[None, :] * stride_inter_ls
+        )
+        inter_blk = tl.load(inter_ptrs,
+                            mask=mask_rows[:, None] & mask_ls[None, :],
+                            other=0.0)
 
-        other_ptrs = other_ptr + row_indices[:, None] * stride_other_bs + curr_offs_h[None, :] * stride_other_h
-        other_block = tl.load(other_ptrs, mask=mask_bs[:, None] & mask_h[None, :], other=0.0)   # (BS, Htile)
+        # Load slice from other → shape (BS, H)
+        other_ptrs = (
+            other_ptr
+            + row_idx[:, None] * stride_other_bs
+            + h_global[None, :] * stride_other_h
+        )
+        other_blk = tl.load(other_ptrs,
+                            mask=mask_rows[:, None] & mask_h[None, :],
+                            other=0.0)
 
-        acc += tl.dot(tl.trans(inter_block), other_block)  # (LS, Htile)
+        acc += tl.dot(tl.trans(inter_blk), other_blk)
 
-    # ----- write back (atomic add) -----
-    out_ptrs = output_ptr + global_cols[:, None] * stride_out_i + offs_h[None, :] * 0  # we write later per H tile
-    off_h_start = 0
-    for h in range(0, hidden_size, BLOCK_SIZE_H):
-        curr_offs_h = h + offs_h
-        mask_h = curr_offs_h < hidden_size
-        tile = acc[:, :]
-        out_tile_ptrs = output_ptr + global_cols[:, None] * stride_out_i + curr_offs_h[None, :] * stride_out_h
-        tl.atomic_add(out_tile_ptrs, tile.to(out_dtype), mask=mask_ls[:, None] & mask_h[None, :])
+    # ------------------------------------------------------------------
+    # Write back (no atomics required)
+    # ------------------------------------------------------------------
+    out_ptrs = (
+        output_ptr
+        + global_cols[:, None] * stride_out_i
+        + h_global[None, :]   * stride_out_h
+    )
+    tl.store(out_ptrs, acc.to(out_dtype), mask=mask_ls[:, None] & mask_h[None, :])
 
 
 # =============================================================================
@@ -154,17 +167,23 @@ def fused_weight_grad_sparse_triton_sortpack(
 ):
     """Sort-pack sparse helper to compute dW = intermediateᵀ · other.
 
-    intermediate : (B, S, I) fp16/bf16 with I = NB·LS (already gated)
-    other        : (B, S, H) fp16/bf16
-    gate         : (B, S, NB) fp32 – same sparsity pattern as forward
+    Expected input layout (flattened batch-sequence):
+        intermediate : (BS, I)  – fp16/bf16 with I = NB·LS (already gated)
+        other        : (BS, H)  – fp16/bf16
+        gate         : (BS, NB) – fp32 mask (non-zero → active)
+
+    where BS = batch_size × sequence_length.
     """
 
-    B, S, I = intermediate.shape
-    hidden_size = other.shape[2]
-    batch_seq = B * S
+    # Basic validations
+    assert intermediate.ndim == 2 and other.ndim == 2 and gate.ndim == 2, "Inputs must be 2-D (batch_seq, …) tensors"
 
-    assert I == num_blocks * line_size
-    assert gate.shape == (B, S, num_blocks)
+    batch_seq, I = intermediate.shape
+    hidden_size = other.shape[1]
+
+    assert other.shape == (batch_seq, hidden_size)
+    assert gate.shape == (batch_seq, num_blocks)
+    assert I == num_blocks * line_size, "line_size must divide intermediate size"
 
     supported = (torch.float16, torch.bfloat16)
     assert intermediate.dtype in supported and other.dtype in supported
@@ -172,10 +191,10 @@ def fused_weight_grad_sparse_triton_sortpack(
     if gate.dtype != torch.float32:
         gate = gate.float()
 
-    # Flatten views
-    inter_flat = intermediate.contiguous().view(batch_seq, I)
-    other_flat = other.contiguous().view(batch_seq, hidden_size)
-    gate_flat  = gate.contiguous().view(batch_seq, num_blocks)
+    # Contiguous views (ensure memory stride is compact)
+    inter_flat = intermediate.contiguous()
+    other_flat = other.contiguous()
+    gate_flat  = gate.contiguous()
 
     # Build packed buffers
     mask = gate_flat > 0
@@ -198,12 +217,13 @@ def fused_weight_grad_sparse_triton_sortpack(
 
     def grid(meta):
         BLK_BS = meta["BLOCK_SIZE_BS"]
+        BLK_LS = meta["BLOCK_SIZE_LS"]
         BLK_H  = meta["BLOCK_SIZE_H"]
         G_R    = meta["GROUP_SIZE_R"]
-        C = triton.cdiv(hidden_size, BLK_H)
-        row_chunks = triton.cdiv(max_rows, BLK_BS)
-        row_groups = triton.cdiv(row_chunks, G_R)
-        num_pid_per_block = C * G_R * row_groups
+
+        hidden_chunks = triton.cdiv(hidden_size, BLK_H)
+        ls_groups     = triton.cdiv(line_size, G_R * BLK_LS)
+        num_pid_per_block = hidden_chunks * ls_groups * G_R
         return (num_pid_per_block * num_blocks,)
 
     fused_weight_grad_sortpack_kernel[grid](
@@ -211,8 +231,8 @@ def fused_weight_grad_sparse_triton_sortpack(
         other_flat,
         row_idx_flat,
         output,
-        line_size,
         hidden_size,
+        line_size,
         max_rows,
         stride_inter_bs, stride_inter_ls,
         stride_other_bs, stride_other_h,
