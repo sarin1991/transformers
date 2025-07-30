@@ -1,14 +1,10 @@
 import torch
 import torch.nn.functional as F
 from typing import Tuple
-# Import the fused operation - works when run from cast directory as:
+# Import the fused operation - run from cast directory as:
 # cd src/transformers/models/cast/
-# python ops/debug_cast_mlp_fused.py
-try:
-    from .cast_mlp_fused import cast_mlp_fused
-except ImportError:
-    # Fallback for running from cast directory
-    from ops.cast_mlp_fused import cast_mlp_fused
+# python -m ops.debug_cast_mlp_fused
+from ops.cast_mlp_fused import cast_mlp_fused
 
 
 def _make_sparse_gate(batch_seq_size: int, num_blocks: int, sparsity: float = 0.9) -> torch.Tensor:
@@ -264,7 +260,7 @@ if __name__ == "__main__":
         exit(1)
     
     print("✅ CAST MLP Fused operation loaded successfully.")
-    print("Run from: cd src/transformers/models/cast/ && python ops/debug_cast_mlp_fused.py")
+    print("Run from: cd src/transformers/models/cast/ && python -m ops.debug_cast_mlp_fused")
     
     # Run debug tests
     success = debug_cast_mlp_fused(test_gradients=True)

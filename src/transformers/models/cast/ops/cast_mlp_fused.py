@@ -2,28 +2,16 @@ import torch
 from torch.autograd import Function
 
 # Import existing Triton helpers (sort-pack variants)
-# Works when run from cast directory: cd src/transformers/models/cast/
-try:
-    from ..kernels.up_proj.triton_cast_kernel_gate_sortpack import (
-        fused_up_proj_gate_activation_sparse_triton_sortpack as _up_sparse,
-    )
-    from ..kernels.down_proj.triton_cast_kernel_gate_sortpack import (
-        fused_down_proj_sparse_triton_sortpack as _down_sparse,
-    )
-    from ..kernels.weight_grad.triton_cast_kernel_gate_sortpack import (
-        fused_weight_grad_sparse_triton_sortpack as _wg_sparse,
-    )
-except ImportError:
-    # Fallback for running from cast directory
-    from kernels.up_proj.triton_cast_kernel_gate_sortpack import (
-        fused_up_proj_gate_activation_sparse_triton_sortpack as _up_sparse,
-    )
-    from kernels.down_proj.triton_cast_kernel_gate_sortpack import (
-        fused_down_proj_sparse_triton_sortpack as _down_sparse,
-    )
-    from kernels.weight_grad.triton_cast_kernel_gate_sortpack import (
-        fused_weight_grad_sparse_triton_sortpack as _wg_sparse,
-    )
+# Import Triton kernels - works with module execution from cast directory
+from kernels.up_proj.triton_cast_kernel_gate_sortpack import (
+    fused_up_proj_gate_activation_sparse_triton_sortpack as _up_sparse,
+)
+from kernels.down_proj.triton_cast_kernel_gate_sortpack import (
+    fused_down_proj_sparse_triton_sortpack as _down_sparse,
+)
+from kernels.weight_grad.triton_cast_kernel_gate_sortpack import (
+    fused_weight_grad_sparse_triton_sortpack as _wg_sparse,
+)
 
 
 __all__ = ["cast_mlp_fused"]
