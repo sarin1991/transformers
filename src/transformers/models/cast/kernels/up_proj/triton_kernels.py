@@ -198,31 +198,31 @@ def fused_up_proj_gate_activation_sparse_triton(
     line_size: int,
     out_dtype: torch.dtype = torch.float32,
 ):
-    """Optimized variant of *fused_up_proj_gate_activation_triton* for sparse ``gate`` tensors.
+    """Sparse Triton helper for up-projection + gating + activation.
 
-    The function detects non-zero gate entries, runs the Triton kernel only on the
-    corresponding (row, block) pairs, and scatters the results back into a full-sized
-    output tensor.  For low sparsity (density > *density_threshold*) it transparently
-    falls back to the original dense implementation.
+    This is a drop-in replacement for the dense helper that processes only the
+    non-zero entries in the gate tensor. It may internally fall back to the dense
+    path if the gate is sufficiently dense.
 
     Args:
-        x:              ``(batch, seq_len, hidden_size)``, *float16*/*bfloat16*
+        x:              ``(batch_seq_size, hidden_size)``, *float16*/*bfloat16*
+
         up_weight:      ``(hidden_size, intermediate_size)``, *float16*/*bfloat16*
 
-        gate:           ``(batch, seq_len, num_blocks)``, *float32* or *float16/bf16*
+        gate:           ``(batch_seq_size, num_blocks)``, *float32* or *float16/bf16*
         num_blocks:     number of blocks in the gated FFN
         line_size:      size of each block line (``intermediate_size = num_blocks * line_size``)
         density_threshold: switch to dense path when *gate* is sufficiently dense.
     Returns:
-        ``output`` – ``(batch, seq_len, intermediate_size)`` in *float32*
+        ``output`` – ``(batch_seq_size, intermediate_size)`` in *float32*
     """
 
-    batch_size, seq_len, hidden_size = x.shape
+    batch_seq_size, hidden_size = x.shape
     intermediate_size = num_blocks * line_size
 
     # Ensure the same validations as in the dense path
     assert up_weight.shape == (hidden_size, intermediate_size), "Incompatible up_weight shape"
-    assert gate.shape == (batch_size, seq_len, num_blocks), "Incompatible gate shape"
+    assert gate.shape == (batch_seq_size, num_blocks), "Incompatible gate shape"
     supported_dtypes = (torch.float16, torch.bfloat16)
     assert x.dtype in supported_dtypes, f"Input x must be fp16/bf16, got {x.dtype}"
     assert up_weight.dtype in supported_dtypes, f"up_weight must be fp16/bf16, got {up_weight.dtype}"
@@ -234,10 +234,9 @@ def fused_up_proj_gate_activation_sparse_triton(
     if gate.dtype != torch.float32:
         gate = gate.float()
 
-    # Prepare contiguous flattened views
-    x_reshaped = x.contiguous().view(-1, hidden_size)         # (B·S, H)
-    gate_reshaped = gate.contiguous().view(-1, num_blocks)    # (B·S, NB)
-    batch_seq_size = x_reshaped.size(0)
+    # Prepare contiguous views (already 2D)
+    x_reshaped = x.contiguous()         # (batch_seq_size, H)
+    gate_reshaped = gate.contiguous()   # (batch_seq_size, NB)
 
     # ------------------------------------------------------------------
     # Determine sparsity – decide whether to use sparse or dense path
@@ -247,7 +246,7 @@ def fused_up_proj_gate_activation_sparse_triton(
 
     if nnz == 0:
         # Everything is zero – return all-zeros tensor fast
-        return torch.zeros((batch_size, seq_len, intermediate_size), device=x.device, dtype=out_dtype)
+        return torch.zeros((batch_seq_size, intermediate_size), device=x.device, dtype=out_dtype)
 
 
     # ------------------------------------------------------------------
@@ -312,7 +311,7 @@ def fused_up_proj_gate_activation_sparse_triton(
         output[rows_nb, start_col:end_col] = out_subset
 
     # Reshape back to original 3-D shape
-    return output.view(batch_size, seq_len, intermediate_size)
+    return output.view(batch_seq_size, intermediate_size)
 
 
 # ===============================================================

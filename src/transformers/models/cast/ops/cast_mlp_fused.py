@@ -36,10 +36,11 @@ class _CastMLPFusedFunction(Function):
         assert gate.shape[:2] == (B, S), "gate batch/seq dims must match x"
 
         # Expect up_weight (H, I) and down_weight (I, H); caller owns layout.
-        I = up_weight.shape[0]
+        I = up_weight.shape[1]  # intermediate dimension
         LS = I // NB
         assert LS * NB == I, "gate dim must divide intermediate size"
-        assert down_weight.shape == (H, I)
+        # down_weight is expected to be (I, H) – transpose of up_weight
+        assert down_weight.shape == (I, H), "down_weight must have shape (intermediate, hidden)"
 
         # Ensure contiguous for raw-pointer access
         up_w_T   = up_weight.contiguous()
