@@ -34,24 +34,24 @@ def _generate_tensors(
     line_size: int,
     sparsity: float,
     device: torch.device = torch.device("cuda"),
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Create fp16 input, fp16 weight/bias and a gate tensor with *sparsity*.
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Create fp16 input, fp16 weight and a gate tensor with *sparsity*.
 
     *sparsity*  – fraction of **zeros** in the gate tensor (e.g. 0.9 → 10 % nnz).
     """
 
     inter_size = num_blocks * line_size
 
-    x_fp16 = torch.randn(batch_size, seq_len, hidden_size, device=device, dtype=torch.float16)
+    batch_seq_size = batch_size * seq_len
+    x_fp16 = torch.randn(batch_seq_size, hidden_size, device=device, dtype=torch.float16)
     w_fp16 = torch.randn(hidden_size, inter_size, device=device, dtype=torch.float16)
-    b_fp16 = torch.randn(inter_size, device=device, dtype=torch.float16)
 
-    gate = torch.rand(batch_size, seq_len, num_blocks, device=device, dtype=torch.float32)
+    gate = torch.rand(batch_seq_size, num_blocks, device=device, dtype=torch.float32)
     if sparsity > 0.0:
         mask_zero = torch.rand_like(gate) < sparsity
         gate[mask_zero] = 0.0
 
-    return x_fp16, w_fp16, b_fp16, gate
+    return x_fp16, w_fp16, gate
 
 
 # -----------------------------------------------------------------------------
@@ -61,18 +61,16 @@ def _generate_tensors(
 def _run_dense(
     x: torch.Tensor,
     w: torch.Tensor,
-    b: torch.Tensor,
     gate: torch.Tensor,
     num_blocks: int,
     line_size: int,
 ):
-    fused_up_proj_gate_activation_triton(x, w, b, gate, num_blocks, line_size, out_dtype=torch.float16)
+    fused_up_proj_gate_activation_triton(x, w, gate, num_blocks, line_size, out_dtype=torch.float16)
 
 
 def _run_sparse(
     x: torch.Tensor,
     w: torch.Tensor,
-    b: torch.Tensor,
     gate: torch.Tensor,
     num_blocks: int,
     line_size: int,
@@ -80,7 +78,6 @@ def _run_sparse(
     fused_up_proj_gate_activation_sparse_triton(
         x,
         w,
-        b,
         gate,
         num_blocks,
         line_size,
@@ -92,7 +89,6 @@ def _run_sparse(
 def _run_opt(
     x: torch.Tensor,
     w: torch.Tensor,
-    b: torch.Tensor,
     gate: torch.Tensor,
     num_blocks: int,
     line_size: int,
@@ -101,7 +97,6 @@ def _run_opt(
     fused_up_proj_gate_activation_sparse_triton_opt(
         x,
         w,
-        b,
         gate,
         num_blocks,
         line_size,
@@ -113,7 +108,6 @@ def _run_opt(
 def _run_csr(
     x: torch.Tensor,
     w: torch.Tensor,
-    b: torch.Tensor,
     gate: torch.Tensor,
     num_blocks: int,
     line_size: int,
@@ -122,7 +116,6 @@ def _run_csr(
     fused_up_proj_gate_activation_sparse_triton_csr(
         x,
         w,
-        b,
         gate,
         num_blocks,
         line_size,
@@ -134,7 +127,6 @@ def _run_csr(
 def _run_sortpack(
     x: torch.Tensor,
     w: torch.Tensor,
-    b: torch.Tensor,
     gate: torch.Tensor,
     num_blocks: int,
     line_size: int,
@@ -143,7 +135,6 @@ def _run_sortpack(
     fused_up_proj_gate_activation_sparse_triton_sortpack(
         x,
         w,
-        b,
         gate,
         num_blocks,
         line_size,
@@ -253,7 +244,7 @@ def main():
 
     device = torch.device("cuda")
 
-    x_fp16, w_fp16, b_fp16, gate_fp32 = _generate_tensors(
+    x_fp16, w_fp16, gate_fp32 = _generate_tensors(
         args.batch,
         args.seq,
         args.hidden,
@@ -265,12 +256,11 @@ def main():
 
     # Warm-up each helper once outside the profiler
     if args.profile_dense:
-        _run_dense(x_fp16, w_fp16, b_fp16, gate_fp32, args.blocks, args.line)
+        _run_dense(x_fp16, w_fp16, gate_fp32, args.blocks, args.line)
     if args.profile_sparse:
         _run_sparse(
             x_fp16,
             w_fp16,
-            b_fp16,
             gate_fp32,
             args.blocks,
             args.line,
@@ -279,7 +269,6 @@ def main():
         _run_opt(
             x_fp16,
             w_fp16,
-            b_fp16,
             gate_fp32,
             args.blocks,
             args.line,
@@ -289,7 +278,6 @@ def main():
         _run_csr(
             x_fp16,
             w_fp16,
-            b_fp16,
             gate_fp32,
             args.blocks,
             args.line,
@@ -299,7 +287,6 @@ def main():
         _run_sortpack(
             x_fp16,
             w_fp16,
-            b_fp16,
             gate_fp32,
             args.blocks,
             args.line,
@@ -313,13 +300,12 @@ def main():
         for _ in range(args.iters):
             if args.profile_dense:
                 with record_function("DENSE_HELPER"):
-                    _run_dense(x_fp16, w_fp16, b_fp16, gate_fp32, args.blocks, args.line)
+                    _run_dense(x_fp16, w_fp16, gate_fp32, args.blocks, args.line)
             if args.profile_sparse:
                 with record_function("SPARSE_HELPER"):
                     _run_sparse(
                         x_fp16,
                         w_fp16,
-                        b_fp16,
                         gate_fp32,
                         args.blocks,
                         args.line,
@@ -329,7 +315,6 @@ def main():
                     _run_opt(
                         x_fp16,
                         w_fp16,
-                        b_fp16,
                         gate_fp32,
                         args.blocks,
                         args.line,
@@ -340,7 +325,6 @@ def main():
                     _run_csr(
                         x_fp16,
                         w_fp16,
-                        b_fp16,
                         gate_fp32,
                         args.blocks,
                         args.line,
@@ -351,7 +335,6 @@ def main():
                     _run_sortpack(
                         x_fp16,
                         w_fp16,
-                        b_fp16,
                         gate_fp32,
                         args.blocks,
                         args.line,

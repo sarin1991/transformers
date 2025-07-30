@@ -27,16 +27,18 @@ def _generate_tensors(
     *sparsity* – fraction of zeros in gate (0.9 → 10 % nnz)
     """
     inter_size = num_blocks * line_size
-    x_fp16 = torch.randn(batch_size, seq_len, inter_size, device=device, dtype=torch.float16)
+    batch_seq_size = batch_size * seq_len
+    x_fp16 = torch.randn(batch_seq_size, inter_size, device=device, dtype=torch.float16)
     weight_fp16 = torch.randn(inter_size, hidden_size, device=device, dtype=torch.float16)
 
-    gate = torch.rand(batch_size, seq_len, num_blocks, device=device, dtype=torch.float32)
+    gate = torch.rand(batch_seq_size, num_blocks, device=device, dtype=torch.float32)
     if sparsity > 0.0:
         gate[torch.rand_like(gate) < sparsity] = 0.0
 
-    # Zero out fully gated rows to mimic real pipeline
-    row_mask = (gate.view(-1, num_blocks).abs().sum(dim=1) != 0).view(batch_size, seq_len, 1)
-    x_fp16 = x_fp16 * row_mask.to(dtype=torch.float16)
+    # Zero out gated blocks to mimic real pipeline
+    x_fp16 = x_fp16.view(batch_seq_size, num_blocks, line_size)
+    x_fp16 = x_fp16 * gate.unsqueeze(-1).to(dtype=torch.float16)
+    x_fp16 = x_fp16.view(batch_seq_size, inter_size)
 
     return x_fp16, weight_fp16, gate
 

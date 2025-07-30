@@ -21,7 +21,6 @@ from typing import Optional
 def fused_up_proj_gate_activation_kernel_optimized(
     x_ptr,                       # (B·S, H)               float16
     up_weight_ptr,               # (H, line_size)         float16 – **single block slice**
-    up_bias_ptr,                 # (line_size,)           float16 – slice for this block
     gate_col_ptr,                # (B·S,)                 float32 – gate[:, nb]
     rows_ptr,                    # (K,)                   int32 row indices for this block
     output_ptr,                  # (B·S, num_blocks*L)    float32 – full output tensor
@@ -94,10 +93,7 @@ def fused_up_proj_gate_activation_kernel_optimized(
         w_block = tl.load(w_ptrs, mask=mask_h[:, None] & mask_ls[None, :], other=0.0)
         acc += tl.dot(x_block, w_block)
 
-    # Add bias & ReLU
-    bias_ptrs = up_bias_ptr + offs_ls
-    b = tl.load(bias_ptrs, mask=mask_ls, other=0.0)
-    acc += b[None, :]
+    # Apply ReLU
     acc = tl.where(acc > 0, acc, 0.0)
 
     # Apply gate
@@ -114,7 +110,6 @@ def fused_up_proj_gate_activation_kernel_optimized(
 def fused_up_proj_gate_activation_sparse_triton_optimized(
     x: torch.Tensor,
     up_weight: torch.Tensor,
-    up_bias: torch.Tensor,
     gate: torch.Tensor,
     num_blocks: int,
     line_size: int,
@@ -127,24 +122,23 @@ def fused_up_proj_gate_activation_sparse_triton_optimized(
     it can be dropped into existing debug / benchmark helpers.
     """
 
-    batch_size, seq_len, hidden_size = x.shape
+    batch_seq_size, hidden_size = x.shape
     intermediate_size = num_blocks * line_size
 
     # Validations
     assert up_weight.shape == (hidden_size, intermediate_size)
-    assert gate.shape == (batch_size, seq_len, num_blocks)
+    assert gate.shape == (batch_seq_size, num_blocks)
 
     supported_dtypes = (torch.float16, torch.bfloat16)
     assert x.dtype in supported_dtypes, "x must be fp16 or bf16"
     assert up_weight.dtype in supported_dtypes, "up_weight must be fp16 or bf16"
-    assert up_bias.dtype in supported_dtypes, "up_bias must be fp16 or bf16"
+
 
     if gate.dtype != torch.float32:
         gate = gate.float()
 
-    x_reshaped = x.contiguous().view(-1, hidden_size)          # (B·S, H)
-    gate_reshaped = gate.contiguous().view(-1, num_blocks)     # (B·S, NB)
-    batch_seq_size = x_reshaped.size(0)
+    x_reshaped = x.contiguous()          # (BS, H)
+    gate_reshaped = gate.contiguous()     # (BS, NB)
 
     # ------------------------------------------------------------------
     # Determine sparsity – fallback if too dense
@@ -152,7 +146,7 @@ def fused_up_proj_gate_activation_sparse_triton_optimized(
     gate_mask = gate_reshaped != 0
     nnz = int(gate_mask.sum().item())
     if nnz == 0:
-        return torch.zeros((batch_size, seq_len, intermediate_size), device=x.device, dtype=out_dtype)
+        return torch.zeros((batch_seq_size, intermediate_size), device=x.device, dtype=out_dtype)
 
     # ------------------------------------------------------------------
     # Sparse path using indexed kernel
@@ -173,11 +167,10 @@ def fused_up_proj_gate_activation_sparse_triton_optimized(
         if K == 0:
             continue
 
-        # Build weight & bias slice for this block (contiguous)
+        # Build weight slice for this block (contiguous)
         col_start = nb * line_size
         col_end = col_start + line_size
         w_slice = up_weight[:, col_start:col_end].contiguous()
-        b_slice = up_bias[col_start:col_end].contiguous()
 
         # Pointers we need
         gate_col_ptr = gate_reshaped[:, nb].contiguous()  # (B·S,) – contiguous column view
@@ -189,7 +182,6 @@ def fused_up_proj_gate_activation_sparse_triton_optimized(
         fused_up_proj_gate_activation_kernel_optimized[grid](
             x_reshaped,
             w_slice,
-            b_slice,
             gate_col_ptr,
             rows_nb,
             output,
@@ -201,4 +193,4 @@ def fused_up_proj_gate_activation_sparse_triton_optimized(
             out_dtype=tl.float16 if out_dtype == torch.float16 else tl.float32,
         )
 
-    return output.view(batch_size, seq_len, intermediate_size) 
+    return output  # already (BS, I) 

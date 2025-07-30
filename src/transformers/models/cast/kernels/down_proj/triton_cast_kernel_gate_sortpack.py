@@ -153,24 +153,23 @@ def fused_down_proj_sparse_triton_sortpack(
     gate: torch.Tensor,
     num_blocks: int,
     line_size: int,
-    GROUP_SIZE_R: int = 4,
     out_dtype: torch.dtype = torch.float32,
 ):
     """Sort-pack sparse helper for Cast down-projection.
 
     Args:
-        x:           (B, S, I)        – *float16* or *bfloat16*, with I = NB·LS
+        x:           (BS, I)        – *float16* or *bfloat16*, with I = NB·LS
         down_weight: (I, H)           – *float16*/*bfloat16* (pass Linear.weight)
-        gate:        (B, S, NB)       – *float32* gate tensor (non-zero → active)
+        gate:        (BS, NB)       – *float32* gate tensor (non-zero → active)
         num_blocks:  NB
         line_size:   LS
     """
 
-    batch_size, seq_len, intermediate_size = x.shape
+    batch_seq_size, intermediate_size = x.shape
     hidden_size = down_weight.shape[1]
 
     assert intermediate_size == num_blocks * line_size
-    assert gate.shape == (batch_size, seq_len, num_blocks)
+    assert gate.shape == (batch_seq_size, num_blocks)
 
     supported_dtypes = (torch.float16, torch.bfloat16)
     assert (
@@ -180,10 +179,9 @@ def fused_down_proj_sparse_triton_sortpack(
     if gate.dtype != torch.float32:
         gate = gate.float()
 
-    # Flatten
-    x_reshaped = x.contiguous().view(-1, intermediate_size)  # (B·S, I)
-    gate_reshaped = gate.contiguous().view(-1, num_blocks)    # (B·S, NB)
-    batch_seq_size = x_reshaped.size(0)
+    # Use inputs directly (already flattened)
+    x_reshaped = x.contiguous()  # (BS, I)
+    gate_reshaped = gate.contiguous()    # (BS, NB)
 
     # Build packed buffers
     mask = gate_reshaped > 0
@@ -191,7 +189,7 @@ def fused_down_proj_sparse_triton_sortpack(
     max_rows = int(block_counts.max().item())
 
     if max_rows == 0:
-        return torch.zeros((batch_size, seq_len, hidden_size), device=x.device, dtype=out_dtype)
+        return torch.zeros((batch_seq_size, hidden_size), device=x.device, dtype=out_dtype)
 
     gate_vals_sorted, row_idx_sorted = torch.sort(gate_reshaped, dim=0, descending=True)
     gate_vals = gate_vals_sorted[:max_rows, :].t().contiguous()  # (NB, max_rows)
@@ -233,4 +231,4 @@ def fused_down_proj_sparse_triton_sortpack(
         out_dtype=tl.float16 if out_dtype == torch.float16 else tl.float32,
     )
 
-    return output.view(batch_size, seq_len, hidden_size) 
+    return output  # already (BS, H) 
