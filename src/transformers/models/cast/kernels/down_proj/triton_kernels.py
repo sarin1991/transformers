@@ -122,16 +122,16 @@ def fused_down_proj_triton(
     """Fused dense down-projection using Triton.
 
     Args:
-        x:            (batch, seq_len, intermediate_size) – *float16* or *bfloat16*
+        x:            (batch_seq_size, intermediate_size) – *float16* or *bfloat16*
         down_weight:  (intermediate_size, hidden_size)    – *float16*/*bfloat16*  (pass ``model.down_proj.weight.t()``)
-        gate:         (batch, seq_len, num_blocks)        – *float32* (or any type, will be upcast)
+        gate:         (batch_seq_size, num_blocks)        – *float32* (or any type, will be upcast)
         num_blocks:   ``NB``
         line_size:    ``LS`` (``intermediate_size = NB·LS``)
 
     Returns:
-        Tensor (batch, seq_len, hidden_size) in *float32*
+        Tensor (batch_seq_size, hidden_size) in *float32*
     """
-    batch_size, seq_len, intermediate_size = x.shape
+    batch_seq_size, intermediate_size = x.shape
     hidden_size = down_weight.shape[1]
 
     # --------------------------------------------------------------
@@ -139,7 +139,7 @@ def fused_down_proj_triton(
     # --------------------------------------------------------------
     assert intermediate_size == num_blocks * line_size, "Mismatch intermediate size"
     assert down_weight.shape == (intermediate_size, hidden_size)
-    assert gate.shape == (batch_size, seq_len, num_blocks)
+    assert gate.shape == (batch_seq_size, num_blocks)
 
     supported_dtypes = (torch.float16, torch.bfloat16)
     assert (
@@ -150,9 +150,8 @@ def fused_down_proj_triton(
     if out_dtype not in (torch.float32, torch.float16):
         raise ValueError("out_dtype must be either torch.float32 (default) or torch.float16")
 
-    # Flatten x to 2-D (B·S, I)
-    batch_seq_size = batch_size * seq_len
-    x_reshaped = x.contiguous().view(batch_seq_size, intermediate_size)
+    # Use input directly (already flattened)
+    x_reshaped = x.contiguous()
 
     # Allocate output with desired dtype
     output = torch.empty((batch_seq_size, hidden_size), device=x.device, dtype=out_dtype)
@@ -179,15 +178,15 @@ def fused_down_proj_triton(
         out_dtype=tl.float16 if out_dtype == torch.float16 else tl.float32,
     )
 
-    return output.view(batch_size, seq_len, hidden_size)
+    return output  # already (BS, H)
 
 
 # ===============================================================
 # Debug / numerical accuracy checker (run with `python triton_kernels.py`)
 # ===============================================================
 
-def _make_sparse_gate(batch_size: int, seq_len: int, num_blocks: int, sparsity: float = 0.9):
-    gate = torch.rand(batch_size, seq_len, num_blocks, device="cuda", dtype=torch.float32)
+def _make_sparse_gate(batch_seq_size: int, num_blocks: int, sparsity: float = 0.9):
+    gate = torch.rand(batch_seq_size, num_blocks, device="cuda", dtype=torch.float32)
     mask = torch.rand_like(gate) < sparsity
     gate[mask] = 0.0
     return gate
@@ -209,15 +208,16 @@ def debug_large_scale(use_sparse_gate: bool = False):
         print(f"\nConfig: {batch_size}×{seq_len} / H={hidden_size} / NB={num_blocks} / LS={line_size}")
 
         # Random tensors
-        x_fp16 = torch.randn(batch_size, seq_len, intermediate_size, device="cuda", dtype=torch.float16)
+        batch_seq_size = batch_size * seq_len
+        x_fp16 = torch.randn(batch_seq_size, intermediate_size, device="cuda", dtype=torch.float16)
         down_weight_fp16 = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=torch.float16)
-        gate = _make_sparse_gate(batch_size, seq_len, num_blocks, sparsity=0.9 if use_sparse_gate else 0.0)
+        gate = _make_sparse_gate(batch_seq_size, num_blocks, sparsity=0.9 if use_sparse_gate else 0.0)
 
         # Zero-out gated blocks in x (simulate real pipeline)
-        # (B, S, I) where I = NB · LS
-        x_fp16 = x_fp16.view(batch_size, seq_len, num_blocks, line_size)
+        # (BS, I) where I = NB · LS
+        x_fp16 = x_fp16.view(batch_seq_size, num_blocks, line_size)
         x_fp16 = x_fp16 * gate.unsqueeze(-1).to(dtype=x_fp16.dtype)   # element-wise multiply
-        x_fp16 = x_fp16.view(batch_size, seq_len, intermediate_size)
+        x_fp16 = x_fp16.view(batch_seq_size, intermediate_size)
 
         # Reference PyTorch result (fp32)
         ref_fp32 = F.linear(x_fp16.float(), down_weight_fp16.t().float()).float()

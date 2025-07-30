@@ -37,18 +37,20 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
         print(f"\nConfig: {cfg}  |  Iters: {num_iters}")
 
         # Random tensors
-        x_fp16 = torch.randn(batch_size, seq_len, intermediate_size, device="cuda", dtype=torch.float16)
+        batch_seq_size = batch_size * seq_len
+        x_fp16 = torch.randn(batch_seq_size, intermediate_size, device="cuda", dtype=torch.float16)
         weight_fp16 = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=torch.float16)
         # Pre-compute transposed weight (fp16) – F.linear will return fp16, we cast to fp32 once.
         weight_t_fp16 = weight_fp16.t().contiguous()
-        gate_fp32 = torch.rand(batch_size, seq_len, num_blocks, device="cuda", dtype=torch.float32)
+        gate_fp32 = torch.rand(batch_seq_size, num_blocks, device="cuda", dtype=torch.float32)
         # Introduce sparsity (90 % zeros) to emulate typical gating pattern
         mask_sparse = torch.rand_like(gate_fp32) < 0.9
         gate_fp32[mask_sparse] = 0.0
 
-        # Zero-out fully gated rows in x for the PyTorch reference
-        row_mask = (gate_fp32.view(-1, num_blocks).abs().sum(dim=1) != 0).view(batch_size, seq_len, 1)
-        x_fp16_masked = x_fp16 * row_mask.to(dtype=torch.float16)
+        # Zero-out gated blocks in x for the PyTorch reference
+        x_fp16_masked = x_fp16.view(batch_seq_size, num_blocks, line_size)
+        x_fp16_masked = x_fp16_masked * gate_fp32.unsqueeze(-1).to(dtype=torch.float16)
+        x_fp16_masked = x_fp16_masked.view(batch_seq_size, intermediate_size)
 
         # ---- PyTorch timing (half×half→half) ----
         for _ in range(5):

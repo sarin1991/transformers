@@ -25,7 +25,7 @@ from triton_cast_kernel_gate_sortpack import (
 )
 @triton.jit
 def fused_up_proj_gate_activation_kernel(
-    x_ptr, up_weight_ptr, up_bias_ptr, gate_ptr, output_ptr,
+    x_ptr, up_weight_ptr, gate_ptr, output_ptr,
     batch_seq_size, hidden_size, num_blocks, line_size,
     stride_x_bs, stride_x_h,
     stride_w_h, stride_w_ls,
@@ -36,7 +36,7 @@ def fused_up_proj_gate_activation_kernel(
 ):
     """
     Fused kernel that performs:
-    1. up_proj = F.relu(x @ up_weight + up_bias)
+    1. up_proj = F.relu(x @ up_weight)
     2. output = up_proj * gate (reshaped and applied)
     
     Following proper Triton matrix multiplication pattern with gating logic added.
@@ -116,11 +116,7 @@ def fused_up_proj_gate_activation_kernel(
         x_ptrs += BLOCK_SIZE_H * stride_x_h
         w_ptrs += BLOCK_SIZE_H * stride_w_h
     
-    # Add bias and apply ReLU - keep in float32 for precision
-    # Load bias for the current block's line_size elements
-    bias_ptrs = up_bias_ptr + (pid_nb * line_size + offs_ls)
-    up_bias = tl.load(bias_ptrs, mask=mask_ls, other=0.0)
-    accumulator += up_bias[None, :]
+    # Apply ReLU - keep in float32 for precision
     accumulator = tl.where(accumulator > 0, accumulator, 0.0)
     
     # Apply gate activation: (BLOCK_SIZE_BS, BLOCK_SIZE_LS) * (BLOCK_SIZE_BS,) -> (BLOCK_SIZE_BS, BLOCK_SIZE_LS)
@@ -132,29 +128,27 @@ def fused_up_proj_gate_activation_kernel(
     tl.store(out_ptrs, output.to(out_dtype), mask=(mask_bs[:, None] & mask_ls[None, :]))
 
 
-def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks, line_size, out_dtype: torch.dtype = torch.float32):
+def fused_up_proj_gate_activation_triton(x, up_weight, gate, num_blocks, line_size, out_dtype: torch.dtype = torch.float32):
     """
     Fused Triton implementation that performs up projection and gate activation in one kernel.
     Args:
-        x: Input tensor of shape (batch_size, seq_len, hidden_size) – *float16* or *bfloat16*
+        x: Input tensor of shape (batch_seq_size, hidden_size) – *float16* or *bfloat16*
         up_weight: Up projection weight of shape (hidden_size, intermediate_size) – *float16*/*bfloat16*
-        up_bias: Up projection bias of shape (intermediate_size,) – *float16*/*bfloat16*
-        gate: Pre-calculated gate tensor of shape (batch_size, seq_len, num_blocks) - must be float32
+        gate: Pre-calculated gate tensor of shape (batch_seq_size, num_blocks) - must be float32
         num_blocks: Number of blocks
         line_size: Size of each line within a block
     Returns:
-        Output tensor of shape (batch_size, seq_len, intermediate_size), always float32
+        Output tensor of shape (batch_seq_size, intermediate_size), always float32
     """
-    batch_size, seq_len, hidden_size = x.shape
+    batch_seq_size, hidden_size = x.shape
     intermediate_size = num_blocks * line_size
     assert up_weight.shape == (hidden_size, intermediate_size), "Incompatible up_weight shape"
-    assert gate.shape == (batch_size, seq_len, num_blocks), "Incompatible gate shape"
+    assert gate.shape == (batch_seq_size, num_blocks), "Incompatible gate shape"
     
     # Check that inputs are correct dtypes (fp16 or bf16)
     supported_dtypes = (torch.float16, torch.bfloat16)
     assert x.dtype in supported_dtypes, f"Input x must be fp16/bf16, got {x.dtype}"
     assert up_weight.dtype in supported_dtypes, f"up_weight must be fp16/bf16, got {up_weight.dtype}"
-    assert up_bias.dtype in supported_dtypes, f"up_bias must be fp16/bf16, got {up_bias.dtype}"
     
     # Optionally upcast gate to float32 if not already
     if gate.dtype != torch.float32:
@@ -163,13 +157,9 @@ def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks
     # Ensure all inputs are contiguous
     x = x.contiguous()
     up_weight = up_weight.contiguous()
-    up_bias = up_bias.contiguous()
     gate = gate.contiguous()
-
-    # Reshape inputs to combine batch_size and seq_len
-    batch_seq_size = batch_size * seq_len
-    x_reshaped = x.view(batch_seq_size, hidden_size)
-    gate_reshaped = gate.view(batch_seq_size, num_blocks)
+    x_reshaped = x  # already (BS, H)
+    gate_reshaped = gate  # already (BS, NB)
 
     # Allocate output as 2D tensor with requested dtype
     output = torch.empty((batch_seq_size, num_blocks * line_size), 
@@ -183,7 +173,7 @@ def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks
     )
 
     fused_up_proj_gate_activation_kernel[grid](
-        x_reshaped, up_weight, up_bias, gate_reshaped, output,
+        x_reshaped, up_weight, gate_reshaped, output,
         batch_seq_size, hidden_size, num_blocks, line_size,
         x_reshaped.stride(0), x_reshaped.stride(1),
         up_weight.stride(0), up_weight.stride(1),
@@ -192,8 +182,7 @@ def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks
         out_dtype=tl.float16 if out_dtype == torch.float16 else tl.float32,
     )
 
-    # Reshape back to original shape
-    return output.view(batch_size, seq_len, intermediate_size)
+    return output  # already (BS, I)
 
 
 # ---------------------------------------------------------------
@@ -204,7 +193,6 @@ def fused_up_proj_gate_activation_triton(x, up_weight, up_bias, gate, num_blocks
 def fused_up_proj_gate_activation_sparse_triton(
     x: torch.Tensor,
     up_weight: torch.Tensor,
-    up_bias: torch.Tensor,
     gate: torch.Tensor,
     num_blocks: int,
     line_size: int,
@@ -220,7 +208,7 @@ def fused_up_proj_gate_activation_sparse_triton(
     Args:
         x:              ``(batch, seq_len, hidden_size)``, *float16*/*bfloat16*
         up_weight:      ``(hidden_size, intermediate_size)``, *float16*/*bfloat16*
-        up_bias:        ``(intermediate_size,)``, *float16*/*bfloat16*
+
         gate:           ``(batch, seq_len, num_blocks)``, *float32* or *float16/bf16*
         num_blocks:     number of blocks in the gated FFN
         line_size:      size of each block line (``intermediate_size = num_blocks * line_size``)
@@ -238,7 +226,7 @@ def fused_up_proj_gate_activation_sparse_triton(
     supported_dtypes = (torch.float16, torch.bfloat16)
     assert x.dtype in supported_dtypes, f"Input x must be fp16/bf16, got {x.dtype}"
     assert up_weight.dtype in supported_dtypes, f"up_weight must be fp16/bf16, got {up_weight.dtype}"
-    assert up_bias.dtype in supported_dtypes, f"up_bias must be fp16/bf16, got {up_bias.dtype}"
+
 
     if out_dtype not in (torch.float32, torch.float16):
         raise ValueError("out_dtype must be either torch.float32 (default) or torch.float16")
@@ -289,11 +277,10 @@ def fused_up_proj_gate_activation_sparse_triton(
         x_subset = x_reshaped.index_select(0, rows_nb).contiguous()       # (K, H)
         gate_subset = gate_reshaped[rows_nb, nb].unsqueeze(1).contiguous()  # (K, 1)
 
-        # Slice weights & bias for this block only
+        # Slice weights for this block only
         start_col = nb * line_size
         end_col = start_col + line_size
         w_slice = up_weight[:, start_col:end_col].contiguous()  # (H, L)
-        b_slice = up_bias[start_col:end_col].contiguous()       # (L,)
 
         K = x_subset.size(0)
 
@@ -308,7 +295,6 @@ def fused_up_proj_gate_activation_sparse_triton(
         fused_up_proj_gate_activation_kernel[grid](
             x_subset,                     # x_ptr
             w_slice,                      # up_weight_ptr
-            b_slice,                      # up_bias_ptr
             gate_subset,                  # gate_ptr
             out_subset,                   # output_ptr
             K,                            # batch_seq_size (== rows in this slice)
@@ -334,13 +320,13 @@ def fused_up_proj_gate_activation_sparse_triton(
 # ===============================================================
 
 
-def _make_sparse_gate(batch_size: int, seq_len: int, num_blocks: int, sparsity: float = 0.9):
+def _make_sparse_gate(batch_seq_size: int, num_blocks: int, sparsity: float = 0.9):
     """Utility: generate a gate tensor with given *sparsity* on CUDA.
 
     *sparsity* denotes the fraction of **zeros** (e.g. 0.9 → 10 % non-zero).
     Returns a `torch.float32` tensor on the current CUDA device.
     """
-    gate = torch.rand(batch_size, seq_len, num_blocks, device="cuda", dtype=torch.float32)
+    gate = torch.rand(batch_seq_size, num_blocks, device="cuda", dtype=torch.float32)
     if sparsity > 0.0:
         mask = torch.rand_like(gate) < sparsity  # True for zeros
         gate[mask] = 0.0
@@ -374,28 +360,27 @@ def debug_large_scale(use_sparse_gate: bool = False):
         print(f"\nConfig: {cfg}")
 
         # Random fp16 data (CUDA)
-        x_fp16 = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float16)
+        batch_seq_size = batch_size * seq_len
+        x_fp16 = torch.randn(batch_seq_size, hidden_size, device="cuda", dtype=torch.float16)
 
-        # Weight / bias: kernel expects (H, I); PyTorch linear expects (I, H)
+        # Weight: kernel expects (H, I); PyTorch linear expects (I, H)
         up_weight_fp16 = torch.randn(hidden_size, intermediate_size, device="cuda", dtype=torch.float16)
-        up_bias_fp16 = torch.randn(intermediate_size, device="cuda", dtype=torch.float16)
 
         # Gate
         if use_sparse_gate:
-            gate_fp32 = _make_sparse_gate(batch_size, seq_len, num_blocks, sparsity=0.9)  # 10% non-zero
+            gate_fp32 = _make_sparse_gate(batch_seq_size, num_blocks, sparsity=0.9)  # 10% non-zero
         else:
-            gate_fp32 = torch.rand(batch_size, seq_len, num_blocks, device="cuda", dtype=torch.float32)
+            gate_fp32 = torch.rand(batch_seq_size, num_blocks, device="cuda", dtype=torch.float32)
 
         # PyTorch reference (float32)
-        up_proj_fp32 = F.relu(F.linear(x_fp16.float(), up_weight_fp16.t().float(), up_bias_fp16.float()))
-        ref_reshaped = up_proj_fp32.view(batch_size, seq_len, num_blocks, line_size)
-        ref_fp32 = (ref_reshaped * gate_fp32.unsqueeze(-1)).view(batch_size, seq_len, intermediate_size)
+        up_proj_fp32 = F.relu(F.linear(x_fp16.float(), up_weight_fp16.t().float()))
+        ref_reshaped = up_proj_fp32.view(batch_seq_size, num_blocks, line_size)
+        ref_fp32 = (ref_reshaped * gate_fp32.unsqueeze(-1)).view(batch_seq_size, intermediate_size)
 
         # Dense Triton helper
         out_dense = fused_up_proj_gate_activation_triton(
             x_fp16,
             up_weight_fp16,
-            up_bias_fp16,
             gate_fp32,
             num_blocks,
             line_size,
@@ -405,7 +390,6 @@ def debug_large_scale(use_sparse_gate: bool = False):
         out_sparse = fused_up_proj_gate_activation_sparse_triton(
             x_fp16,
             up_weight_fp16,
-            up_bias_fp16,
             gate_fp32,
             num_blocks,
             line_size,
@@ -415,7 +399,6 @@ def debug_large_scale(use_sparse_gate: bool = False):
         out_opt = fused_up_proj_gate_activation_sparse_triton_opt(
             x_fp16,
             up_weight_fp16,
-            up_bias_fp16,
             gate_fp32,
             num_blocks,
             line_size,
@@ -425,7 +408,6 @@ def debug_large_scale(use_sparse_gate: bool = False):
         out_csr = fused_up_proj_gate_activation_sparse_triton_csr(
             x_fp16,
             up_weight_fp16,
-            up_bias_fp16,
             gate_fp32,
             num_blocks,
             line_size,
@@ -435,7 +417,6 @@ def debug_large_scale(use_sparse_gate: bool = False):
         out_sortpack = fused_up_proj_gate_activation_sparse_triton_sortpack(
             x_fp16,
             up_weight_fp16,
-            up_bias_fp16,
             gate_fp32,
             num_blocks,
             line_size,

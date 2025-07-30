@@ -21,7 +21,7 @@ import triton.language as tl
 )
 @triton.jit
 def fused_up_proj_gate_sortpack_kernel(
-    x_ptr, w_ptr, b_ptr,
+    x_ptr, w_ptr,
     row_idx_ptr, gate_vals_ptr,        # (NB, max_rows) column-major (row-major in memory)
     output_ptr,
     # sizes
@@ -106,10 +106,7 @@ def fused_up_proj_gate_sortpack_kernel(
         w_block = tl.load(w_ptrs, mask=mask_h[:, None] & mask_ls[None, :], other=0.0)
         acc += tl.dot(x_block, w_block)
 
-    # Add bias and activation (ReLU)
-    b_ptrs = b_ptr + global_cols
-    bias   = tl.load(b_ptrs, mask=mask_ls, other=0.0)
-    acc += bias[None, :]
+    # Apply activation (ReLU)
     acc = tl.where(acc > 0, acc, 0.0)
 
     # Apply gate and write back
@@ -126,11 +123,9 @@ def fused_up_proj_gate_sortpack_kernel(
 def fused_up_proj_gate_activation_sparse_triton_sortpack(
     x: torch.Tensor,
     up_weight: torch.Tensor,
-    up_bias: torch.Tensor,
     gate: torch.Tensor,
     num_blocks: int,
     line_size: int,
-    GROUP_SIZE_R: int = 4,
     zero_init: bool = True,
     out_dtype: torch.dtype = torch.float32,
 ):
@@ -140,26 +135,25 @@ def fused_up_proj_gate_activation_sparse_triton_sortpack(
     Triton kernel and a `torch.sort` pre-pass instead of a CSR writer kernel.
     """
 
-    batch_size, seq_len, hidden_size = x.shape
+    batch_seq_size, hidden_size = x.shape
     intermediate_size = num_blocks * line_size
 
-    # Shape / dtype validation (same as the original helpers)
+    # Shape / dtype validation
     assert up_weight.shape == (hidden_size, intermediate_size)
-    assert gate.shape == (batch_size, seq_len, num_blocks)
+    assert gate.shape == (batch_seq_size, num_blocks)
 
     supported_dtypes = (torch.float16, torch.bfloat16)
     assert (
-        x.dtype in supported_dtypes and up_weight.dtype in supported_dtypes and up_bias.dtype in supported_dtypes
-    ), "x, up_weight, up_bias must be fp16 or bf16"
+        x.dtype in supported_dtypes and up_weight.dtype in supported_dtypes
+    ), "x, up_weight must be fp16 or bf16"
 
     # Promote gate to fp32 for better precision in sorting / multiplication
     if gate.dtype != torch.float32:
         gate = gate.float()
 
-    # Flatten views (contiguous)
-    x_reshaped    = x.contiguous().view(-1, hidden_size)        # (B*S, H)
-    gate_reshaped = gate.contiguous().view(-1, num_blocks)       # (B*S, NB)
-    batch_seq_size = x_reshaped.size(0)
+    # Use inputs directly (already flattened)
+    x_reshaped    = x.contiguous()        # (BS, H)
+    gate_reshaped = gate.contiguous()     # (BS, NB)
 
     # ------------------------------------------------------------------
     # Build sort-packed buffers on the GPU (entirely with PyTorch ops)
@@ -170,7 +164,7 @@ def fused_up_proj_gate_activation_sparse_triton_sortpack(
 
     # Early exit: gate is entirely zero
     if max_rows == 0:
-        return torch.zeros((batch_size, seq_len, intermediate_size), device=x.device, dtype=out_dtype)
+        return torch.zeros((batch_seq_size, intermediate_size), device=x.device, dtype=out_dtype)
 
     # Sort each column in descending order – positive values first.
     gate_vals_sorted, row_idx_sorted = torch.sort(gate_reshaped, dim=0, descending=True)
@@ -212,7 +206,6 @@ def fused_up_proj_gate_activation_sparse_triton_sortpack(
     fused_up_proj_gate_sortpack_kernel[grid](
         x_reshaped,
         up_weight,
-        up_bias,
         row_idx_flat,
         gate_vals_flat,
         output,
@@ -224,4 +217,4 @@ def fused_up_proj_gate_activation_sparse_triton_sortpack(
         out_dtype=tl.float16 if out_dtype == torch.float16 else tl.float32,
     )
 
-    return output.view(batch_size, seq_len, intermediate_size) 
+    return output  # already (BS, I) 

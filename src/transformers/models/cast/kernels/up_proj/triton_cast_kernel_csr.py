@@ -21,7 +21,6 @@ from typing import Tuple
 def fused_up_proj_gate_csr_kernel(
     x_ptr,                       # (B·S, H)             fp16
     w_ptr,                       # (H, I)               fp16   (full matrix)
-    b_ptr,                       # (I,)                 fp16
     rows_index_ptr,              # (N,)                 int32
     gates_val_ptr,               # (N,)                 fp32
     block_start_offsets_ptr,     # (NB+1,)              int32
@@ -104,10 +103,7 @@ def fused_up_proj_gate_csr_kernel(
         w_block = tl.load(w_ptrs, mask=mask_h[:, None] & mask_ls[None, :], other=0.0)
         acc += tl.dot(x_block, w_block)
 
-    # Bias, relu
-    b_ptrs = b_ptr + global_cols
-    bias = tl.load(b_ptrs, mask=mask_ls, other=0.0)
-    acc += bias[None, :]
+    # Apply relu
     acc = tl.where(acc > 0, acc, 0.0)
 
     # Apply gate
@@ -124,7 +120,6 @@ def fused_up_proj_gate_csr_kernel(
 def fused_up_proj_gate_activation_sparse_triton_csr(
     x: torch.Tensor,
     up_weight: torch.Tensor,
-    up_bias: torch.Tensor,
     gate: torch.Tensor,
     num_blocks: int,
     line_size: int,
@@ -134,25 +129,24 @@ def fused_up_proj_gate_activation_sparse_triton_csr(
 ):
     """Sparse helper using CSR buffers and single-axis grid launch."""
 
-    batch_size, seq_len, hidden_size = x.shape
+    batch_seq_size, hidden_size = x.shape
     intermediate_size = num_blocks * line_size
 
     # Validate
     assert up_weight.shape == (hidden_size, intermediate_size)
-    assert gate.shape == (batch_size, seq_len, num_blocks)
+    assert gate.shape == (batch_seq_size, num_blocks)
 
     supported_dtypes = (torch.float16, torch.bfloat16)
     assert x.dtype in supported_dtypes, "x must be fp16 or bf16"
     assert up_weight.dtype in supported_dtypes, "up_weight must be fp16 or bf16"
-    assert up_bias.dtype in supported_dtypes, "up_bias must be fp16 or bf16"
+
 
     if gate.dtype != torch.float32:
         gate = gate.float()
 
-    # Flatten views
-    x_reshaped = x.contiguous().view(-1, hidden_size)           # (B*S, H)
-    gate_reshaped = gate.contiguous().view(-1, num_blocks)      # (B*S, NB)
-    batch_seq_size = x_reshaped.size(0)
+    # Use inputs directly (already flattened)
+    x_reshaped = x.contiguous()           # (BS, H)
+    gate_reshaped = gate.contiguous()     # (BS, NB)
 
     # Build CSR buffers
     rows_list = []
@@ -172,7 +166,7 @@ def fused_up_proj_gate_activation_sparse_triton_csr(
     N_total = block_start_offsets[-1]
     if N_total == 0:
         # all gates zero
-        return torch.zeros((batch_size, seq_len, intermediate_size), device=x.device, dtype=out_dtype)
+        return torch.zeros((batch_seq_size, intermediate_size), device=x.device, dtype=out_dtype)
 
     rows_index = torch.cat(rows_list).contiguous().to(torch.int32)
     gates_index = torch.cat(gates_list).contiguous().to(torch.float32)
@@ -205,7 +199,6 @@ def fused_up_proj_gate_activation_sparse_triton_csr(
     fused_up_proj_gate_csr_kernel[grid](
         x_reshaped,
         up_weight,
-        up_bias,
         rows_index,
         gates_index,
         block_start_offsets,
@@ -218,4 +211,4 @@ def fused_up_proj_gate_activation_sparse_triton_csr(
         out_dtype=tl.float16 if out_dtype == torch.float16 else tl.float32,
     )
 
-    return output.view(batch_size, seq_len, intermediate_size) 
+    return output  # already (BS, I) 

@@ -42,26 +42,26 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
         print(f"\nConfig: {cfg}  |  Iters: {num_iters}")
 
         # Random tensors
-        x_fp16 = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float16)
+        batch_seq_size = batch_size * seq_len
+        x_fp16 = torch.randn(batch_seq_size, hidden_size, device="cuda", dtype=torch.float16)
         up_weight_fp16 = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=torch.float16)
-        up_bias_fp16 = torch.randn(intermediate_size, device="cuda", dtype=torch.float16)
-        gate_fp32 = torch.rand(batch_size, seq_len, num_blocks, device="cuda", dtype=torch.float32)
+        gate_fp32 = torch.rand(batch_seq_size, num_blocks, device="cuda", dtype=torch.float32)
 
         # ---- PyTorch timing ----
         # Warm-up for PyTorch (5 runs)
         for _ in range(5):
-            up_proj_fp16 = F.relu(F.linear(x_fp16, up_weight_fp16, up_bias_fp16)).float()
-            up_proj_reshaped = up_proj_fp16.view(batch_size, seq_len, num_blocks, line_size)
-            _ = (up_proj_reshaped * gate_fp32.unsqueeze(-1)).view(batch_size, seq_len, intermediate_size)
+            up_proj_fp16 = F.relu(F.linear(x_fp16, up_weight_fp16)).float()
+            up_proj_reshaped = up_proj_fp16.view(batch_seq_size, num_blocks, line_size)
+            _ = (up_proj_reshaped * gate_fp32.unsqueeze(-1)).view(batch_seq_size, intermediate_size)
         torch.cuda.synchronize()
 
         start_pt = torch.cuda.Event(enable_timing=True)
         end_pt = torch.cuda.Event(enable_timing=True)
         start_pt.record(torch.cuda.current_stream())
         for _ in range(num_iters):
-            up_proj_fp16 = F.relu(F.linear(x_fp16, up_weight_fp16, up_bias_fp16)).float()
-            up_proj_reshaped = up_proj_fp16.view(batch_size, seq_len, num_blocks, line_size)
-            _ = (up_proj_reshaped * gate_fp32.unsqueeze(-1)).view(batch_size, seq_len, intermediate_size)
+            up_proj_fp16 = F.relu(F.linear(x_fp16, up_weight_fp16)).float()
+            up_proj_reshaped = up_proj_fp16.view(batch_seq_size, num_blocks, line_size)
+            _ = (up_proj_reshaped * gate_fp32.unsqueeze(-1)).view(batch_seq_size, intermediate_size)
         end_pt.record(torch.cuda.current_stream())
         torch.cuda.synchronize()
         torch_ms = start_pt.elapsed_time(end_pt) / num_iters
@@ -74,7 +74,6 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                 _ = fused_up_proj_gate_activation_triton(
                     x_fp16,
                     up_weight_fp16.t(),
-                    up_bias_fp16,
                     gate_fp32,
                     num_blocks,
                     line_size,
@@ -89,7 +88,6 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                 _ = fused_up_proj_gate_activation_triton(
                     x_fp16,
                     up_weight_fp16.t(),
-                    up_bias_fp16,
                     gate_fp32,
                     num_blocks,
                     line_size,
@@ -112,7 +110,6 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                 _ = fused_up_proj_gate_activation_sparse_triton(
                     x_fp16,
                     up_weight_fp16.t(),
-                    up_bias_fp16,
                     gate_sparse,
                     num_blocks,
                     line_size,
@@ -127,7 +124,6 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                 _ = fused_up_proj_gate_activation_sparse_triton(
                     x_fp16,
                     up_weight_fp16.t(),
-                    up_bias_fp16,
                     gate_sparse,
                     num_blocks,
                     line_size,
@@ -144,7 +140,6 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                 _ = fused_up_proj_gate_activation_sparse_triton_opt(
                     x_fp16,
                     up_weight_fp16.t(),
-                    up_bias_fp16,
                     gate_sparse,
                     num_blocks,
                     line_size,
@@ -160,7 +155,6 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                 _ = fused_up_proj_gate_activation_sparse_triton_opt(
                     x_fp16,
                     up_weight_fp16.t(),
-                    up_bias_fp16,
                     gate_sparse,
                     num_blocks,
                     line_size,
@@ -178,7 +172,6 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                 _ = fused_up_proj_gate_activation_sparse_triton_csr(
                     x_fp16,
                     up_weight_fp16.t(),
-                    up_bias_fp16,
                     gate_sparse,
                     num_blocks,
                     line_size,
@@ -194,7 +187,6 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                 _ = fused_up_proj_gate_activation_sparse_triton_csr(
                     x_fp16,
                     up_weight_fp16.t(),
-                    up_bias_fp16,
                     gate_sparse,
                     num_blocks,
                     line_size,
@@ -214,7 +206,6 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
             _ = fused_up_proj_gate_activation_sparse_triton_sortpack(
                 x_fp16,
                 up_weight_fp16.t(),
-                up_bias_fp16,
                 gate_sparse,
                 num_blocks,
                 line_size,
@@ -230,7 +221,6 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
             _ = fused_up_proj_gate_activation_sparse_triton_sortpack(
                 x_fp16,
                 up_weight_fp16.t(),
-                up_bias_fp16,
                 gate_sparse,
                 num_blocks,
                 line_size,

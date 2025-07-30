@@ -168,7 +168,6 @@ def fused_weight_grad_sparse_triton_sortpack(
     gate: torch.Tensor,
     num_blocks: int,
     line_size: int,
-    GROUP_SIZE_R: int = 4,
     out_dtype: torch.dtype = torch.float32,
 ):
     """Sort-pack sparse helper to compute dW = intermediateᵀ · other.
