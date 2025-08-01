@@ -200,7 +200,7 @@ def _make_sparse_gate(batch_seq_size: int, num_blocks: int, sparsity: float = 0.
     return gate
 
 
-def debug_large_scale(use_sparse_gate: bool = False):
+def debug_large_scale(use_sparse_gate: bool = False, use_fp32: bool = False):
     """Run numerical correctness checks on several shapes."""
     configs = [
         (4, 8, 128, 4, 32),      # (B, S, H, NB, LS)
@@ -217,23 +217,24 @@ def debug_large_scale(use_sparse_gate: bool = False):
 
         # Random tensors
         batch_seq_size = batch_size * seq_len
-        x_fp16 = torch.randn(batch_seq_size, intermediate_size, device="cuda", dtype=torch.float16)
-        down_weight_fp16 = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=torch.float16)
+        dtype = torch.float32 if use_fp32 else torch.float16
+        x = torch.randn(batch_seq_size, intermediate_size, device="cuda", dtype=dtype)
+        down_weight = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=dtype)
         gate = _make_sparse_gate(batch_seq_size, num_blocks, sparsity=0.9 if use_sparse_gate else 0.0)
 
         # Zero-out gated blocks in x (simulate real pipeline)
         # (BS, I) where I = NB · LS
-        x_fp16 = x_fp16.view(batch_seq_size, num_blocks, line_size)
-        x_fp16 = x_fp16 * gate.unsqueeze(-1).to(dtype=x_fp16.dtype)   # element-wise multiply
-        x_fp16 = x_fp16.view(batch_seq_size, intermediate_size)
+        x = x.view(batch_seq_size, num_blocks, line_size)
+        x = x * gate.unsqueeze(-1).to(dtype=x.dtype)   # element-wise multiply
+        x = x.view(batch_seq_size, intermediate_size)
 
         # Reference PyTorch result (fp32)
-        ref_fp32 = F.linear(x_fp16.float(), down_weight_fp16.t().float()).float()
+        ref_fp32 = F.linear(x.float(), down_weight.t().float()).float()
 
         # Triton dense helper
         out_dense = fused_down_proj_triton(
-            x_fp16,
-            down_weight_fp16,
+            x,
+            down_weight,
             gate,
             num_blocks,
             line_size,
@@ -241,8 +242,8 @@ def debug_large_scale(use_sparse_gate: bool = False):
 
         # Triton SortPack sparse helper
         out_sortpack = fused_down_proj_sparse_triton_sortpack(
-            x_fp16,
-            down_weight_fp16,
+            x,
+            down_weight,
             gate,
             num_blocks,
             line_size,
@@ -277,5 +278,11 @@ if __name__ == "__main__":
         exit(1)
 
     print("✅ Triton down-proj kernel loaded successfully.")
-    debug_large_scale(use_sparse_gate=False)
-    debug_large_scale(use_sparse_gate=True) 
+    
+    print("\n=== Testing with FP16 ===")
+    debug_large_scale(use_sparse_gate=False, use_fp32=False)
+    debug_large_scale(use_sparse_gate=True, use_fp32=False)
+    
+    print("\n=== Testing with FP32 ===")
+    debug_large_scale(use_sparse_gate=False, use_fp32=True)
+    debug_large_scale(use_sparse_gate=True, use_fp32=True) 
