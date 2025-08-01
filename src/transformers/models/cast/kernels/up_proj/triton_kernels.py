@@ -32,6 +32,7 @@ def fused_up_proj_gate_activation_kernel(
     stride_g_bs, stride_g_nb,
     stride_out_bs, stride_out_ls,
     out_dtype: tl.constexpr,
+    apply_gate: tl.constexpr,
     BLOCK_SIZE_BS: tl.constexpr, BLOCK_SIZE_H: tl.constexpr, BLOCK_SIZE_LS: tl.constexpr,
 ):
     """
@@ -119,8 +120,11 @@ def fused_up_proj_gate_activation_kernel(
     # Apply ReLU - keep in float32 for precision
     accumulator = tl.where(accumulator > 0, accumulator, 0.0)
     
-    # Apply gate activation: (BLOCK_SIZE_BS, BLOCK_SIZE_LS) * (BLOCK_SIZE_BS,) -> (BLOCK_SIZE_BS, BLOCK_SIZE_LS)
-    output = accumulator * g[:, None]
+    # Optionally apply gate activation
+    if apply_gate:
+        output = accumulator * g[:, None]
+    else:
+        output = accumulator
     
     # Store output
     out_ptrs = output_ptr + (offs_bs[:, None] * stride_out_bs + 
@@ -128,7 +132,7 @@ def fused_up_proj_gate_activation_kernel(
     tl.store(out_ptrs, output.to(out_dtype), mask=(mask_bs[:, None] & mask_ls[None, :]))
 
 
-def fused_up_proj_gate_activation_triton(x, up_weight, gate, num_blocks, line_size, out_dtype: torch.dtype = torch.float32):
+def fused_up_proj_gate_activation_triton(x, up_weight, gate, num_blocks, line_size, out_dtype: torch.dtype = torch.float32, apply_gate: bool = True):
     """
     Fused Triton implementation that performs up projection and gate activation in one kernel.
     Args:
@@ -188,6 +192,7 @@ def fused_up_proj_gate_activation_triton(x, up_weight, gate, num_blocks, line_si
         gate_reshaped.stride(0), gate_reshaped.stride(1),
         output.stride(0), output.stride(1),
         out_dtype=triton_out_dtype,
+        apply_gate=apply_gate,
     )
 
     return output  # already (BS, I)
@@ -205,6 +210,7 @@ def fused_up_proj_gate_activation_sparse_triton(
     num_blocks: int,
     line_size: int,
     out_dtype: torch.dtype = torch.float32,
+    apply_gate: bool = True,
 ):
     """Sparse Triton helper for up-projection + gating + activation.
 
@@ -313,6 +319,7 @@ def fused_up_proj_gate_activation_sparse_triton(
             gate_subset.stride(0), gate_subset.stride(1),
             out_subset.stride(0), out_subset.stride(1),
             out_dtype=tl.float16 if out_dtype == torch.float16 else tl.float32,
+            apply_gate=apply_gate,
         )
 
         # Scatter results back into the full output tensor

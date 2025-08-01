@@ -30,6 +30,7 @@ def fused_up_proj_gate_activation_kernel_optimized(
     stride_w_h,                 # w_slice stride(0)
     stride_out_bs, stride_out_ls,# output strides
     out_dtype: tl.constexpr,
+    apply_gate: tl.constexpr,
     BLOCK_SIZE_BS: tl.constexpr, BLOCK_SIZE_H: tl.constexpr, BLOCK_SIZE_LS: tl.constexpr,
 ):
     """Compute fused up-proj * gate for selected rows of **one** block.
@@ -96,8 +97,9 @@ def fused_up_proj_gate_activation_kernel_optimized(
     # Apply ReLU
     acc = tl.where(acc > 0, acc, 0.0)
 
-    # Apply gate
-    acc *= g_vals[:, None]
+    # Optionally apply gate
+    if apply_gate:
+        acc *= g_vals[:, None]
 
     # Store back to output – need global row index
     tl.store(out_ptrs, acc.to(out_dtype), mask=mask_bs_valid[:, None] & mask_ls[None, :])
@@ -115,6 +117,7 @@ def fused_up_proj_gate_activation_sparse_triton_optimized(
     line_size: int,
     zero_init: bool = True,
     out_dtype: torch.dtype = torch.float32,
+    apply_gate: bool = True,
 ):
     """Sparse variant that offloads gather & scatter into the Triton kernel.
 
@@ -199,6 +202,7 @@ def fused_up_proj_gate_activation_sparse_triton_optimized(
             w_slice.stride(0),
             output.stride(0), output.stride(1),
             out_dtype=triton_out_dtype,
+            apply_gate=apply_gate,
         )
 
     return output  # already (BS, I) 

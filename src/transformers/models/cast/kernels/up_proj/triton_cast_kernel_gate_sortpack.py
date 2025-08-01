@@ -33,6 +33,7 @@ def fused_up_proj_gate_sortpack_kernel(
     stride_out_bs, stride_out_i,
     # meta-params
     out_dtype: tl.constexpr,
+    apply_gate: tl.constexpr,
     BLOCK_SIZE_BS: tl.constexpr, BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_LS: tl.constexpr, GROUP_SIZE_R: tl.constexpr,
 ):
@@ -109,8 +110,9 @@ def fused_up_proj_gate_sortpack_kernel(
     # Apply activation (ReLU)
     acc = tl.where(acc > 0, acc, 0.0)
 
-    # Apply gate and write back
-    acc *= gate_vals[:, None]
+    # Optionally apply gate before write-back
+    if apply_gate:
+        acc *= gate_vals[:, None]
 
     out_ptrs = output_ptr + row_indices[:, None] * stride_out_bs + global_cols[None, :] * stride_out_i
     tl.store(out_ptrs, acc.to(out_dtype), mask=mask_bs[:, None] & mask_ls[None, :])
@@ -128,6 +130,7 @@ def fused_up_proj_gate_activation_sparse_triton_sortpack(
     line_size: int,
     zero_init: bool = True,
     out_dtype: torch.dtype = torch.float32,
+    apply_gate: bool = True,
 ):
     """Sort-pack (ELLPACK) sparse fused MLP helper.
 
@@ -223,6 +226,7 @@ def fused_up_proj_gate_activation_sparse_triton_sortpack(
         max_rows,  # stride between blocks in row_idx / gate_vals
         output.stride(0), output.stride(1),
         out_dtype=triton_out_dtype,
+        apply_gate=apply_gate,
     )
 
     return output  # already (BS, I) 

@@ -34,6 +34,7 @@ def fused_up_proj_gate_csr_kernel(
     stride_out_bs, stride_out_i, # output
     # Meta
     out_dtype: tl.constexpr,
+    apply_gate: tl.constexpr,
     BLOCK_SIZE_BS: tl.constexpr, BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_LS: tl.constexpr, GROUP_SIZE_R: tl.constexpr,
 ):
@@ -106,8 +107,9 @@ def fused_up_proj_gate_csr_kernel(
     # Apply relu
     acc = tl.where(acc > 0, acc, 0.0)
 
-    # Apply gate
-    acc *= gate_vals[:, None]
+    # Optionally apply gate
+    if apply_gate:
+        acc *= gate_vals[:, None]
 
     # Store
     out_ptrs = output_ptr + row_indices[:, None] * stride_out_bs + global_cols[None, :] * stride_out_i
@@ -125,6 +127,7 @@ def fused_up_proj_gate_activation_sparse_triton_csr(
     line_size: int,
     zero_init: bool = True,
     out_dtype: torch.dtype = torch.float32,
+    apply_gate: bool = True,
 ):
     """Sparse helper using CSR buffers and single-axis grid launch."""
 
@@ -216,6 +219,7 @@ def fused_up_proj_gate_activation_sparse_triton_csr(
         up_weight.stride(0), up_weight.stride(1),
         output.stride(0), output.stride(1),
         out_dtype=triton_out_dtype,
+        apply_gate=apply_gate,
     )
 
     return output  # already (BS, I) 
