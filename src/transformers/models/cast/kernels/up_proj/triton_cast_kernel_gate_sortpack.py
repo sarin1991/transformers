@@ -142,10 +142,10 @@ def fused_up_proj_gate_activation_sparse_triton_sortpack(
     assert up_weight.shape == (hidden_size, intermediate_size)
     assert gate.shape == (batch_seq_size, num_blocks)
 
-    supported_dtypes = (torch.float16, torch.bfloat16)
+    supported_dtypes = (torch.float16, torch.bfloat16, torch.float32)
     assert (
         x.dtype in supported_dtypes and up_weight.dtype in supported_dtypes
-    ), "x, up_weight must be fp16 or bf16"
+    ), f"x, up_weight must be fp16/bf16/fp32, got x={x.dtype}, up_weight={up_weight.dtype}"
 
     # Promote gate to fp32 for better precision in sorting / multiplication
     if gate.dtype != torch.float32:
@@ -203,6 +203,14 @@ def fused_up_proj_gate_activation_sparse_triton_sortpack(
     # ------------------------------------------------------------------
     # Launch Triton kernel
     # ------------------------------------------------------------------
+    # Map torch dtypes to triton dtypes
+    dtype_map = {
+        torch.float16: tl.float16,
+        torch.bfloat16: tl.bfloat16,
+        torch.float32: tl.float32,
+    }
+    triton_out_dtype = dtype_map[out_dtype]
+
     fused_up_proj_gate_sortpack_kernel[grid](
         x_reshaped,
         up_weight,
@@ -214,7 +222,7 @@ def fused_up_proj_gate_activation_sparse_triton_sortpack(
         up_weight.stride(0), up_weight.stride(1),
         max_rows,  # stride between blocks in row_idx / gate_vals
         output.stride(0), output.stride(1),
-        out_dtype=tl.float16 if out_dtype == torch.float16 else tl.float32,
+        out_dtype=triton_out_dtype,
     )
 
     return output  # already (BS, I) 

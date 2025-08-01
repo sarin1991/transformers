@@ -40,7 +40,7 @@ def fused_weight_grad_sortpack_kernel(
     inter_ptr, other_ptr,
     row_idx_ptr,               # (NB, max_rows)
     row_counts_ptr,            # (NB,) – number of active rows per block
-    output_ptr,                # (I, H) – fp32/fp16
+    output_ptr,                # (I, H) – fp16/bf16/fp32
     # sizes
     hidden_size: tl.constexpr, line_size: tl.constexpr, max_rows: tl.constexpr,
     # strides
@@ -173,8 +173,8 @@ def fused_weight_grad_sparse_triton_sortpack(
     """Sort-pack sparse helper to compute dW = intermediateᵀ · other.
 
     Expected input layout (flattened batch-sequence):
-        intermediate : (BS, I)  – fp16/bf16 with I = NB·LS (already gated)
-        other        : (BS, H)  – fp16/bf16
+        intermediate : (BS, I)  – fp16/bf16/fp32 with I = NB·LS (already gated)
+        other        : (BS, H)  – fp16/bf16/fp32
         gate         : (BS, NB) – fp32 mask (non-zero → active)
 
     where BS = batch_size × sequence_length.
@@ -190,8 +190,8 @@ def fused_weight_grad_sparse_triton_sortpack(
     assert gate.shape == (batch_seq, num_blocks)
     assert I == num_blocks * line_size, "line_size must divide intermediate size"
 
-    supported = (torch.float16, torch.bfloat16)
-    assert intermediate.dtype in supported and other.dtype in supported
+    supported = (torch.float16, torch.bfloat16, torch.float32)
+    assert intermediate.dtype in supported and other.dtype in supported, f"Unsupported dtype: intermediate={intermediate.dtype}, other={other.dtype}. Supported: {supported}"
 
     if gate.dtype != torch.float32:
         gate = gate.float()
@@ -231,6 +231,14 @@ def fused_weight_grad_sparse_triton_sortpack(
         num_pid_per_block = hidden_chunks * ls_groups * G_R
         return (num_pid_per_block * num_blocks,)
 
+    # Map torch dtypes to triton dtypes
+    dtype_map = {
+        torch.float16: tl.float16,
+        torch.bfloat16: tl.bfloat16, 
+        torch.float32: tl.float32,
+    }
+    triton_out_dtype = dtype_map[out_dtype]
+
     fused_weight_grad_sortpack_kernel[grid](
         inter_flat,
         other_flat,
@@ -244,7 +252,7 @@ def fused_weight_grad_sparse_triton_sortpack(
         stride_other_bs, stride_other_h,
         max_rows,
         output.stride(0), output.stride(1),
-        out_dtype=tl.float16 if out_dtype == torch.float16 else tl.float32,
+        out_dtype=triton_out_dtype,
     )
 
     return output 

@@ -123,7 +123,6 @@ def fused_up_proj_gate_activation_sparse_triton_csr(
     gate: torch.Tensor,
     num_blocks: int,
     line_size: int,
-    GROUP_SIZE_R: int = 4,
     zero_init: bool = True,
     out_dtype: torch.dtype = torch.float32,
 ):
@@ -136,9 +135,9 @@ def fused_up_proj_gate_activation_sparse_triton_csr(
     assert up_weight.shape == (hidden_size, intermediate_size)
     assert gate.shape == (batch_seq_size, num_blocks)
 
-    supported_dtypes = (torch.float16, torch.bfloat16)
-    assert x.dtype in supported_dtypes, "x must be fp16 or bf16"
-    assert up_weight.dtype in supported_dtypes, "up_weight must be fp16 or bf16"
+    supported_dtypes = (torch.float16, torch.bfloat16, torch.float32)
+    assert x.dtype in supported_dtypes, f"x must be fp16/bf16/fp32, got {x.dtype}"
+    assert up_weight.dtype in supported_dtypes, f"up_weight must be fp16/bf16/fp32, got {up_weight.dtype}"
 
 
     if gate.dtype != torch.float32:
@@ -196,6 +195,14 @@ def fused_up_proj_gate_activation_sparse_triton_csr(
 
         return (num_pid_per_block * num_blocks,)
 
+    # Map torch dtypes to triton dtypes
+    dtype_map = {
+        torch.float16: tl.float16,
+        torch.bfloat16: tl.bfloat16,
+        torch.float32: tl.float32,
+    }
+    triton_out_dtype = dtype_map[out_dtype]
+
     fused_up_proj_gate_csr_kernel[grid](
         x_reshaped,
         up_weight,
@@ -208,7 +215,7 @@ def fused_up_proj_gate_activation_sparse_triton_csr(
         x_reshaped.stride(0), x_reshaped.stride(1),
         up_weight.stride(0), up_weight.stride(1),
         output.stride(0), output.stride(1),
-        out_dtype=tl.float16 if out_dtype == torch.float16 else tl.float32,
+        out_dtype=triton_out_dtype,
     )
 
     return output  # already (BS, I) 

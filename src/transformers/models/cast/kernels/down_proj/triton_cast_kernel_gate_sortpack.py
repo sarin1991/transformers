@@ -158,8 +158,8 @@ def fused_down_proj_sparse_triton_sortpack(
     """Sort-pack sparse helper for Cast down-projection.
 
     Args:
-        x:           (BS, I)        – *float16* or *bfloat16*, with I = NB·LS
-        down_weight: (I, H)           – *float16*/*bfloat16* (pass Linear.weight)
+        x:           (BS, I)        – *float16*/*bfloat16*/*float32*, with I = NB·LS
+        down_weight: (I, H)           – *float16*/*bfloat16*/*float32* (pass Linear.weight)
         gate:        (BS, NB)       – *float32* gate tensor (non-zero → active)
         num_blocks:  NB
         line_size:   LS
@@ -171,10 +171,10 @@ def fused_down_proj_sparse_triton_sortpack(
     assert intermediate_size == num_blocks * line_size
     assert gate.shape == (batch_seq_size, num_blocks)
 
-    supported_dtypes = (torch.float16, torch.bfloat16)
+    supported_dtypes = (torch.float16, torch.bfloat16, torch.float32)
     assert (
         x.dtype in supported_dtypes and down_weight.dtype in supported_dtypes
-    ), "x and weight must be fp16 or bf16"
+    ), f"Unsupported dtype: x={x.dtype}, down_weight={down_weight.dtype}. Supported: {supported_dtypes}"
 
     if gate.dtype != torch.float32:
         gate = gate.float()
@@ -214,6 +214,14 @@ def fused_down_proj_sparse_triton_sortpack(
 
         return (num_pid_per_block * num_blocks,)
 
+    # Map torch dtypes to triton dtypes
+    dtype_map = {
+        torch.float16: tl.float16,
+        torch.bfloat16: tl.bfloat16,
+        torch.float32: tl.float32,
+    }
+    triton_out_dtype = dtype_map[out_dtype]
+
     fused_down_proj_sortpack_kernel[grid](
         x_reshaped,
         down_weight,
@@ -228,7 +236,7 @@ def fused_down_proj_sparse_triton_sortpack(
         down_weight.stride(0), down_weight.stride(1),
         max_rows,
         output.stride(0), output.stride(1),
-        out_dtype=tl.float16 if out_dtype == torch.float16 else tl.float32,
+        out_dtype=triton_out_dtype,
     )
 
     return output  # already (BS, H) 

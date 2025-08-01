@@ -43,11 +43,11 @@ def fused_weight_grad_kernel(
     """Compute Gram matrix G = yᵀ · x used as weight-gradient.
 
     Inputs (all row-major):
-        y_ptr :  (batch_seq_size, intermediate_size)  fp16  – sparse or dense activations/gradients
-        x_ptr :  (batch_seq_size, hidden_size)        fp16  – dense activations/gradients
+        y_ptr :  (batch_seq_size, intermediate_size)  fp16/bf16/fp32  – sparse or dense activations/gradients
+        x_ptr :  (batch_seq_size, hidden_size)        fp16/bf16/fp32  – dense activations/gradients
 
     Output:
-        out_ptr : (intermediate_size, hidden_size)    fp32/fp16 – accumulated result
+        out_ptr : (intermediate_size, hidden_size)    fp16/bf16/fp32 – accumulated result
 
     The kernel tiles along I and H dimensions and reduces over the batch_seq axis.
     GROUP_SIZE_I allows several I-tiles to stay resident in the same CTA, mirroring the
@@ -134,8 +134,8 @@ def fused_weight_grad_triton(
     """Compute weight gradient `dW = intermediateᵀ · other` with Triton.
 
     Args:
-        intermediate: (batch_seq, intermediate_size) – *float16*/*bfloat16*  (U or dZ)
-        other:        (batch_seq, hidden_size)       – *float16*/*bfloat16*  (dY or X)
+        intermediate: (batch_seq, intermediate_size) – *float16*/*bfloat16*/*float32*  (U or dZ)
+        other:        (batch_seq, hidden_size)       – *float16*/*bfloat16*/*float32*  (dY or X)
         line_size: size of each block line (LS)
         out_dtype: dtype of the returned matrix (default fp32, can be fp16)
 
@@ -147,8 +147,8 @@ def fused_weight_grad_triton(
     assert intermediate.ndim == 2 and other.ndim == 2, "Input tensors must be 2-D"
     assert intermediate.shape[0] == other.shape[0], "Batch dimension mismatch"
 
-    supported_dtypes = (torch.float16, torch.bfloat16)
-    assert intermediate.dtype in supported_dtypes and other.dtype in supported_dtypes, "Inputs must be fp16 or bf16"
+    supported_dtypes = (torch.float16, torch.bfloat16, torch.float32)
+    assert intermediate.dtype in supported_dtypes and other.dtype in supported_dtypes, f"Unsupported dtype: intermediate={intermediate.dtype}, other={other.dtype}. Supported: {supported_dtypes}"
 
     batch_seq_size, intermediate_size = intermediate.shape
     assert intermediate_size % line_size == 0, "line_size must divide intermediate_size"
@@ -167,6 +167,14 @@ def fused_weight_grad_triton(
 
         return (num_blocks * num_ls_groups * h_chunks * G_I,)
 
+    # Map torch dtypes to triton dtypes
+    dtype_map = {
+        torch.float16: tl.float16,
+        torch.bfloat16: tl.bfloat16,
+        torch.float32: tl.float32,
+    }
+    triton_out_dtype = dtype_map[out_dtype]
+
     fused_weight_grad_kernel[grid](
         intermediate, other, out,
         batch_seq_size,
@@ -176,7 +184,7 @@ def fused_weight_grad_triton(
         intermediate.stride(0), intermediate.stride(1),
         other.stride(0), other.stride(1),
         out.stride(0), out.stride(1),
-        out_dtype=tl.float16 if out_dtype == torch.float16 else tl.float32,
+        out_dtype=triton_out_dtype,
     )
 
     return out
