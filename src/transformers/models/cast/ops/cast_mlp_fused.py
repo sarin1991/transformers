@@ -34,6 +34,7 @@ class _CastMLPFusedFunction(Function):
         B, S, H = x.shape
         NB = gate.shape[-1]
         assert gate.shape[:2] == (B, S), "gate batch/seq dims must match x"
+        assert gate.dtype == torch.float32, "gate must be float32"
 
         # Expect up_weight (H, I) and down_weight (I, H); caller owns layout.
         I = up_weight.shape[1]  # intermediate dimension
