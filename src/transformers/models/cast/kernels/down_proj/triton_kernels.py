@@ -50,9 +50,9 @@ def fused_down_proj_kernel(
     """Dense down-projection kernel (matmul) with optional early exit when an entire
     intermediate vector is zero.  *row_mask_ptr* is a 1-D array containing 1 for
     active rows and 0 for fully-zero rows.
-    ``x``:   (B·S, I)   – float16
-    ``w``:   (I,  H)   – float16  (transposed weight)
-    ``out``: (B·S, H)   – float32
+    ``x``:   (B·S, I)   – float16/bf16/fp32
+    ``w``:   (I,  H)   – float16/bf16/fp32  (transposed weight)
+    ``out``: (B·S, H)   – float16/bf16/fp32
     """
 
     pid = tl.program_id(0)
@@ -122,14 +122,14 @@ def fused_down_proj_triton(
     """Fused dense down-projection using Triton.
 
     Args:
-        x:            (batch_seq_size, intermediate_size) – *float16* or *bfloat16*
-        down_weight:  (intermediate_size, hidden_size)    – *float16*/*bfloat16*  (pass ``model.down_proj.weight.t()``)
+        x:            (batch_seq_size, intermediate_size) – *float16*/*bfloat16*/*float32*
+        down_weight:  (intermediate_size, hidden_size)    – *float16*/*bfloat16*/*float32*  (pass ``model.down_proj.weight.t()``)
         gate:         (batch_seq_size, num_blocks)        – *float32* (or any type, will be upcast)
         num_blocks:   ``NB``
         line_size:    ``LS`` (``intermediate_size = NB·LS``)
 
     Returns:
-        Tensor (batch_seq_size, hidden_size) in *float32*
+        Tensor (batch_seq_size, hidden_size) in *float16*/*bfloat16*/*float32*
     """
     batch_seq_size, intermediate_size = x.shape
     hidden_size = down_weight.shape[1]
@@ -141,14 +141,14 @@ def fused_down_proj_triton(
     assert down_weight.shape == (intermediate_size, hidden_size)
     assert gate.shape == (batch_seq_size, num_blocks)
 
-    supported_dtypes = (torch.float16, torch.bfloat16)
+    supported_dtypes = (torch.float16, torch.bfloat16, torch.float32)
     assert (
         x.dtype in supported_dtypes and down_weight.dtype in supported_dtypes
-    ), "x and weight must be fp16 or bf16"
+    ), f"Unsupported dtype: x={x.dtype}, down_weight={down_weight.dtype}. Supported: {supported_dtypes}"
 
     # Validate output dtype
-    if out_dtype not in (torch.float32, torch.float16):
-        raise ValueError("out_dtype must be either torch.float32 (default) or torch.float16")
+    if out_dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise ValueError("out_dtype must be torch.float32, torch.float16, or torch.bfloat16")
 
     # Use input directly (already flattened)
     x_reshaped = x.contiguous()
@@ -165,6 +165,14 @@ def fused_down_proj_triton(
         row_groups = triton.cdiv(row_chunks, GROUP_SIZE_BS)
         return (num_col_chunks * GROUP_SIZE_BS * row_groups,)
 
+    # Map torch dtypes to triton dtypes
+    dtype_map = {
+        torch.float16: tl.float16,
+        torch.bfloat16: tl.bfloat16,
+        torch.float32: tl.float32,
+    }
+    triton_out_dtype = dtype_map[out_dtype]
+
     fused_down_proj_kernel[grid](
         x_reshaped,
         down_weight,
@@ -175,7 +183,7 @@ def fused_down_proj_triton(
         x_reshaped.stride(0), x_reshaped.stride(1),
         down_weight.stride(0), down_weight.stride(1),
         output.stride(0), output.stride(1),
-        out_dtype=tl.float16 if out_dtype == torch.float16 else tl.float32,
+        out_dtype=triton_out_dtype,
     )
 
     return output  # already (BS, H)
