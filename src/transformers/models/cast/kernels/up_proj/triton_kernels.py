@@ -33,6 +33,7 @@ def fused_up_proj_gate_activation_kernel(
     stride_out_bs, stride_out_ls,
     out_dtype: tl.constexpr,
     apply_gate: tl.constexpr,
+    apply_relu: tl.constexpr,
     BLOCK_SIZE_BS: tl.constexpr, BLOCK_SIZE_H: tl.constexpr, BLOCK_SIZE_LS: tl.constexpr,
 ):
     """
@@ -117,8 +118,9 @@ def fused_up_proj_gate_activation_kernel(
         x_ptrs += BLOCK_SIZE_H * stride_x_h
         w_ptrs += BLOCK_SIZE_H * stride_w_h
     
-    # Apply ReLU - keep in float32 for precision
-    accumulator = tl.where(accumulator > 0, accumulator, 0.0)
+    # Apply ReLU (optional) - keep in float32 for precision
+    if apply_relu:
+        accumulator = tl.where(accumulator > 0, accumulator, 0.0)
     
     # Optionally apply gate activation
     if apply_gate:
@@ -132,7 +134,7 @@ def fused_up_proj_gate_activation_kernel(
     tl.store(out_ptrs, output.to(out_dtype), mask=(mask_bs[:, None] & mask_ls[None, :]))
 
 
-def fused_up_proj_gate_activation_triton(x, up_weight, gate, num_blocks, line_size, out_dtype: torch.dtype = torch.float32, apply_gate: bool = True):
+def fused_up_proj_gate_activation_triton(x, up_weight, gate, num_blocks, line_size, out_dtype: torch.dtype = torch.float32, apply_gate: bool = True, apply_relu: bool = True):
     """
     Fused Triton implementation that performs up projection and gate activation in one kernel.
     Args:
@@ -193,6 +195,7 @@ def fused_up_proj_gate_activation_triton(x, up_weight, gate, num_blocks, line_si
         output.stride(0), output.stride(1),
         out_dtype=triton_out_dtype,
         apply_gate=apply_gate,
+        apply_relu=apply_relu,
     )
 
     return output  # already (BS, I)
@@ -211,6 +214,7 @@ def fused_up_proj_gate_activation_sparse_triton(
     line_size: int,
     out_dtype: torch.dtype = torch.float32,
     apply_gate: bool = True,
+    apply_relu: bool = True,
 ):
     """Sparse Triton helper for up-projection + gating + activation.
 
@@ -320,6 +324,7 @@ def fused_up_proj_gate_activation_sparse_triton(
             out_subset.stride(0), out_subset.stride(1),
             out_dtype=tl.float16 if out_dtype == torch.float16 else tl.float32,
             apply_gate=apply_gate,
+            apply_relu=apply_relu,
         )
 
         # Scatter results back into the full output tensor

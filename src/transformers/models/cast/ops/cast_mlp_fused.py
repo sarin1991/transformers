@@ -100,29 +100,48 @@ class _CastMLPFusedFunction(Function):
             LS,
         )  # (I, H) matches down_weight layout
 
-        # ---------------- grad_up_proj = grad_out · W_downᵀ ----------------
-        # Use up-proj kernel with actual gates
+        # ---------------- grad_inter_flat = grad_out · W_downᵀ ----------------
+        # Use sparse up-proj kernel as a plain matmul (no gate, no ReLU)
         down_w_transposed = down_weight.t().contiguous()  # (H, I)
-        
-        grad_up_proj = _up_sparse(
+
+        grad_inter_flat = _up_sparse(
             grad_out_flat,
             down_w_transposed,
-            gate_flat,  # Use actual gates, not dummy
+            gate_flat,
             NB,
             LS,
             out_dtype=grad_out.dtype,
-        )  # (BS, I) - gradient w.r.t. pre-gating intermediate
+            apply_gate=False,
+            apply_relu=False,
+        )  # (BS, I) – gradient w.r.t. post-gate values (inter)
+
+        # ---------------- Recompute up_proj (pre-gate activations) ----------------
+        up_w_T = up_weight.contiguous()
+        up_proj_flat = _up_sparse(
+            x_flat,
+            up_w_T,
+            gate_flat,
+            NB,
+            LS,
+            out_dtype=x.dtype,
+            apply_gate=False,   # no gate scaling
+            apply_relu=True,    # keep ReLU to match forward
+        )  # (BS, I) – relu(up_proj)
 
         # ---------------- grad w.r.t. gate -------------------
-        # Use epsilon threshold for numerical stability
-        eps = 1e-9
-        gate_expanded = gate_flat.repeat_interleave(LS, dim=1)
-        grad_gate_flat = torch.where(
-            gate_flat > eps,
-            (grad_up_proj * inter_flat / (gate_expanded ** 2)).view(BS, NB, LS).sum(dim=2),
-            0
-        )  # (BS, NB)
+        grad_gate_flat = (
+            grad_inter_flat.view(BS, NB, LS) *
+            up_proj_flat.view(BS, NB, LS)
+        ).sum(dim=2)  # (BS, NB)
         grad_gate = grad_gate_flat.view_as(gate)
+
+        # ---------------- grad_w.r.t up_proj ------------------
+        # First multiply by gate to get gradient flowing into relu output
+        grad_up_relu = grad_inter_flat.view(BS, NB, LS) * gate_flat.view(BS, NB, 1)
+
+        # Apply ReLU derivative: pass only where up_proj > 0
+        relu_mask = (up_proj_flat.view(BS, NB, LS) > 0)
+        grad_up_proj = (grad_up_relu * relu_mask).view(BS, I)
 
         # ---------------- grad w.r.t. up_weight -------------------
         grad_up_w_T = _wg_sparse(
