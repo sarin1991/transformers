@@ -47,8 +47,8 @@ def _run_fused(x, g, up_w, down_w):
     cast_mlp_fused(x, g, up_w, down_w)
 
 
-def _run_pytorch(x, g, up_w, down_w):
-    reference_cast_mlp_pytorch(x, g, up_w, down_w)
+def _run_pytorch(x, g, up_w, down_w, compute_dtype=torch.float32):
+    reference_cast_mlp_pytorch(x, g, up_w, down_w, compute_dtype=compute_dtype)
 
 
 # -----------------------------------------------------------------------------
@@ -127,7 +127,7 @@ def main():
         _profile("cast_mlp_fused", lambda: _run_fused(x, gate, up_w, down_w))
 
     if args.profile_pytorch:
-        _profile("cast_mlp_pytorch", lambda: _run_pytorch(x, gate, up_w, down_w))
+        _profile("cast_mlp_pytorch", lambda: _run_pytorch(x, gate, up_w, down_w, compute_dtype=dtype))
 
 
 if __name__ == "__main__":

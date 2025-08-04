@@ -13,8 +13,6 @@ def _make_sparse_gate(batch_seq_size: int, num_blocks: int, sparsity: float = 0.
     gate = torch.rand(batch_seq_size, num_blocks, device="cuda", dtype=torch.float32)
     mask = torch.rand_like(gate) < sparsity
     gate[mask] = 0.0
-    # Apply ReLU to ensure non-negative values (as expected by the fused op)
-    gate = F.relu(gate)
     return gate
 
 
@@ -22,7 +20,8 @@ def reference_cast_mlp_pytorch(
     x: torch.Tensor, 
     gate: torch.Tensor, 
     up_weight: torch.Tensor, 
-    down_weight: torch.Tensor
+    down_weight: torch.Tensor,
+    compute_dtype: torch.dtype = torch.float32
 ) -> torch.Tensor:
     """Reference PyTorch implementation of the CAST MLP operation.
     
@@ -31,6 +30,7 @@ def reference_cast_mlp_pytorch(
         gate: (B, S, NB) gate tensor (after ReLU)
         up_weight: (H, I) up projection weight
         down_weight: (I, H) down projection weight
+        compute_dtype: dtype for matrix multiplications (default: float32)
     
     Returns:
         (B, S, H) output tensor
@@ -42,10 +42,10 @@ def reference_cast_mlp_pytorch(
     
     # Flatten for easier processing
     x_flat = x.view(B * S, H)  # (BS, H)
-    gate_flat = gate.view(B * S, NB)  # (BS, NB)
+    gate_flat = F.relu(gate.view(B * S, NB))  # (BS, NB) after ReLU as in fused op
     
     # Up projection: (BS, H) @ (H, I) = (BS, I)
-    up_proj = torch.matmul(x_flat.float(), up_weight.float().contiguous())
+    up_proj = torch.matmul(x_flat.to(compute_dtype), up_weight.to(compute_dtype).contiguous())
     
     # Apply ReLU activation (as done in the up_proj kernels)
     up_proj = F.relu(up_proj)  # (BS, I)
@@ -54,7 +54,7 @@ def reference_cast_mlp_pytorch(
     up_proj_reshaped = up_proj.view(B * S, NB, LS)
     
     # Apply gating: multiply each block by its corresponding gate value
-    # Cast gate to same dtype as up_proj to avoid upcasting to float32
+    # Cast gate to same dtype as up_proj to avoid upcasting
     gate_expanded = gate_flat.to(up_proj_reshaped.dtype).unsqueeze(-1)  # (BS, NB, 1)
     gated_intermediate = up_proj_reshaped * gate_expanded  # (BS, NB, LS)
     
@@ -62,7 +62,7 @@ def reference_cast_mlp_pytorch(
     gated_intermediate_flat = gated_intermediate.view(B * S, I).to(x.dtype).contiguous()
     
     # Down projection: (BS, I) @ (I, H) = (BS, H)
-    output_flat = torch.matmul(gated_intermediate_flat.float(), down_weight.contiguous().float())
+    output_flat = torch.matmul(gated_intermediate_flat.to(compute_dtype), down_weight.to(compute_dtype).contiguous())
     
     # Reshape back to original: (BS, H) -> (B, S, H)
     output = output_flat.view(B, S, H).to(x.dtype)
@@ -149,47 +149,41 @@ def test_gradient_accuracy(
     down_weight = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=torch.float16, requires_grad=True)
     
     # Reference gradients
-    x_ref = x.detach().float().requires_grad_(True)
-    gate_ref = gate.detach().float().requires_grad_(True)
-    up_weight_ref = up_weight.detach().float().requires_grad_(True)
-    down_weight_ref = down_weight.detach().float().requires_grad_(True)
+    x_ref = x.detach().clone().requires_grad_(True)
+    gate_ref = gate.detach().clone().requires_grad_(True)
+    up_weight_ref = up_weight.detach().clone().requires_grad_(True)
+    down_weight_ref = down_weight.detach().clone().requires_grad_(True)
     
     ref_output = reference_cast_mlp_pytorch(x_ref, gate_ref, up_weight_ref, down_weight_ref)
     ref_loss = ref_output.sum()
     ref_loss.backward()
     
-    # Fused gradients
-    fused_output = cast_mlp_fused(x, gate, up_weight, down_weight)
-    fused_loss = fused_output.sum()
-    fused_loss.backward()
-    
-    # Compare gradients
+    fused_triton = cast_mlp_fused(x, gate, up_weight, down_weight)
+    fused_triton.sum().backward()
+
+    grad_triton = {
+        'x': x.grad.detach().clone(),
+        'gate': gate.grad.detach().clone(),
+        'up_weight': up_weight.grad.detach().clone(),
+        'down_weight': down_weight.grad.detach().clone(),
+    }
+
     grad_diffs = {}
-    
-    # x gradients
-    if x.grad is not None and x_ref.grad is not None:
-        grad_x_diff = torch.max(torch.abs(x_ref.grad - x.grad.float())).item()
-        grad_diffs['x'] = grad_x_diff
-        print(f"  Grad x max diff: {grad_x_diff:.6e}")
-    
-    # gate gradients
-    if gate.grad is not None and gate_ref.grad is not None:
-        grad_gate_diff = torch.max(torch.abs(gate_ref.grad - gate.grad.float())).item()
-        grad_diffs['gate'] = grad_gate_diff
-        print(f"  Grad gate max diff: {grad_gate_diff:.6e}")
-    
-    # up_weight gradients
-    if up_weight.grad is not None and up_weight_ref.grad is not None:
-        grad_up_diff = torch.max(torch.abs(up_weight_ref.grad - up_weight.grad.float())).item()
-        grad_diffs['up_weight'] = grad_up_diff
-        print(f"  Grad up_weight max diff: {grad_up_diff:.6e}")
-    
-    # down_weight gradients
-    if down_weight.grad is not None and down_weight_ref.grad is not None:
-        grad_down_diff = torch.max(torch.abs(down_weight_ref.grad - down_weight.grad.float())).item()
-        grad_diffs['down_weight'] = grad_down_diff
-        print(f"  Grad down_weight max diff: {grad_down_diff:.6e}")
-    
+    def _compute_grad_diff(ref_grad: torch.Tensor, fused_grad: torch.Tensor):
+        if ref_grad is None or fused_grad is None:
+            return 0.0,0.0
+        abs_diff = torch.max(torch.abs(ref_grad - fused_grad.float())).item()
+        abs_ref = torch.max(torch.abs(ref_grad)).item()
+        rel_diff = abs_diff / (abs_ref + 1e-6)
+        return abs_diff, rel_diff
+
+    names = ['x','gate','up_weight','down_weight']
+    for n in names:
+        abs_d = torch.max(torch.abs(locals()[f"{n}_ref"].grad - grad_triton[n].float())).item()
+        abs_ref = torch.max(torch.abs(locals()[f"{n}_ref"].grad)).item()
+        rel_d = abs_d / (abs_ref + 1e-6)
+        grad_diffs[n] = rel_d
+        print(f"  Grad {n:<10} | abs diff: {abs_d:.3e} | rel diff: {rel_d:.3e}")
     return grad_diffs
 
 
@@ -236,12 +230,16 @@ def debug_cast_mlp_fused(test_gradients: bool = True, *, dtype: torch.dtype = to
     
     # Gradient testing
     if test_gradients:
-        try:
-            grad_diffs = test_gradient_accuracy()
-            max_grad_diff = max(grad_diffs.values()) if grad_diffs else 0.0
-            print(f"Max gradient diff: {max_grad_diff:.6e}")
-        except Exception as e:
-            print(f"Gradient testing failed: {e}")
+        grad_diffs = test_gradient_accuracy()
+        # Flatten nested dict to compute global maximum relative diff
+        max_grad_diff = 0.0
+        for backend_dict in grad_diffs.values():
+            if isinstance(backend_dict, dict):
+                backend_max = max(backend_dict.values()) if backend_dict else 0.0
+                max_grad_diff = max(max_grad_diff, backend_max)
+            else:
+                max_grad_diff = max(max_grad_diff, backend_dict)
+        print(f"Max gradient diff: {max_grad_diff:.6e}")
     
     # Success criteria (relative tolerance)
     REL_TOLERANCE = 3e-1  # 30% relative tolerance for fp16 operations
