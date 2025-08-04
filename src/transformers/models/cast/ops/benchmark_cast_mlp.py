@@ -55,14 +55,14 @@ def benchmark_cast_mlp(num_iters: int = 100, sparsity: float = 0.9, dtype: torch
         # PyTorch reference timing
         # ------------------------------------------------------------------
         for _ in range(5):
-            reference_cast_mlp_pytorch(x, gate, up_weight, down_weight)
+            reference_cast_mlp_pytorch(x, gate, up_weight, down_weight, compute_dtype=dtype)
         torch.cuda.synchronize()
 
         t_start_ref = torch.cuda.Event(enable_timing=True)
         t_end_ref = torch.cuda.Event(enable_timing=True)
         t_start_ref.record()
         for _ in range(num_iters):
-            reference_cast_mlp_pytorch(x, gate, up_weight, down_weight)
+            reference_cast_mlp_pytorch(x, gate, up_weight, down_weight, compute_dtype=dtype)
         t_end_ref.record()
         torch.cuda.synchronize()
         ref_ms = t_start_ref.elapsed_time(t_end_ref) / num_iters
@@ -87,6 +87,82 @@ def benchmark_cast_mlp(num_iters: int = 100, sparsity: float = 0.9, dtype: torch
 
         speedup = ref_ms / fused_ms if fused_ms > 0.0 else float('inf')
         print(f"Triton fused:     {fused_ms:.3f} ms | Speed-up: {speedup:.2f}×")
+
+        # ------------------------------------------------------------------
+        # Backward pass timing
+        # ------------------------------------------------------------------
+        print(f"\nBackward pass:")
+        
+        # Create tensors that require gradients
+        x_grad = x.clone().requires_grad_(True)
+        gate_grad = gate.clone().requires_grad_(True)
+        up_weight_grad = up_weight.clone().requires_grad_(True)
+        down_weight_grad = down_weight.clone().requires_grad_(True)
+        
+        # PyTorch reference backward
+        for _ in range(5):
+            ref_output = reference_cast_mlp_pytorch(x_grad, gate_grad, up_weight_grad, down_weight_grad, compute_dtype=dtype)
+            ref_loss = ref_output.sum()
+            ref_loss.backward()
+            # Zero grads for next iteration
+            for t in [x_grad, gate_grad, up_weight_grad, down_weight_grad]:
+                if t.grad is not None:
+                    t.grad.zero_()
+        torch.cuda.synchronize()
+
+        t_start_ref_bwd = torch.cuda.Event(enable_timing=True)
+        t_end_ref_bwd = torch.cuda.Event(enable_timing=True)
+        t_start_ref_bwd.record()
+        for _ in range(num_iters):
+            ref_output = reference_cast_mlp_pytorch(x_grad, gate_grad, up_weight_grad, down_weight_grad, compute_dtype=dtype)
+            ref_loss = ref_output.sum()
+            ref_loss.backward()
+            # Zero grads for next iteration
+            for t in [x_grad, gate_grad, up_weight_grad, down_weight_grad]:
+                if t.grad is not None:
+                    t.grad.zero_()
+        t_end_ref_bwd.record()
+        torch.cuda.synchronize()
+        ref_bwd_ms = t_start_ref_bwd.elapsed_time(t_end_ref_bwd) / num_iters
+
+        print(f"PyTorch reference: {ref_bwd_ms:.3f} ms")
+
+        # Triton fused backward
+        for _ in range(5):
+            fused_output = cast_mlp_fused(x_grad, gate_grad, up_weight_grad, down_weight_grad)
+            fused_loss = fused_output.sum()
+            fused_loss.backward()
+            # Zero grads for next iteration
+            for t in [x_grad, gate_grad, up_weight_grad, down_weight_grad]:
+                if t.grad is not None:
+                    t.grad.zero_()
+        torch.cuda.synchronize()
+
+        t_start_fused_bwd = torch.cuda.Event(enable_timing=True)
+        t_end_fused_bwd = torch.cuda.Event(enable_timing=True)
+        t_start_fused_bwd.record()
+        for _ in range(num_iters):
+            fused_output = cast_mlp_fused(x_grad, gate_grad, up_weight_grad, down_weight_grad)
+            fused_loss = fused_output.sum()
+            fused_loss.backward()
+            # Zero grads for next iteration
+            for t in [x_grad, gate_grad, up_weight_grad, down_weight_grad]:
+                if t.grad is not None:
+                    t.grad.zero_()
+        t_end_fused_bwd.record()
+        torch.cuda.synchronize()
+        fused_bwd_ms = t_start_fused_bwd.elapsed_time(t_end_fused_bwd) / num_iters
+
+        speedup_bwd = ref_bwd_ms / fused_bwd_ms if fused_bwd_ms > 0.0 else float('inf')
+        print(f"Triton fused:     {fused_bwd_ms:.3f} ms | Speed-up: {speedup_bwd:.2f}×")
+
+        # Combined forward + backward
+        total_ref = ref_ms + ref_bwd_ms
+        total_fused = fused_ms + fused_bwd_ms
+        total_speedup = total_ref / total_fused if total_fused > 0.0 else float('inf')
+        print(f"\nTotal (fwd + bwd):")
+        print(f"PyTorch reference: {total_ref:.3f} ms")
+        print(f"Triton fused:     {total_fused:.3f} ms | Speed-up: {total_speedup:.2f}×")
 
 
 if __name__ == "__main__":

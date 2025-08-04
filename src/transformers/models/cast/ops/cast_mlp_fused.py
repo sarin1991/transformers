@@ -1,5 +1,6 @@
 import torch
 from torch.autograd import Function
+import torch.nn.functional as F
 
 # Import existing Triton helpers (sort-pack variants)
 # Import Triton kernels - works with module execution from cast directory
@@ -46,6 +47,7 @@ class _CastMLPFusedFunction(Function):
         # Ensure contiguous for raw-pointer access
         up_w_T   = up_weight.contiguous()
         down_w_T = down_weight.contiguous()
+        gate = F.relu(gate)
 
         # Up-projection + gating (sparse)
         x_flat = x.view(B * S, H)
@@ -91,6 +93,7 @@ class _CastMLPFusedFunction(Function):
         gate_flat     = gate.contiguous().view(BS, NB)
         x_flat        = x.contiguous().view(BS, H)
 
+        # ---- Triton kernel path ----
         # ---------------- grad w.r.t. down_weight ----------------
         grad_down_w = _wg_sparse(
             inter_flat,
@@ -98,10 +101,9 @@ class _CastMLPFusedFunction(Function):
             gate_flat,
             NB,
             LS,
-        )  # (I, H) matches down_weight layout
+        )  # (I, H)
 
         # ---------------- grad_inter_flat = grad_out · W_downᵀ ----------------
-        # Use sparse up-proj kernel as a plain matmul (no gate, no ReLU)
         down_w_transposed = down_weight.t().contiguous()  # (H, I)
 
         grad_inter_flat = _up_sparse(
@@ -113,9 +115,9 @@ class _CastMLPFusedFunction(Function):
             out_dtype=grad_out.dtype,
             apply_gate=False,
             apply_relu=False,
-        )  # (BS, I) – gradient w.r.t. post-gate values (inter)
+        )  # (BS, I)
 
-        # ---------------- Recompute up_proj (pre-gate activations) ----------------
+        # ---------------- Recompute up_proj ----------------
         up_w_T = up_weight.contiguous()
         up_proj_flat = _up_sparse(
             x_flat,
@@ -124,45 +126,40 @@ class _CastMLPFusedFunction(Function):
             NB,
             LS,
             out_dtype=x.dtype,
-            apply_gate=False,   # no gate scaling
-            apply_relu=True,    # keep ReLU to match forward
-        )  # (BS, I) – relu(up_proj)
+            apply_gate=False,
+            apply_relu=True,
+        )
 
         # ---------------- grad w.r.t. gate -------------------
         grad_gate_flat = (
-            grad_inter_flat.view(BS, NB, LS) *
-            up_proj_flat.view(BS, NB, LS)
-        ).sum(dim=2)  # (BS, NB)
+            grad_inter_flat.view(BS, NB, LS) * up_proj_flat.view(BS, NB, LS)
+        ).sum(dim=2)
+        pos_mask = (gate_flat > 0).to(grad_gate_flat.dtype)
+        grad_gate_flat = grad_gate_flat * pos_mask
         grad_gate = grad_gate_flat.view_as(gate)
 
-        # ---------------- grad_w.r.t up_proj ------------------
-        # First multiply by gate to get gradient flowing into relu output
-        grad_up_relu = grad_inter_flat.view(BS, NB, LS) * gate_flat.view(BS, NB, 1)
-
-        # Apply ReLU derivative: pass only where up_proj > 0
+        grad_up_relu = grad_inter_flat.view(BS, NB, LS) * gate_flat.to(grad_inter_flat.dtype).view(BS, NB, 1)
         relu_mask = (up_proj_flat.view(BS, NB, LS) > 0)
-        grad_up_proj = (grad_up_relu * relu_mask).view(BS, I)
+        grad_up_proj = (grad_up_relu * relu_mask).view(BS, I).to(x.dtype)
 
-        # ---------------- grad w.r.t. up_weight -------------------
+        # grad up weight
         grad_up_w_T = _wg_sparse(
             grad_up_proj,
             x_flat,
             gate_flat,
             NB,
             LS,
-        )  # (I, H)
-        grad_up_w = grad_up_w_T.t().contiguous()  # (H,I)
+        )
+        grad_up_w = grad_up_w_T.t().contiguous()
 
-        # ---------------- grad w.r.t. input ----------------------
-        # Use down-proj kernel in reverse: grad_up_proj → grad_x
         grad_x_flat = _down_sparse(
             grad_up_proj,
-            up_weight.t().contiguous(),  # (I, H) - transpose to match kernel expectation
+            up_weight.t().contiguous(),
             gate_flat,
             NB,
             LS,
             out_dtype=grad_out.dtype,
-        )  # (BS, H)
+        )
         grad_x = grad_x_flat.view_as(x)
 
         grad_kernel = None
@@ -170,6 +167,13 @@ class _CastMLPFusedFunction(Function):
         return grad_x, grad_gate, grad_up_w, grad_down_w, grad_kernel
 
 
-def cast_mlp_fused(x: torch.Tensor, gate: torch.Tensor, up_weight: torch.Tensor, down_weight: torch.Tensor, *, kernel: str = "sortpack") -> torch.Tensor:
-    """Convenience wrapper around the autograd Function."""
+def cast_mlp_fused(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    up_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    *,
+    kernel: str = "sortpack",
+) -> torch.Tensor:
+    """Convenience wrapper around the autograd Function (Triton backend)."""
     return _CastMLPFusedFunction.apply(x, gate, up_weight, down_weight, kernel) 
