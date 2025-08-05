@@ -68,8 +68,23 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
 
         print(f"PyTorch: {torch_ms:.3f} ms")
         
+        # Preprocess gate data once for all kernels
+        def preprocess_gate(gate_tensor, num_blocks):
+            mask = gate_tensor > 0
+            block_counts = mask.sum(dim=0, dtype=torch.int32)
+            max_rows = int(block_counts.max().item())
+            if max_rows == 0:
+                return None, None, block_counts, max_rows
+            gate_vals_sorted, row_idx_sorted = torch.sort(gate_tensor, dim=0, descending=True)
+            gate_vals = gate_vals_sorted[:max_rows, :].t().contiguous()
+            row_idx = row_idx_sorted[:max_rows, :].t().contiguous().to(torch.int32)
+            return gate_vals, row_idx, block_counts, max_rows
+
+        gate_vals_dense, row_idx_dense, block_counts_dense, max_rows_dense = preprocess_gate(gate_fp32, num_blocks)
+        
         if run_all:
             # ---- Triton timing (autotuned) ----
+            
             for _ in range(5):
                 _ = fused_up_proj_gate_activation_triton(
                     x_fp16,
@@ -78,6 +93,10 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                     num_blocks,
                     line_size,
                     out_dtype=torch.float16,
+                    gate_vals=gate_vals_dense,
+                    row_idx=row_idx_dense,
+                    block_counts=block_counts_dense,
+                    max_rows=max_rows_dense,
                 )
             torch.cuda.synchronize()
 
@@ -92,6 +111,10 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                     num_blocks,
                     line_size,
                     out_dtype=torch.float16,
+                    gate_vals=gate_vals_dense,
+                    row_idx=row_idx_dense,
+                    block_counts=block_counts_dense,
+                    max_rows=max_rows_dense,
                 )
             end_tri.record(torch.cuda.current_stream())
             torch.cuda.synchronize()
@@ -99,11 +122,14 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
 
             print(f"Triton (autotuned): {triton_ms:.3f} ms | Speed-up: {torch_ms/triton_ms:.2f}x")
 
+        # Create sparse gate data for sparse benchmarks
+        gate_sparse = gate_fp32.clone()
+        mask_sparse = torch.rand_like(gate_sparse) < 0.9  # 90% zeros
+        gate_sparse[mask_sparse] = 0.0
+        gate_vals_sparse, row_idx_sparse, block_counts_sparse, max_rows_sparse = preprocess_gate(gate_sparse, num_blocks)
+
         if run_all:
             # ---- Sparse benchmark (10% non-zero gate) ----
-            gate_sparse = gate_fp32.clone()
-            mask_sparse = torch.rand_like(gate_sparse) < 0.9  # 90% zeros
-            gate_sparse[mask_sparse] = 0.0
 
             # Warm-up sparse helper (5 runs)
             for _ in range(5):
@@ -114,6 +140,10 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                     num_blocks,
                     line_size,
                     out_dtype=torch.float16,
+                    gate_vals=gate_vals_sparse,
+                    row_idx=row_idx_sparse,
+                    block_counts=block_counts_sparse,
+                    max_rows=max_rows_sparse,
                 )
             torch.cuda.synchronize()
 
@@ -128,6 +158,10 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                     num_blocks,
                     line_size,
                     out_dtype=torch.float16,
+                    gate_vals=gate_vals_sparse,
+                    row_idx=row_idx_sparse,
+                    block_counts=block_counts_sparse,
+                    max_rows=max_rows_sparse,
                 )
             end_sp.record(torch.cuda.current_stream())
             torch.cuda.synchronize()
@@ -145,6 +179,10 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                     line_size,
                     zero_init=False,
                     out_dtype=torch.float16,
+                    gate_vals=gate_vals_sparse,
+                    row_idx=row_idx_sparse,
+                    block_counts=block_counts_sparse,
+                    max_rows=max_rows_sparse,
                 )
             torch.cuda.synchronize()
 
@@ -160,6 +198,10 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                     line_size,
                     zero_init=False,
                     out_dtype=torch.float16,
+                    gate_vals=gate_vals_sparse,
+                    row_idx=row_idx_sparse,
+                    block_counts=block_counts_sparse,
+                    max_rows=max_rows_sparse,
                 )
             end_opt.record(torch.cuda.current_stream())
             torch.cuda.synchronize()
@@ -177,6 +219,10 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                     line_size,
                     zero_init=False,
                     out_dtype=torch.float16,
+                    gate_vals=gate_vals_sparse,
+                    row_idx=row_idx_sparse,
+                    block_counts=block_counts_sparse,
+                    max_rows=max_rows_sparse,
                 )
             torch.cuda.synchronize()
 
@@ -192,15 +238,17 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                     line_size,
                     zero_init=False,
                     out_dtype=torch.float16,
+                    gate_vals=gate_vals_sparse,
+                    row_idx=row_idx_sparse,
+                    block_counts=block_counts_sparse,
+                    max_rows=max_rows_sparse,
                 )
             end_csr.record(torch.cuda.current_stream())
             torch.cuda.synchronize()
             csr_ms = start_csr.elapsed_time(end_csr) / num_iters
 
         # ---- SortPack benchmark (always) ----
-        gate_sparse = gate_fp32.clone()
-        mask_sparse = torch.rand_like(gate_sparse) < 0.9
-        gate_sparse[mask_sparse] = 0.0
+        # Reuse preprocessed sparse gate data
 
         for _ in range(5):
             _ = fused_up_proj_gate_activation_sparse_triton_sortpack(
@@ -211,6 +259,10 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                 line_size,
                 zero_init=False,
                 out_dtype=torch.float16,
+                gate_vals=gate_vals_sparse,
+                row_idx=row_idx_sparse,
+                block_counts=block_counts_sparse,
+                max_rows=max_rows_sparse,
             )
         torch.cuda.synchronize()
 
@@ -226,6 +278,10 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                 line_size,
                 zero_init=False,
                 out_dtype=torch.float16,
+                gate_vals=gate_vals_sparse,
+                row_idx=row_idx_sparse,
+                block_counts=block_counts_sparse,
+                max_rows=max_rows_sparse,
             )
         end_sortpack.record(torch.cuda.current_stream())
         torch.cuda.synchronize()
