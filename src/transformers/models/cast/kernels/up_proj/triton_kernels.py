@@ -78,6 +78,8 @@ def fused_up_proj_gate_activation_kernel(
     # gate: (batch_seq_size, num_blocks)
     g_ptrs = gate_ptr + (offs_bs * stride_g_bs + pid_nb * stride_g_nb)
     g = tl.load(g_ptrs, mask=mask_bs, other=0.0)
+    # Clamp negative gate values to zero
+    g = tl.where(g > 0, g, 0.0)
     
     # Check if all gates are zero - early return
     g_sum = tl.sum(g)
