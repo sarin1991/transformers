@@ -121,6 +121,11 @@ def fused_up_proj_gate_activation_sparse_triton_optimized(
     out_dtype: torch.dtype = torch.float32,
     apply_gate: bool = True,
     apply_relu: bool = True,
+    # New preprocessed gate parameters (ignored for this implementation)
+    gate_vals: torch.Tensor = None,
+    row_idx: torch.Tensor = None,
+    block_counts: torch.Tensor = None,
+    max_rows: int = None,
 ):
     """Sparse variant that offloads gather & scatter into the Triton kernel.
 
