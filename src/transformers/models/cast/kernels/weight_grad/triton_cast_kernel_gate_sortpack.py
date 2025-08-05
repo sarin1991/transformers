@@ -169,6 +169,11 @@ def fused_weight_grad_sparse_triton_sortpack(
     num_blocks: int,
     line_size: int,
     out_dtype: torch.dtype = torch.float32,
+    # New preprocessed gate parameters
+    gate_vals: torch.Tensor = None,
+    row_idx: torch.Tensor = None,
+    block_counts: torch.Tensor = None,
+    max_rows: int = None,
 ):
     """Sort-pack sparse helper to compute dW = intermediateᵀ · other.
 
@@ -199,17 +204,16 @@ def fused_weight_grad_sparse_triton_sortpack(
     # Contiguous views (ensure memory stride is compact)
     inter_flat = intermediate.contiguous()
     other_flat = other.contiguous()
-    gate_flat  = gate.contiguous()
 
-    # Build packed buffers
-    mask = gate_flat > 0
-    block_counts = mask.sum(dim=0, dtype=torch.int32)
-    max_rows = int(block_counts.max().item())
+    # ------------------------------------------------------------------
+    # Require preprocessed gate data - no longer do internal preprocessing
+    # ------------------------------------------------------------------
+    if gate_vals is None or row_idx is None or block_counts is None or max_rows is None:
+        raise ValueError("gate_vals, row_idx, block_counts, and max_rows must all be provided")
+    
+    # Early exit: gate is entirely zero
     if max_rows == 0:
         return torch.zeros((I, hidden_size), device=intermediate.device, dtype=out_dtype)
-
-    _, row_idx_sorted = torch.sort(gate_flat, dim=0, descending=True)
-    row_idx = row_idx_sorted[:max_rows, :].t().contiguous().to(torch.int32)  # (NB, max_rows)
 
     row_idx_flat = row_idx.view(-1)
 

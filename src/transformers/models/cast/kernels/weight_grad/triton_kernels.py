@@ -130,6 +130,11 @@ def fused_weight_grad_triton(
     other: torch.Tensor,
     line_size: int,
     out_dtype: torch.dtype = torch.float32,
+    # New preprocessed gate parameters (ignored for this implementation)
+    gate_vals: torch.Tensor = None,
+    row_idx: torch.Tensor = None,
+    block_counts: torch.Tensor = None,
+    max_rows: int = None,
 ):
     """Compute weight gradient `dW = intermediateᵀ · other` with Triton.
 
@@ -231,9 +236,24 @@ def debug_large_scale():
         intermediate = intermediate * gate.unsqueeze(-1).to(dtype=intermediate.dtype)
         intermediate = intermediate.view(batch_seq, intermediate_size)
 
+        # Preprocess gate data once for all kernels
+        def preprocess_gate(gate_tensor, num_blocks):
+            mask = gate_tensor > 0
+            block_counts = mask.sum(dim=0, dtype=torch.int32)
+            max_rows = int(block_counts.max().item())
+            if max_rows == 0:
+                return None, None, block_counts, max_rows
+            gate_vals_sorted, row_idx_sorted = torch.sort(gate_tensor, dim=0, descending=True)
+            gate_vals = gate_vals_sorted[:max_rows, :].t().contiguous()
+            row_idx = row_idx_sorted[:max_rows, :].t().contiguous().to(torch.int32)
+            return gate_vals, row_idx, block_counts, max_rows
+
+        gate_vals, row_idx, block_counts, max_rows = preprocess_gate(gate, num_blocks)
+
         # Reference & Triton (dense)
         ref = intermediate.transpose(0, 1).float() @ other.float()
-        tri_dense = fused_weight_grad_triton(intermediate, other, line_size)
+        tri_dense = fused_weight_grad_triton(intermediate, other, line_size,
+                                             gate_vals=gate_vals, row_idx=row_idx, block_counts=block_counts, max_rows=max_rows)
 
         # Triton SortPack sparse helper
         tri_sortpack = fused_weight_grad_sparse_triton_sortpack(
@@ -242,6 +262,10 @@ def debug_large_scale():
             gate,           # (BS, NB)
             num_blocks,
             line_size,
+            gate_vals=gate_vals,
+            row_idx=row_idx,
+            block_counts=block_counts,
+            max_rows=max_rows,
         )
 
         # Diffs
