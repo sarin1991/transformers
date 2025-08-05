@@ -24,6 +24,7 @@ def fused_up_proj_gate_sortpack_kernel(
     x_ptr, w_ptr,
     row_idx_ptr, gate_vals_ptr,        # (NB, max_rows) column-major (row-major in memory)
     output_ptr,
+    up_proj_ptr,                       # optional output for pre-ReLU values
     # sizes
     hidden_size: tl.constexpr, line_size: tl.constexpr, max_rows: tl.constexpr,
     # strides / leading dimensions
@@ -31,10 +32,12 @@ def fused_up_proj_gate_sortpack_kernel(
     stride_w_h, stride_w_i,
     stride_row_blk,                    # max_rows – distance between consecutive blocks in row_idx / gate_vals
     stride_out_bs, stride_out_i,
+    stride_up_proj_bs, stride_up_proj_i,  # strides for up_proj_ptr
     # meta-params
     out_dtype: tl.constexpr,
     apply_gate: tl.constexpr,
     apply_relu: tl.constexpr,
+    save_up_proj: tl.constexpr,        # whether to save pre-ReLU values to up_proj_ptr
     BLOCK_SIZE_BS: tl.constexpr, BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_LS: tl.constexpr, GROUP_SIZE_R: tl.constexpr,
 ):
@@ -110,13 +113,18 @@ def fused_up_proj_gate_sortpack_kernel(
         w_block = tl.load(w_ptrs, mask=mask_h[:, None] & mask_ls[None, :], other=0.0)
         acc += tl.dot(x_block, w_block)
 
+    # Apply gating first (before ReLU)
+    if apply_gate:
+        acc *= gate_vals[:, None]
+
+    # Store pre-ReLU gated values if requested (for backward pass caching)
+    if save_up_proj:
+        up_proj_ptrs = up_proj_ptr + row_indices[:, None] * stride_up_proj_bs + global_cols[None, :] * stride_up_proj_i
+        tl.store(up_proj_ptrs, acc.to(out_dtype), mask=mask_bs[:, None] & mask_ls[None, :])
+
     # Apply activation (ReLU) if requested
     if apply_relu:
         acc = tl.where(acc > 0, acc, 0.0)
-
-    # Optionally apply gate before write-back
-    if apply_gate:
-        acc *= gate_vals[:, None]
 
     out_ptrs = output_ptr + row_indices[:, None] * stride_out_bs + global_cols[None, :] * stride_out_i
     tl.store(out_ptrs, acc.to(out_dtype), mask=mask_bs[:, None] & mask_ls[None, :])
@@ -141,6 +149,8 @@ def fused_up_proj_gate_activation_sparse_triton_sortpack(
     row_idx: torch.Tensor = None, 
     block_counts: torch.Tensor = None,
     max_rows: int = None,
+    # Optimization parameter - moved to end for backward compatibility
+    save_up_proj: bool = False,        # whether to save pre-ReLU values
 ):
     """Sort-pack (ELLPACK) sparse fused MLP helper.
 
@@ -190,6 +200,18 @@ def fused_up_proj_gate_activation_sparse_triton_sortpack(
         output = torch.empty((batch_seq_size, intermediate_size), device=x.device, dtype=out_dtype)
 
     # ------------------------------------------------------------------
+    # Conditionally allocate up_proj buffer for pre-ReLU caching
+    # ------------------------------------------------------------------
+    if save_up_proj:
+        up_proj_output = torch.empty((batch_seq_size, intermediate_size), device=x.device, dtype=out_dtype)
+        up_proj_ptr = up_proj_output
+        stride_up_proj_bs, stride_up_proj_i = up_proj_output.stride()
+    else:
+        up_proj_output = None
+        up_proj_ptr = output  # Use dummy pointer (won't be accessed due to save_up_proj=False)
+        stride_up_proj_bs, stride_up_proj_i = 0, 0  # Dummy strides
+
+    # ------------------------------------------------------------------
     # Grid size helper (same logic as CSR variant)
     # ------------------------------------------------------------------
     def grid(meta):
@@ -221,14 +243,20 @@ def fused_up_proj_gate_activation_sparse_triton_sortpack(
         row_idx_flat,
         gate_vals_flat,
         output,
+        up_proj_ptr,
         hidden_size, line_size, max_rows,
         x_reshaped.stride(0), x_reshaped.stride(1),
         up_weight.stride(0), up_weight.stride(1),
         max_rows,  # stride between blocks in row_idx / gate_vals
         output.stride(0), output.stride(1),
+        stride_up_proj_bs, stride_up_proj_i,
         out_dtype=triton_out_dtype,
         apply_gate=apply_gate,
         apply_relu=apply_relu,
+        save_up_proj=save_up_proj,
     )
 
-    return output  # already (BS, I) 
+    if save_up_proj:
+        return output, up_proj_output  # (gated + ReLU, pre-ReLU gated)
+    else:
+        return output  # already (BS, I) 
