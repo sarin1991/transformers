@@ -72,6 +72,20 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
 
         print(f"PyTorch: {torch_ms:.3f} ms")
 
+        # Preprocess gate data once for all kernels
+        def preprocess_gate(gate_tensor, num_blocks):
+            mask = gate_tensor > 0
+            block_counts = mask.sum(dim=0, dtype=torch.int32)
+            max_rows = int(block_counts.max().item())
+            if max_rows == 0:
+                return None, None, block_counts, max_rows
+            gate_vals_sorted, row_idx_sorted = torch.sort(gate_tensor, dim=0, descending=True)
+            gate_vals = gate_vals_sorted[:max_rows, :].t().contiguous()
+            row_idx = row_idx_sorted[:max_rows, :].t().contiguous().to(torch.int32)
+            return gate_vals, row_idx, block_counts, max_rows
+
+        gate_vals, row_idx, block_counts, max_rows = preprocess_gate(gate_fp32, num_blocks)
+
         if run_all:
             # ---- Triton timing ----
             for _ in range(5):
@@ -80,6 +94,10 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                     other_fp16,
                     line_size,
                     out_dtype=torch.float16,
+                    gate_vals=gate_vals,
+                    row_idx=row_idx,
+                    block_counts=block_counts,
+                    max_rows=max_rows,
                 )
             torch.cuda.synchronize()
 
@@ -92,6 +110,10 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                     other_fp16,
                     line_size,
                     out_dtype=torch.float16,
+                    gate_vals=gate_vals,
+                    row_idx=row_idx,
+                    block_counts=block_counts,
+                    max_rows=max_rows,
                 )
             end_tri.record(torch.cuda.current_stream())
             torch.cuda.synchronize()
@@ -108,6 +130,10 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                     num_blocks,
                     line_size,
                     out_dtype=torch.float16,
+                    gate_vals=gate_vals,
+                    row_idx=row_idx,
+                    block_counts=block_counts,
+                    max_rows=max_rows,
                 )
             torch.cuda.synchronize()
 
@@ -122,6 +148,10 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
                     num_blocks,
                     line_size,
                     out_dtype=torch.float16,
+                    gate_vals=gate_vals,
+                    row_idx=row_idx,
+                    block_counts=block_counts,
+                    max_rows=max_rows,
                 )
             end_sp.record(torch.cuda.current_stream())
             torch.cuda.synchronize()
