@@ -78,6 +78,8 @@ def fused_up_proj_gate_csr_kernel(
 
     # Gate values
     gate_vals = tl.load(gates_val_ptr + block_start + offs_bs, mask=mask_bs, other=0.0)
+    # Clamp negative gate values to zero
+    gate_vals = tl.where(gate_vals > 0, gate_vals, 0.0)
 
     # Early exit if entire tile is zero – caller is responsible for zero-init
     if tl.sum(gate_vals) == 0:

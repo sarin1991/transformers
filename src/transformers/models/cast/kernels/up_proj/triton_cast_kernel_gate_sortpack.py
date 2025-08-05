@@ -75,6 +75,8 @@ def fused_up_proj_gate_sortpack_kernel(
     base_ptr  = block_idx * stride_row_blk  # stride_row_blk == max_rows
     row_indices = tl.load(row_idx_ptr  + base_ptr + rows_in_block, mask=mask_bs, other=0)
     gate_vals  = tl.load(gate_vals_ptr + base_ptr + rows_in_block, mask=mask_bs, other=0.0)
+    # Clamp negative gate values to zero
+    gate_vals = tl.where(gate_vals > 0, gate_vals, 0.0)
 
     # Early exit if this tile is fully padded
     if tl.sum(gate_vals) == 0:

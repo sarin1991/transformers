@@ -64,6 +64,8 @@ def fused_up_proj_gate_activation_kernel_optimized(
     # Load gate values for these rows (gate_col_ptr is already offset to the correct column)
     g_ptrs = gate_col_ptr + row_indices
     g_vals = tl.load(g_ptrs, mask=mask_bs_valid, other=0.0)
+    # Clamp negative gate values to zero
+    g_vals = tl.where(g_vals > 0, g_vals, 0.0)
 
     # Early exit if tile has zero gates – caller decides whether output is pre-initialised
     if tl.sum(g_vals) == 0:
