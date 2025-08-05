@@ -64,8 +64,13 @@ def _run_dense(
     gate: torch.Tensor,
     num_blocks: int,
     line_size: int,
+    gate_vals: torch.Tensor = None,
+    row_idx: torch.Tensor = None,
+    block_counts: torch.Tensor = None,
+    max_rows: int = None,
 ):
-    fused_up_proj_gate_activation_triton(x, w, gate, num_blocks, line_size, out_dtype=torch.float16)
+    fused_up_proj_gate_activation_triton(x, w, gate, num_blocks, line_size, out_dtype=torch.float16,
+                                        gate_vals=gate_vals, row_idx=row_idx, block_counts=block_counts, max_rows=max_rows)
 
 
 def _run_sparse(
@@ -74,6 +79,10 @@ def _run_sparse(
     gate: torch.Tensor,
     num_blocks: int,
     line_size: int,
+    gate_vals: torch.Tensor = None,
+    row_idx: torch.Tensor = None,
+    block_counts: torch.Tensor = None,
+    max_rows: int = None,
 ):
     fused_up_proj_gate_activation_sparse_triton(
         x,
@@ -82,6 +91,10 @@ def _run_sparse(
         num_blocks,
         line_size,
         out_dtype=torch.float16,
+        gate_vals=gate_vals,
+        row_idx=row_idx,
+        block_counts=block_counts,
+        max_rows=max_rows,
     )
 
 
@@ -93,6 +106,10 @@ def _run_opt(
     num_blocks: int,
     line_size: int,
     zero_init: bool,
+    gate_vals: torch.Tensor = None,
+    row_idx: torch.Tensor = None,
+    block_counts: torch.Tensor = None,
+    max_rows: int = None,
 ):
     fused_up_proj_gate_activation_sparse_triton_opt(
         x,
@@ -102,6 +119,10 @@ def _run_opt(
         line_size,
         zero_init=zero_init,
         out_dtype=torch.float16,
+        gate_vals=gate_vals,
+        row_idx=row_idx,
+        block_counts=block_counts,
+        max_rows=max_rows,
     )
 
 # CSR sparse helper
@@ -112,6 +133,10 @@ def _run_csr(
     num_blocks: int,
     line_size: int,
     zero_init: bool,
+    gate_vals: torch.Tensor = None,
+    row_idx: torch.Tensor = None,
+    block_counts: torch.Tensor = None,
+    max_rows: int = None,
 ):
     fused_up_proj_gate_activation_sparse_triton_csr(
         x,
@@ -121,6 +146,10 @@ def _run_csr(
         line_size,
         zero_init=zero_init,
         out_dtype=torch.float16,
+        gate_vals=gate_vals,
+        row_idx=row_idx,
+        block_counts=block_counts,
+        max_rows=max_rows,
     )
 
 # SortPack helper
@@ -131,6 +160,10 @@ def _run_sortpack(
     num_blocks: int,
     line_size: int,
     zero_init: bool,
+    gate_vals: torch.Tensor = None,
+    row_idx: torch.Tensor = None,
+    block_counts: torch.Tensor = None,
+    max_rows: int = None,
 ):
     fused_up_proj_gate_activation_sparse_triton_sortpack(
         x,
@@ -140,6 +173,10 @@ def _run_sortpack(
         line_size,
         zero_init=zero_init,
         out_dtype=torch.float16,
+        gate_vals=gate_vals,
+        row_idx=row_idx,
+        block_counts=block_counts,
+        max_rows=max_rows,
     )
 
 
@@ -254,44 +291,31 @@ def main():
         device=device,
     )
 
+    # Preprocess gate data once for all helpers
+    def preprocess_gate(gate_tensor, num_blocks):
+        mask = gate_tensor > 0
+        block_counts = mask.sum(dim=0, dtype=torch.int32)
+        max_rows = int(block_counts.max().item())
+        if max_rows == 0:
+            return None, None, block_counts, max_rows
+        gate_vals_sorted, row_idx_sorted = torch.sort(gate_tensor, dim=0, descending=True)
+        gate_vals = gate_vals_sorted[:max_rows, :].t().contiguous()
+        row_idx = row_idx_sorted[:max_rows, :].t().contiguous().to(torch.int32)
+        return gate_vals, row_idx, block_counts, max_rows
+
+    gate_vals, row_idx, block_counts, max_rows = preprocess_gate(gate_fp32, args.blocks)
+
     # Warm-up each helper once outside the profiler
     if args.profile_dense:
-        _run_dense(x_fp16, w_fp16, gate_fp32, args.blocks, args.line)
+        _run_dense(x_fp16, w_fp16, gate_fp32, args.blocks, args.line, gate_vals, row_idx, block_counts, max_rows)
     if args.profile_sparse:
-        _run_sparse(
-            x_fp16,
-            w_fp16,
-            gate_fp32,
-            args.blocks,
-            args.line,
-        )
+        _run_sparse(x_fp16, w_fp16, gate_fp32, args.blocks, args.line, gate_vals, row_idx, block_counts, max_rows)
     if args.profile_optimized:
-        _run_opt(
-            x_fp16,
-            w_fp16,
-            gate_fp32,
-            args.blocks,
-            args.line,
-            args.zero_init,
-        )
+        _run_opt(x_fp16, w_fp16, gate_fp32, args.blocks, args.line, args.zero_init, gate_vals, row_idx, block_counts, max_rows)
     if args.profile_csr:
-        _run_csr(
-            x_fp16,
-            w_fp16,
-            gate_fp32,
-            args.blocks,
-            args.line,
-            args.zero_init,
-        )
+        _run_csr(x_fp16, w_fp16, gate_fp32, args.blocks, args.line, args.zero_init, gate_vals, row_idx, block_counts, max_rows)
     if args.profile_sortpack:
-        _run_sortpack(
-            x_fp16,
-            w_fp16,
-            gate_fp32,
-            args.blocks,
-            args.line,
-            args.zero_init,
-        )
+        _run_sortpack(x_fp16, w_fp16, gate_fp32, args.blocks, args.line, args.zero_init, gate_vals, row_idx, block_counts, max_rows)
     torch.cuda.synchronize()
 
     activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
@@ -300,46 +324,19 @@ def main():
         for _ in range(args.iters):
             if args.profile_dense:
                 with record_function("DENSE_HELPER"):
-                    _run_dense(x_fp16, w_fp16, gate_fp32, args.blocks, args.line)
+                    _run_dense(x_fp16, w_fp16, gate_fp32, args.blocks, args.line, gate_vals, row_idx, block_counts, max_rows)
             if args.profile_sparse:
                 with record_function("SPARSE_HELPER"):
-                    _run_sparse(
-                        x_fp16,
-                        w_fp16,
-                        gate_fp32,
-                        args.blocks,
-                        args.line,
-                    )
+                    _run_sparse(x_fp16, w_fp16, gate_fp32, args.blocks, args.line, gate_vals, row_idx, block_counts, max_rows)
             if args.profile_optimized:
                 with record_function("OPTIMIZED_HELPER"):
-                    _run_opt(
-                        x_fp16,
-                        w_fp16,
-                        gate_fp32,
-                        args.blocks,
-                        args.line,
-                        args.zero_init,
-                    )
+                    _run_opt(x_fp16, w_fp16, gate_fp32, args.blocks, args.line, args.zero_init, gate_vals, row_idx, block_counts, max_rows)
             if args.profile_csr:
                 with record_function("CSR_HELPER"):
-                    _run_csr(
-                        x_fp16,
-                        w_fp16,
-                        gate_fp32,
-                        args.blocks,
-                        args.line,
-                        args.zero_init,
-                    )
+                    _run_csr(x_fp16, w_fp16, gate_fp32, args.blocks, args.line, args.zero_init, gate_vals, row_idx, block_counts, max_rows)
             if args.profile_sortpack:
                 with record_function("SORTPACK_HELPER"):
-                    _run_sortpack(
-                        x_fp16,
-                        w_fp16,
-                        gate_fp32,
-                        args.blocks,
-                        args.line,
-                        args.zero_init,
-                    )
+                    _run_sortpack(x_fp16, w_fp16, gate_fp32, args.blocks, args.line, args.zero_init, gate_vals, row_idx, block_counts, max_rows)
         torch.cuda.synchronize()
 
     print("\n========= PROFILER SUMMARY =========")

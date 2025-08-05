@@ -134,7 +134,7 @@ def fused_up_proj_gate_activation_kernel(
     tl.store(out_ptrs, output.to(out_dtype), mask=(mask_bs[:, None] & mask_ls[None, :]))
 
 
-def fused_up_proj_gate_activation_triton(x, up_weight, gate, num_blocks, line_size, out_dtype: torch.dtype = torch.float32, apply_gate: bool = True, apply_relu: bool = True):
+def fused_up_proj_gate_activation_triton(x, up_weight, gate, num_blocks, line_size, out_dtype: torch.dtype = torch.float32, apply_gate: bool = True, apply_relu: bool = True, gate_vals: torch.Tensor = None, row_idx: torch.Tensor = None, block_counts: torch.Tensor = None, max_rows: int = None):
     """
     Fused Triton implementation that performs up projection and gate activation in one kernel.
     Args:
@@ -215,6 +215,10 @@ def fused_up_proj_gate_activation_sparse_triton(
     out_dtype: torch.dtype = torch.float32,
     apply_gate: bool = True,
     apply_relu: bool = True,
+    gate_vals: torch.Tensor = None,
+    row_idx: torch.Tensor = None, 
+    block_counts: torch.Tensor = None,
+    max_rows: int = None,
 ):
     """Sparse Triton helper for up-projection + gating + activation.
 
@@ -396,6 +400,20 @@ def debug_large_scale(use_sparse_gate: bool = False):
         ref_reshaped = up_proj_fp32.view(batch_seq_size, num_blocks, line_size)
         ref_fp32 = (ref_reshaped * gate_fp32.unsqueeze(-1)).view(batch_seq_size, intermediate_size)
 
+        # Preprocess gate data once for all helpers
+        def preprocess_gate(gate_tensor, num_blocks):
+            mask = gate_tensor > 0
+            block_counts = mask.sum(dim=0, dtype=torch.int32)
+            max_rows = int(block_counts.max().item())
+            if max_rows == 0:
+                return None, None, block_counts, max_rows
+            gate_vals_sorted, row_idx_sorted = torch.sort(gate_tensor, dim=0, descending=True)
+            gate_vals = gate_vals_sorted[:max_rows, :].t().contiguous()
+            row_idx = row_idx_sorted[:max_rows, :].t().contiguous().to(torch.int32)
+            return gate_vals, row_idx, block_counts, max_rows
+
+        gate_vals, row_idx, block_counts, max_rows = preprocess_gate(gate_fp32, num_blocks)
+
         # Dense Triton helper
         out_dense = fused_up_proj_gate_activation_triton(
             x_fp16,
@@ -403,6 +421,10 @@ def debug_large_scale(use_sparse_gate: bool = False):
             gate_fp32,
             num_blocks,
             line_size,
+            gate_vals=gate_vals,
+            row_idx=row_idx,
+            block_counts=block_counts,
+            max_rows=max_rows,
         )
 
         # Baseline sparse Triton helper (may internally fall back)
@@ -412,6 +434,10 @@ def debug_large_scale(use_sparse_gate: bool = False):
             gate_fp32,
             num_blocks,
             line_size,
+            gate_vals=gate_vals,
+            row_idx=row_idx,
+            block_counts=block_counts,
+            max_rows=max_rows,
         )
 
         # Optimized sparse helper
@@ -421,6 +447,10 @@ def debug_large_scale(use_sparse_gate: bool = False):
             gate_fp32,
             num_blocks,
             line_size,
+            gate_vals=gate_vals,
+            row_idx=row_idx,
+            block_counts=block_counts,
+            max_rows=max_rows,
         )
 
         # CSR sparse helper (original two-pass)
@@ -430,15 +460,23 @@ def debug_large_scale(use_sparse_gate: bool = False):
             gate_fp32,
             num_blocks,
             line_size,
+            gate_vals=gate_vals,
+            row_idx=row_idx,
+            block_counts=block_counts,
+            max_rows=max_rows,
         )
 
-        # SortPack helper
+        # SortPack helper - reuse preprocessed gate data
         out_sortpack = fused_up_proj_gate_activation_sparse_triton_sortpack(
             x_fp16,
             up_weight_fp16,
             gate_fp32,
             num_blocks,
             line_size,
+            gate_vals=gate_vals,
+            row_idx=row_idx,
+            block_counts=block_counts,
+            max_rows=max_rows,
         )
 
         # Compute diffs

@@ -134,6 +134,11 @@ def fused_up_proj_gate_activation_sparse_triton_sortpack(
     out_dtype: torch.dtype = torch.float32,
     apply_gate: bool = True,
     apply_relu: bool = True,
+    # New preprocessed gate parameters
+    gate_vals: torch.Tensor = None,
+    row_idx: torch.Tensor = None, 
+    block_counts: torch.Tensor = None,
+    max_rows: int = None,
 ):
     """Sort-pack (ELLPACK) sparse fused MLP helper.
 
@@ -158,26 +163,17 @@ def fused_up_proj_gate_activation_sparse_triton_sortpack(
         gate = gate.float()
 
     # Use inputs directly (already flattened)
-    x_reshaped    = x.contiguous()        # (BS, H)
-    gate_reshaped = gate.contiguous()     # (BS, NB)
+    x_reshaped = x.contiguous()  # (BS, H)
 
     # ------------------------------------------------------------------
-    # Build sort-packed buffers on the GPU (entirely with PyTorch ops)
+    # Require preprocessed gate data - no longer do internal preprocessing
     # ------------------------------------------------------------------
-    mask = gate_reshaped > 0
-    block_counts = mask.sum(dim=0, dtype=torch.int32)          # (NB,)
-    max_rows = int(block_counts.max().item())
-
+    if gate_vals is None or row_idx is None or block_counts is None or max_rows is None:
+        raise ValueError("gate_vals, row_idx, block_counts, and max_rows must all be provided")
+    
     # Early exit: gate is entirely zero
     if max_rows == 0:
         return torch.zeros((batch_seq_size, intermediate_size), device=x.device, dtype=out_dtype)
-
-    # Sort each column in descending order – positive values first.
-    gate_vals_sorted, row_idx_sorted = torch.sort(gate_reshaped, dim=0, descending=True)
-
-    # Truncate to max_rows and transpose so that blocks are contiguous in memory
-    gate_vals = gate_vals_sorted[:max_rows, :].t().contiguous()   # (NB, max_rows)
-    row_idx   = row_idx_sorted[:max_rows, :].t().contiguous().to(torch.int32)  # (NB, max_rows)
 
     # Flatten for raw pointer access in Triton
     gate_vals_flat = gate_vals.view(-1)
