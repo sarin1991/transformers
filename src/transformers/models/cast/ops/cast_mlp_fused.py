@@ -18,6 +18,36 @@ from kernels.weight_grad.triton_cast_kernel_gate_sortpack import (
 __all__ = ["cast_mlp_fused"]
 
 
+def _preprocess_gate_data(gate: torch.Tensor, num_blocks: int):
+    """Preprocess gate data once to avoid redundant sorting in multiple kernel calls.
+    
+    Returns:
+        gate_vals: (NB, max_rows) - sorted gate values, transposed for memory layout
+        row_idx: (NB, max_rows) - corresponding row indices, transposed  
+        block_counts: (NB,) - number of active rows per block
+        max_rows: int - maximum number of active rows across all blocks
+    """
+    batch_seq_size = gate.shape[0]
+    
+    # Build mask and counts
+    mask = gate > 0
+    block_counts = mask.sum(dim=0, dtype=torch.int32)  # (NB,)
+    max_rows = int(block_counts.max().item())
+    
+    # Early exit: gate is entirely zero
+    if max_rows == 0:
+        return None, None, block_counts, max_rows
+    
+    # Sort each column in descending order – positive values first
+    gate_vals_sorted, row_idx_sorted = torch.sort(gate, dim=0, descending=True)
+    
+    # Truncate to max_rows and transpose so that blocks are contiguous in memory
+    gate_vals = gate_vals_sorted[:max_rows, :].t().contiguous()   # (NB, max_rows)
+    row_idx = row_idx_sorted[:max_rows, :].t().contiguous().to(torch.int32)  # (NB, max_rows)
+    
+    return gate_vals, row_idx, block_counts, max_rows
+
+
 class _CastMLPFusedFunction(Function):
     """Fuses sparse up-projection → gate → sparse down-projection.
 
@@ -53,6 +83,9 @@ class _CastMLPFusedFunction(Function):
         x_flat = x.view(B * S, H)
         gate_flat = gate.view(B * S, NB)
         
+        # Preprocess gate data once for all kernels
+        gate_vals, row_idx, block_counts, max_rows = _preprocess_gate_data(gate_flat, NB)
+        
         # Compute gated intermediate with real gate
         inter_flat = _up_sparse(
             x_flat,
@@ -61,6 +94,10 @@ class _CastMLPFusedFunction(Function):
             NB,
             LS,
             out_dtype=x.dtype,
+            gate_vals=gate_vals,
+            row_idx=row_idx,
+            block_counts=block_counts,
+            max_rows=max_rows,
         )  # (BS, I) - post-gating intermediate
 
         # Down-projection (sparse)
@@ -71,19 +108,24 @@ class _CastMLPFusedFunction(Function):
             NB,
             LS,
             out_dtype=x.dtype,
+            gate_vals=gate_vals,
+            row_idx=row_idx,
+            block_counts=block_counts,
+            max_rows=max_rows,
         )  # (BS, H)
         out = out_flat.view(B, S, H)
 
         # Save tensors for backward
-        ctx.save_for_backward(x, gate, inter_flat, up_weight, down_weight)
+        ctx.save_for_backward(x, gate, inter_flat, up_weight, down_weight, gate_vals, row_idx, block_counts)
         ctx.NB = NB
         ctx.LS = LS
+        ctx.max_rows = max_rows
         return out
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        x, gate, inter_flat, up_weight, down_weight = ctx.saved_tensors
-        NB, LS = ctx.NB, ctx.LS
+        x, gate, inter_flat, up_weight, down_weight, gate_vals, row_idx, block_counts = ctx.saved_tensors
+        NB, LS, max_rows = ctx.NB, ctx.LS, ctx.max_rows
 
         B, S, H = x.shape
         BS = B * S
@@ -101,6 +143,10 @@ class _CastMLPFusedFunction(Function):
             gate_flat,
             NB,
             LS,
+            gate_vals=gate_vals,
+            row_idx=row_idx,
+            block_counts=block_counts,
+            max_rows=max_rows,
         )  # (I, H)
 
         # ---------------- grad_inter_flat = grad_out · W_downᵀ ----------------
@@ -115,6 +161,10 @@ class _CastMLPFusedFunction(Function):
             out_dtype=grad_out.dtype,
             apply_gate=False,
             apply_relu=False,
+            gate_vals=gate_vals,
+            row_idx=row_idx,
+            block_counts=block_counts,
+            max_rows=max_rows,
         )  # (BS, I)
 
         # ---------------- Recompute up_proj ----------------
@@ -128,6 +178,10 @@ class _CastMLPFusedFunction(Function):
             out_dtype=x.dtype,
             apply_gate=False,
             apply_relu=True,
+            gate_vals=gate_vals,
+            row_idx=row_idx,
+            block_counts=block_counts,
+            max_rows=max_rows,
         )
 
         # ---------------- grad w.r.t. gate -------------------
@@ -149,6 +203,10 @@ class _CastMLPFusedFunction(Function):
             gate_flat,
             NB,
             LS,
+            gate_vals=gate_vals,
+            row_idx=row_idx,
+            block_counts=block_counts,
+            max_rows=max_rows,
         )
         grad_up_w = grad_up_w_T.t()
 
@@ -159,6 +217,10 @@ class _CastMLPFusedFunction(Function):
             NB,
             LS,
             out_dtype=grad_out.dtype,
+            gate_vals=gate_vals,
+            row_idx=row_idx,
+            block_counts=block_counts,
+            max_rows=max_rows,
         )
         grad_x = grad_x_flat.view_as(x)
 
