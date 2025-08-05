@@ -18,7 +18,7 @@ from kernels.weight_grad.triton_cast_kernel_gate_sortpack import (
 __all__ = ["cast_mlp_fused"]
 
 
-def _preprocess_gate_data(gate: torch.Tensor, num_blocks: int):
+def _preprocess_gate_data(gate: torch.Tensor):
     """Preprocess gate data once to avoid redundant sorting in multiple kernel calls.
     
     Returns:
@@ -26,9 +26,7 @@ def _preprocess_gate_data(gate: torch.Tensor, num_blocks: int):
         row_idx: (NB, max_rows) - corresponding row indices, transposed  
         block_counts: (NB,) - number of active rows per block
         max_rows: int - maximum number of active rows across all blocks
-    """
-    batch_seq_size = gate.shape[0]
-    
+    """    
     # Build mask and counts
     mask = gate > 0
     block_counts = mask.sum(dim=0, dtype=torch.int32)  # (NB,)
