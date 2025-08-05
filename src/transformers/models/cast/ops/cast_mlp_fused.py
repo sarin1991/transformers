@@ -104,7 +104,7 @@ class _CastMLPFusedFunction(Function):
         )  # (I, H)
 
         # ---------------- grad_inter_flat = grad_out · W_downᵀ ----------------
-        down_w_transposed = down_weight.t().contiguous()  # (H, I)
+        down_w_transposed = down_weight.t()  # (H, I)
 
         grad_inter_flat = _up_sparse(
             grad_out_flat,
@@ -150,11 +150,11 @@ class _CastMLPFusedFunction(Function):
             NB,
             LS,
         )
-        grad_up_w = grad_up_w_T.t().contiguous()
+        grad_up_w = grad_up_w_T.t()
 
         grad_x_flat = _down_sparse(
             grad_up_proj,
-            up_weight.t().contiguous(),
+            up_weight.t(),
             gate_flat,
             NB,
             LS,
