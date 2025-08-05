@@ -154,6 +154,11 @@ def fused_down_proj_sparse_triton_sortpack(
     num_blocks: int,
     line_size: int,
     out_dtype: torch.dtype = torch.float32,
+    # New preprocessed gate parameters
+    gate_vals: torch.Tensor = None,
+    row_idx: torch.Tensor = None,
+    block_counts: torch.Tensor = None,
+    max_rows: int = None,
 ):
     """Sort-pack sparse helper for Cast down-projection.
 
@@ -181,19 +186,16 @@ def fused_down_proj_sparse_triton_sortpack(
 
     # Use inputs directly (already flattened)
     x_reshaped = x.contiguous()  # (BS, I)
-    gate_reshaped = gate.contiguous()    # (BS, NB)
 
-    # Build packed buffers
-    mask = gate_reshaped > 0
-    block_counts = mask.sum(dim=0, dtype=torch.int32)
-    max_rows = int(block_counts.max().item())
-
+    # ------------------------------------------------------------------
+    # Require preprocessed gate data - no longer do internal preprocessing
+    # ------------------------------------------------------------------
+    if gate_vals is None or row_idx is None or block_counts is None or max_rows is None:
+        raise ValueError("gate_vals, row_idx, block_counts, and max_rows must all be provided")
+    
+    # Early exit: gate is entirely zero
     if max_rows == 0:
         return torch.zeros((batch_seq_size, hidden_size), device=x.device, dtype=out_dtype)
-
-    gate_vals_sorted, row_idx_sorted = torch.sort(gate_reshaped, dim=0, descending=True)
-    gate_vals = gate_vals_sorted[:max_rows, :].t().contiguous()  # (NB, max_rows)
-    row_idx = row_idx_sorted[:max_rows, :].t().contiguous().to(torch.int32)
 
     gate_vals_flat = gate_vals.view(-1)
     row_idx_flat = row_idx.view(-1)

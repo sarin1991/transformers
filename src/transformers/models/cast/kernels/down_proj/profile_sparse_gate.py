@@ -47,9 +47,11 @@ def _generate_tensors(
 # Runners
 # -----------------------------------------------------------------------------
 
-def _run_dense(x: torch.Tensor, w: torch.Tensor, gate: torch.Tensor, num_blocks: int, line_size: int):
+def _run_dense(x: torch.Tensor, w: torch.Tensor, gate: torch.Tensor, num_blocks: int, line_size: int,
+               gate_vals: torch.Tensor = None, row_idx: torch.Tensor = None, block_counts: torch.Tensor = None, max_rows: int = None):
     """Triton dense helper – mirrors up_proj naming (_run_dense)."""
-    fused_down_proj_triton(x, w, gate, num_blocks, line_size, out_dtype=torch.float16)
+    fused_down_proj_triton(x, w, gate, num_blocks, line_size, out_dtype=torch.float16,
+                          gate_vals=gate_vals, row_idx=row_idx, block_counts=block_counts, max_rows=max_rows)
 
 
 def _run_pytorch(x: torch.Tensor, w: torch.Tensor):
@@ -57,8 +59,10 @@ def _run_pytorch(x: torch.Tensor, w: torch.Tensor):
 
 
 # SortPack
-def _run_sortpack(x: torch.Tensor, w: torch.Tensor, gate: torch.Tensor, num_blocks: int, line_size: int):
-    fused_down_proj_sparse_triton_sortpack(x, w, gate, num_blocks, line_size, out_dtype=torch.float16)
+def _run_sortpack(x: torch.Tensor, w: torch.Tensor, gate: torch.Tensor, num_blocks: int, line_size: int,
+                  gate_vals: torch.Tensor = None, row_idx: torch.Tensor = None, block_counts: torch.Tensor = None, max_rows: int = None):
+    fused_down_proj_sparse_triton_sortpack(x, w, gate, num_blocks, line_size, out_dtype=torch.float16,
+                                          gate_vals=gate_vals, row_idx=row_idx, block_counts=block_counts, max_rows=max_rows)
 
 
 # -----------------------------------------------------------------------------
@@ -103,6 +107,20 @@ def main():
         args.batch, args.seq, args.hidden, args.num_blocks, args.line_size, args.sparsity
     )
 
+    # Preprocess gate data once for all kernels
+    def preprocess_gate(gate_tensor, num_blocks):
+        mask = gate_tensor > 0
+        block_counts = mask.sum(dim=0, dtype=torch.int32)
+        max_rows = int(block_counts.max().item())
+        if max_rows == 0:
+            return None, None, block_counts, max_rows
+        gate_vals_sorted, row_idx_sorted = torch.sort(gate_tensor, dim=0, descending=True)
+        gate_vals = gate_vals_sorted[:max_rows, :].t().contiguous()
+        row_idx = row_idx_sorted[:max_rows, :].t().contiguous().to(torch.int32)
+        return gate_vals, row_idx, block_counts, max_rows
+
+    gate_vals, row_idx, block_counts, max_rows = preprocess_gate(gate, args.num_blocks)
+
     # Ensure at least one kernel selected
     if not (args.profile_dense or args.profile_sortpack or args.profile_pytorch):
         args.profile_dense = True  # default to dense
@@ -131,10 +149,12 @@ def main():
         print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=20))
 
     if args.profile_dense:
-        _profile("triton_down_proj_dense", lambda: _run_dense(x_fp16, w_fp16, gate, args.num_blocks, args.line_size))
+        _profile("triton_down_proj_dense", lambda: _run_dense(x_fp16, w_fp16, gate, args.num_blocks, args.line_size,
+                                                              gate_vals=gate_vals, row_idx=row_idx, block_counts=block_counts, max_rows=max_rows))
 
     if args.profile_sortpack:
-        _profile("triton_down_proj_sortpack", lambda: _run_sortpack(x_fp16, w_fp16, gate, args.num_blocks, args.line_size))
+        _profile("triton_down_proj_sortpack", lambda: _run_sortpack(x_fp16, w_fp16, gate, args.num_blocks, args.line_size,
+                                                                    gate_vals=gate_vals, row_idx=row_idx, block_counts=block_counts, max_rows=max_rows))
 
     if args.profile_pytorch:
         _profile("pytorch_down_proj", lambda: _run_pytorch(x_fp16, w_fp16))
