@@ -73,8 +73,8 @@ class _CastMLPFusedFunction(Function):
         assert down_weight.shape == (I, H), "down_weight must have shape (intermediate, hidden)"
 
         # Ensure contiguous for raw-pointer access
-        up_w_T   = up_weight.contiguous()
-        down_w_T = down_weight.contiguous()
+        up_weight   = up_weight.contiguous()
+        down_weight = down_weight.contiguous()
         gate = F.relu(gate)
 
         # Up-projection + gating (sparse)
@@ -82,26 +82,46 @@ class _CastMLPFusedFunction(Function):
         gate_flat = gate.view(B * S, NB)
         
         # Preprocess gate data once for all kernels
-        gate_vals, row_idx, block_counts, max_rows = _preprocess_gate_data(gate_flat, NB)
+        gate_vals, row_idx, block_counts, max_rows = _preprocess_gate_data(gate_flat)
         
-        # Compute gated intermediate with real gate
-        inter_flat = _up_sparse(
-            x_flat,
-            up_w_T,
-            gate_flat,
-            NB,
-            LS,
-            out_dtype=x.dtype,
-            gate_vals=gate_vals,
-            row_idx=row_idx,
-            block_counts=block_counts,
-            max_rows=max_rows,
-        )  # (BS, I) - post-gating intermediate
+        # Check if any input requires gradients (for backward pass optimization)
+        needs_backward = any(t.requires_grad for t in [x, gate, up_weight, down_weight])
+        
+        # Compute gated intermediate with real gate, optionally cache pre-ReLU values
+        if needs_backward:
+            inter_flat, up_proj_flat = _up_sparse(
+                x_flat,
+                up_weight,
+                gate_flat,
+                NB,
+                LS,
+                out_dtype=x.dtype,
+                gate_vals=gate_vals,
+                row_idx=row_idx,
+                block_counts=block_counts,
+                max_rows=max_rows,
+                save_up_proj=True,  # Cache pre-ReLU values for backward
+            )  # (BS, I) - post-gating intermediate, (BS, I) - pre-ReLU gated
+        else:
+            inter_flat = _up_sparse(
+                x_flat,
+                down_weight,
+                gate_flat,
+                NB,
+                LS,
+                out_dtype=x.dtype,
+                gate_vals=gate_vals,
+                row_idx=row_idx,
+                block_counts=block_counts,
+                max_rows=max_rows,
+                save_up_proj=False,  # No caching for inference
+            )  # (BS, I) - post-gating intermediate
+            up_proj_flat = None  # No cached values
 
         # Down-projection (sparse)
         out_flat = _down_sparse(
             inter_flat,
-            down_w_T,
+            down_weight,
             gate_flat,
             NB,
             LS,
@@ -114,7 +134,7 @@ class _CastMLPFusedFunction(Function):
         out = out_flat.view(B, S, H)
 
         # Save tensors for backward
-        ctx.save_for_backward(x, gate, inter_flat, up_weight, down_weight, gate_vals, row_idx, block_counts)
+        ctx.save_for_backward(x, gate, inter_flat, up_weight, down_weight, gate_vals, row_idx, block_counts, up_proj_flat)
         ctx.NB = NB
         ctx.LS = LS
         ctx.max_rows = max_rows
@@ -122,8 +142,11 @@ class _CastMLPFusedFunction(Function):
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        x, gate, inter_flat, up_weight, down_weight, gate_vals, row_idx, block_counts = ctx.saved_tensors
+        x, gate, inter_flat, up_weight, down_weight, gate_vals, row_idx, block_counts, up_proj_flat = ctx.saved_tensors
         NB, LS, max_rows = ctx.NB, ctx.LS, ctx.max_rows
+        
+        # Assert that up_proj_flat was cached (should always be available in backward pass)
+        assert up_proj_flat is not None, "up_proj_flat should be cached when requires_grad=True"
 
         B, S, H = x.shape
         BS = B * S
@@ -164,23 +187,6 @@ class _CastMLPFusedFunction(Function):
             block_counts=block_counts,
             max_rows=max_rows,
         )  # (BS, I)
-
-        # ---------------- Recompute up_proj ----------------
-        up_w_T = up_weight.contiguous()
-        up_proj_flat = _up_sparse(
-            x_flat,
-            up_w_T,
-            gate_flat,
-            NB,
-            LS,
-            out_dtype=x.dtype,
-            apply_gate=False,
-            apply_relu=True,
-            gate_vals=gate_vals,
-            row_idx=row_idx,
-            block_counts=block_counts,
-            max_rows=max_rows,
-        )
 
         # ---------------- grad w.r.t. gate -------------------
         grad_gate_flat = (
