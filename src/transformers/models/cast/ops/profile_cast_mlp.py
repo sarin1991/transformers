@@ -136,7 +136,7 @@ def main():
                     fn()
             torch.cuda.synchronize()
 
-        print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=25))
+        print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=25, max_name_column_width=120))
 
     if args.profile_backward:
         if args.profile_fused:
