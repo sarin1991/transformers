@@ -105,7 +105,7 @@ class _CastMLPFusedFunction(Function):
         else:
             inter_flat = _up_sparse(
                 x_flat,
-                down_weight,
+                up_weight,
                 gate_flat,
                 NB,
                 LS,
