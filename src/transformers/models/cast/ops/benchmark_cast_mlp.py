@@ -26,9 +26,13 @@ def benchmark_cast_mlp(num_iters: int = 100, sparsity: float = 0.9, dtype: torch
     configs = [
         (4, 8, 128, 4, 32),
         (8, 16, 256, 8, 32),
-        (32, 32, 512, 8, 64),
-        (64, 64, 1024, 16, 64),
-        (128, 128, 4096, 8, 4096),
+        (128, 32, 512, 8, 64),
+        (128, 256, 4096, 64, 64),
+        (128, 256, 4096, 256, 128),
+        (128, 256, 4096, 128, 256),
+        (128, 256, 4096, 64, 512),
+        (128, 256, 4096, 32, 1024),
+        (128, 256, 4096, 8, 4096),
     ]
 
     for batch_size, seq_len, hidden_size, num_blocks, line_size in configs:
@@ -98,29 +102,19 @@ def benchmark_cast_mlp(num_iters: int = 100, sparsity: float = 0.9, dtype: torch
         gate_grad = gate.clone().requires_grad_(True)
         up_weight_grad = up_weight.clone().requires_grad_(True)
         down_weight_grad = down_weight.clone().requires_grad_(True)
-        
+        ref_output = reference_cast_mlp_pytorch(x_grad, gate_grad, up_weight_grad, down_weight_grad, compute_dtype=dtype)
+        ref_loss = ref_output.sum()
+
         # PyTorch reference backward
         for _ in range(5):
-            ref_output = reference_cast_mlp_pytorch(x_grad, gate_grad, up_weight_grad, down_weight_grad, compute_dtype=dtype)
-            ref_loss = ref_output.sum()
-            ref_loss.backward()
-            # Zero grads for next iteration
-            for t in [x_grad, gate_grad, up_weight_grad, down_weight_grad]:
-                if t.grad is not None:
-                    t.grad.zero_()
+            ref_loss.backward(retain_graph=True)
         torch.cuda.synchronize()
 
         t_start_ref_bwd = torch.cuda.Event(enable_timing=True)
         t_end_ref_bwd = torch.cuda.Event(enable_timing=True)
         t_start_ref_bwd.record()
         for _ in range(num_iters):
-            ref_output = reference_cast_mlp_pytorch(x_grad, gate_grad, up_weight_grad, down_weight_grad, compute_dtype=dtype)
-            ref_loss = ref_output.sum()
-            ref_loss.backward()
-            # Zero grads for next iteration
-            for t in [x_grad, gate_grad, up_weight_grad, down_weight_grad]:
-                if t.grad is not None:
-                    t.grad.zero_()
+            ref_loss.backward(retain_graph=True)
         t_end_ref_bwd.record()
         torch.cuda.synchronize()
         ref_bwd_ms = t_start_ref_bwd.elapsed_time(t_end_ref_bwd) / num_iters
@@ -128,27 +122,17 @@ def benchmark_cast_mlp(num_iters: int = 100, sparsity: float = 0.9, dtype: torch
         print(f"PyTorch reference: {ref_bwd_ms:.3f} ms")
 
         # Triton fused backward
+        fused_output = cast_mlp_fused(x_grad, gate_grad, up_weight_grad, down_weight_grad)
+        fused_loss = fused_output.sum()
         for _ in range(5):
-            fused_output = cast_mlp_fused(x_grad, gate_grad, up_weight_grad, down_weight_grad)
-            fused_loss = fused_output.sum()
-            fused_loss.backward()
-            # Zero grads for next iteration
-            for t in [x_grad, gate_grad, up_weight_grad, down_weight_grad]:
-                if t.grad is not None:
-                    t.grad.zero_()
+            fused_loss.backward(retain_graph=True)
         torch.cuda.synchronize()
 
         t_start_fused_bwd = torch.cuda.Event(enable_timing=True)
         t_end_fused_bwd = torch.cuda.Event(enable_timing=True)
         t_start_fused_bwd.record()
         for _ in range(num_iters):
-            fused_output = cast_mlp_fused(x_grad, gate_grad, up_weight_grad, down_weight_grad)
-            fused_loss = fused_output.sum()
-            fused_loss.backward()
-            # Zero grads for next iteration
-            for t in [x_grad, gate_grad, up_weight_grad, down_weight_grad]:
-                if t.grad is not None:
-                    t.grad.zero_()
+            fused_loss.backward(retain_graph=True)
         t_end_fused_bwd.record()
         torch.cuda.synchronize()
         fused_bwd_ms = t_start_fused_bwd.elapsed_time(t_end_fused_bwd) / num_iters
