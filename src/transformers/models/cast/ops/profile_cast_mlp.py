@@ -51,16 +51,12 @@ def _run_pytorch(x, g, up_w, down_w, compute_dtype=torch.float32):
     return reference_cast_mlp_pytorch(x, g, up_w, down_w, compute_dtype=compute_dtype)
 
 
-def _run_fused_backward(output_template):
-    output = output_template.detach().requires_grad_(True)
-    loss = output.sum()
-    loss.backward()
+def _run_fused_backward(loss):
+    loss.backward(retain_graph=True)
 
 
-def _run_pytorch_backward(output_template):
-    output = output_template.detach().requires_grad_(True)
-    loss = output.sum()
-    loss.backward()
+def _run_pytorch_backward(loss):
+    loss.backward(retain_graph=True)
 
 
 # -----------------------------------------------------------------------------
@@ -146,12 +142,14 @@ def main():
         if args.profile_fused:
             # Pre-compute forward pass output as template
             fused_output_template = _run_fused(x, gate, up_w, down_w)
-            _profile("cast_mlp_fused_backward", lambda: _run_fused_backward(fused_output_template))
+            fused_loss = fused_output_template.sum()
+            _profile("cast_mlp_fused_backward", lambda: _run_fused_backward(fused_loss))
 
         if args.profile_pytorch:
             # Pre-compute forward pass output as template
             pytorch_output_template = _run_pytorch(x, gate, up_w, down_w, compute_dtype=dtype)
-            _profile("cast_mlp_pytorch_backward", lambda: _run_pytorch_backward(pytorch_output_template))
+            pytorch_loss = pytorch_output_template.sum()
+            _profile("cast_mlp_pytorch_backward", lambda: _run_pytorch_backward(pytorch_loss))
     else:
         if args.profile_fused:
             _profile("cast_mlp_fused", lambda: _run_fused(x, gate, up_w, down_w))
