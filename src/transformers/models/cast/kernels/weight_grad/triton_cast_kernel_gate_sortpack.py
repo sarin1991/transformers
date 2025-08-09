@@ -113,8 +113,14 @@ def fused_weight_grad_sortpack_kernel(
     # Main reduction loop over packed rows
     # ------------------------------------------------------------------
     blk_rows = tl.load(row_counts_ptr + block_idx)
-    # Early exit if block has no active rows
+    # If block has no active rows, store zeros and return
     if blk_rows == 0:
+        out_ptrs = (
+            output_ptr
+            + global_cols[:, None] * stride_out_i
+            + h_global[None, :]   * stride_out_h
+        )
+        tl.store(out_ptrs, acc.to(out_dtype), mask=mask_ls[:, None] & mask_h[None, :])
         return
 
     for r in range(0, blk_rows, BLOCK_SIZE_BS):
