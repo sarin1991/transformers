@@ -1,6 +1,7 @@
 import argparse
 import torch
 import torch.nn.functional as F
+import os
 from typing import Tuple
 # Import the fused operation - run from cast directory as:
 # cd src/transformers/models/cast/
@@ -97,15 +98,21 @@ def run_accuracy_test(
     down_weight = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=dtype)
     
     # Reference tensors use the SAME dtype as the forward path
-    x_ref = x.clone()
-    up_weight_ref = up_weight.clone()
-    down_weight_ref = down_weight.clone()
-    gate_ref = gate.clone()
+    x_ref = x.detach().clone()
+    up_weight_ref = up_weight.detach().clone()
+    down_weight_ref = down_weight.detach().clone()
+    gate_ref = gate.detach().clone()
     
     ref_output = reference_cast_mlp_pytorch(x_ref, gate_ref, up_weight_ref, down_weight_ref)
     
+    # Fused tensors use the SAME dtype as the forward path
+    x_fused = x.detach().clone()
+    up_weight_fused = up_weight.detach().clone()
+    down_weight_fused = down_weight.detach().clone()
+    gate_fused = gate.detach().clone()
+
     # Fused implementation
-    fused_output = cast_mlp_fused(x, gate, up_weight, down_weight)
+    fused_output = cast_mlp_fused(x_fused, gate_fused, up_weight_fused, down_weight_fused)
     
     # Compare outputs (convert fused to float32 for comparison)
     fused_output_f32 = fused_output.float()
@@ -134,56 +141,140 @@ def test_gradient_accuracy(
     line_size: int = 32,
     sparsity: float = 0.8
 ):
-    """Test gradient accuracy by comparing against reference implementation."""
+    """Test gradient accuracy comparing PyTorch vs fused kernel implementations."""
     intermediate_size = num_blocks * line_size
     batch_seq_size = batch_size * seq_len
     
     print(f"\n=== Gradient Accuracy Test ===")
     print(f"Config: B={batch_size}, S={seq_len}, H={hidden_size}, NB={num_blocks}, LS={line_size}")
     
-    # Create input tensors (require gradients)
-    x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float16, requires_grad=True)
-    gate = _make_sparse_gate(batch_seq_size, num_blocks, sparsity=sparsity).view(batch_size, seq_len, num_blocks)
-    gate.requires_grad_(True)
-    up_weight = torch.randn(hidden_size, intermediate_size, device="cuda", dtype=torch.float16, requires_grad=True)
-    down_weight = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=torch.float16, requires_grad=True)
+    # Create input tensors (shared for both tests)
+    x_base = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float16)
+    gate_base = _make_sparse_gate(batch_seq_size, num_blocks, sparsity=sparsity).view(batch_size, seq_len, num_blocks)
+    up_weight_base = torch.randn(hidden_size, intermediate_size, device="cuda", dtype=torch.float16)
+    down_weight_base = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=torch.float16)
     
-    # Reference gradients
-    x_ref = x.detach().clone().requires_grad_(True)
-    gate_ref = gate.detach().clone().requires_grad_(True)
-    up_weight_ref = up_weight.detach().clone().requires_grad_(True)
-    down_weight_ref = down_weight.detach().clone().requires_grad_(True)
+    # Test 1: Reference PyTorch implementation
+    print("  Testing against reference PyTorch implementation...")
+    x_ref = x_base.detach().clone().requires_grad_(True)
+    gate_ref = gate_base.detach().clone().requires_grad_(True) 
+    up_weight_ref = up_weight_base.detach().clone().requires_grad_(True)
+    down_weight_ref = down_weight_base.detach().clone().requires_grad_(True)
     
     ref_output = reference_cast_mlp_pytorch(x_ref, gate_ref, up_weight_ref, down_weight_ref)
     ref_loss = ref_output.sum()
     ref_loss.backward()
     
-    fused_triton = cast_mlp_fused(x, gate, up_weight, down_weight)
-    fused_triton.sum().backward()
-
-    grad_triton = {
-        'x': x.grad.detach().clone(),
-        'gate': gate.grad.detach().clone(),
-        'up_weight': up_weight.grad.detach().clone(),
-        'down_weight': down_weight.grad.detach().clone(),
+    # Store reference gradients immediately
+    ref_grads = {
+        'x': x_ref.grad.detach().clone(),
+        'gate': gate_ref.grad.detach().clone(),
+        'up_weight': up_weight_ref.grad.detach().clone(),
+        'down_weight': down_weight_ref.grad.detach().clone(),
     }
-
-    grad_diffs = {}
-    def _compute_grad_diff(ref_grad: torch.Tensor, fused_grad: torch.Tensor):
-        if ref_grad is None or fused_grad is None:
-            return 0.0,0.0
-        abs_diff = torch.max(torch.abs(ref_grad - fused_grad.float())).item()
-        abs_ref = torch.max(torch.abs(ref_grad)).item()
+    
+    # Test 2: Fused implementation with PyTorch gradients (CAST_USE_FUSED_GRAD_KERNEL=0)
+    print("  Testing fused forward + PyTorch gradients...")
+    os.environ["CAST_USE_FUSED_GRAD_KERNEL"] = "0"
+    
+    # Ensure complete isolation - deep clone and explicitly zero gradients
+    x_pytorch_grad = x_base.detach().clone().requires_grad_(True)
+    gate_pytorch_grad = gate_base.detach().clone().requires_grad_(True)
+    up_weight_pytorch_grad = up_weight_base.detach().clone().requires_grad_(True)
+    down_weight_pytorch_grad = down_weight_base.detach().clone().requires_grad_(True)
+    
+    # Explicitly zero gradients (though they should be None for new tensors)
+    if x_pytorch_grad.grad is not None:
+        x_pytorch_grad.grad.zero_()
+    if gate_pytorch_grad.grad is not None:
+        gate_pytorch_grad.grad.zero_()
+    if up_weight_pytorch_grad.grad is not None:
+        up_weight_pytorch_grad.grad.zero_()
+    if down_weight_pytorch_grad.grad is not None:
+        down_weight_pytorch_grad.grad.zero_()
+    
+    pytorch_grad_output = cast_mlp_fused(x_pytorch_grad, gate_pytorch_grad, up_weight_pytorch_grad, down_weight_pytorch_grad)
+    pytorch_grad_loss = pytorch_grad_output.sum()
+    pytorch_grad_loss.backward()
+    
+    # Store gradients immediately after backward to avoid contamination
+    pytorch_grads = {
+        'x': x_pytorch_grad.grad.detach().clone(),
+        'gate': gate_pytorch_grad.grad.detach().clone(), 
+        'up_weight': up_weight_pytorch_grad.grad.detach().clone(),
+        'down_weight': down_weight_pytorch_grad.grad.detach().clone(),
+    }
+    
+    # Clear computation graph and gradients before next test
+    del pytorch_grad_output, pytorch_grad_loss
+    x_pytorch_grad.grad = None
+    gate_pytorch_grad.grad = None  
+    up_weight_pytorch_grad.grad = None
+    down_weight_pytorch_grad.grad = None
+    torch.cuda.empty_cache()  # Clear CUDA memory
+    
+    # Test 3: Fused implementation with fused gradients (CAST_USE_FUSED_GRAD_KERNEL=1)  
+    print("  Testing fused forward + fused gradients...")
+    os.environ["CAST_USE_FUSED_GRAD_KERNEL"] = "1"
+    
+    # Completely fresh tensors for fused test
+    x_fused_grad = x_base.detach().clone().requires_grad_(True)
+    gate_fused_grad = gate_base.detach().clone().requires_grad_(True)
+    up_weight_fused_grad = up_weight_base.detach().clone().requires_grad_(True)
+    down_weight_fused_grad = down_weight_base.detach().clone().requires_grad_(True)
+    
+    # Explicitly zero gradients
+    if x_fused_grad.grad is not None:
+        x_fused_grad.grad.zero_()
+    if gate_fused_grad.grad is not None:
+        gate_fused_grad.grad.zero_()
+    if up_weight_fused_grad.grad is not None:
+        up_weight_fused_grad.grad.zero_()
+    if down_weight_fused_grad.grad is not None:
+        down_weight_fused_grad.grad.zero_()
+    
+    fused_grad_output = cast_mlp_fused(x_fused_grad, gate_fused_grad, up_weight_fused_grad, down_weight_fused_grad)
+    fused_grad_loss = fused_grad_output.sum()
+    fused_grad_loss.backward()
+    
+    # Store gradients immediately
+    fused_grads = {
+        'x': x_fused_grad.grad.detach().clone(),
+        'gate': gate_fused_grad.grad.detach().clone(),
+        'up_weight': up_weight_fused_grad.grad.detach().clone(), 
+        'down_weight': down_weight_fused_grad.grad.detach().clone(),
+    }
+    
+    # Compare gradients
+    def compare_grads(name, ref_grad, test_grad):
+        abs_diff = torch.max(torch.abs(ref_grad - test_grad.float())).item()
+        abs_ref = torch.max(torch.abs(ref_grad)).item() 
         rel_diff = abs_diff / (abs_ref + 1e-6)
-        return abs_diff, rel_diff
-
-    names = ['x','gate','up_weight','down_weight']
-    for n in names:
-        abs_d = torch.max(torch.abs(locals()[f"{n}_ref"].grad - grad_triton[n].float())).item()
-        abs_ref = torch.max(torch.abs(locals()[f"{n}_ref"].grad)).item()
-        rel_d = abs_d / (abs_ref + 1e-6)
-        grad_diffs[n] = rel_d
-        print(f"  Grad {n:<10} | abs diff: {abs_d:.3e} | rel diff: {rel_d:.3e}")
+        print(f"    {name:<12} | abs diff: {abs_diff:.3e} | rel diff: {rel_diff:.3e}")
+        return rel_diff
+    
+    grad_diffs = {}
+    
+    print("  PyTorch gradients vs Reference:")
+    names = ['x', 'gate', 'up_weight', 'down_weight']
+    
+    pytorch_diffs = {}
+    for name in names:
+        pytorch_diffs[name] = compare_grads(name, ref_grads[name], pytorch_grads[name])
+    grad_diffs['pytorch'] = pytorch_diffs
+    
+    print("  Fused gradients vs Reference:")
+    fused_diffs = {}
+    for name in names:
+        fused_diffs[name] = compare_grads(name, ref_grads[name], fused_grads[name])
+    grad_diffs['fused'] = fused_diffs
+    
+    print("  Fused gradients vs PyTorch gradients:")
+    comparison_diffs = {}
+    for name in names:
+        comparison_diffs[name] = compare_grads(name, pytorch_grads[name], fused_grads[name])
+    grad_diffs['fused_vs_pytorch'] = comparison_diffs
+    
     return grad_diffs
 
 

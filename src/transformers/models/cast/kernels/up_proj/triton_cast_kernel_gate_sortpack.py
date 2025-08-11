@@ -11,13 +11,65 @@ import triton.language as tl
 #     kernel.
 # =============================================================================
 
+@triton.jit
+def compute_backward_gradients_tile(
+    grad_inter_block, up_proj_cached_ptr, 
+    grad_gate_ptr, grad_up_proj_ptr,
+    row_indices, gate_vals, block_idx, global_cols,
+    mask_bs, mask_ls,
+    stride_up_cached_bs, stride_up_cached_i,
+    stride_grad_gate_bs, stride_grad_gate_nb,
+    stride_grad_up_proj_bs, stride_grad_up_proj_i,
+    out_dtype: tl.constexpr,
+    line_size: tl.constexpr,
+    BLOCK_SIZE_BS: tl.constexpr, BLOCK_SIZE_LS: tl.constexpr,
+):
+    """Compute gate and up_proj gradients for current tile.
+    
+    Gate gradient = sum(grad_inter * up_proj_cached, dim=LS) for each block
+    Up_proj gradient = grad_inter * gate_vals (broadcasted)
+    """
+    # Load up_proj_cached for current tile (grad_inter_block is already passed in)
+    # Only load where gate values are non-zero to avoid uninitialized memory
+    gate_mask = gate_vals > 0.0  # (BLOCK_SIZE_BS,)
+    up_proj_cached_ptrs = up_proj_cached_ptr + row_indices[:, None] * stride_up_cached_bs + global_cols[None, :] * stride_up_cached_i
+    up_proj_cached_block = tl.load(up_proj_cached_ptrs, mask=mask_bs[:, None] & mask_ls[None, :] & gate_mask[:, None], other=0.0)    
+    
+    # ============ Gate Gradient Calculation ============
+    # Compute elementwise product: grad_inter * up_proj_cached
+    grad_product = grad_inter_block * up_proj_cached_block
+    
+    # Reduce over line_size dimension (sum across columns for each row)
+    grad_gate_tile = tl.sum(grad_product, axis=1)  # (BLOCK_SIZE_BS,)
+    
+    # Store gate gradients - each row contributes to one gate element for this block
+    grad_gate_ptrs = grad_gate_ptr + row_indices * stride_grad_gate_bs + block_idx * stride_grad_gate_nb
+    
+    tl.atomic_add(grad_gate_ptrs, grad_gate_tile, mask=mask_bs)
+    
+    # ============ Up_proj Gradient Calculation ============
+    # Broadcast gate_vals to match grad_inter_block shape: (BLOCK_SIZE_BS, BLOCK_SIZE_LS)
+    gate_vals_broadcasted = gate_vals[:, None]  # (BLOCK_SIZE_BS, 1)
+    
+    # Compute grad_up_proj = grad_inter * gate_vals (broadcasted over LS dimension)
+    grad_up_proj_block = grad_inter_block * gate_vals_broadcasted
+    
+    # Apply ReLU mask: only where up_proj_cached > 0
+    relu_mask = up_proj_cached_block > 0.0
+    grad_up_proj_block = tl.where(relu_mask, grad_up_proj_block, 0.0)
+    
+    # Store up_proj gradients directly (no atomic add needed since each tile writes to unique locations)
+    grad_up_proj_ptrs = grad_up_proj_ptr + row_indices[:, None] * stride_grad_up_proj_bs + global_cols[None, :] * stride_grad_up_proj_i
+    tl.store(grad_up_proj_ptrs, grad_up_proj_block.to(out_dtype), mask=mask_bs[:, None] & mask_ls[None, :])
+
 @triton.autotune(
     configs=[
         triton.Config({'BLOCK_SIZE_BS': 16, 'BLOCK_SIZE_H': 16, 'BLOCK_SIZE_LS': 16, 'GROUP_SIZE_R': 4}, num_warps=4),
         triton.Config({'BLOCK_SIZE_BS': 32, 'BLOCK_SIZE_H': 32, 'BLOCK_SIZE_LS': 32, 'GROUP_SIZE_R': 4}, num_warps=8),
         triton.Config({'BLOCK_SIZE_BS': 64, 'BLOCK_SIZE_H': 64, 'BLOCK_SIZE_LS': 64, 'GROUP_SIZE_R': 4}, num_warps=8, num_stages=2),
     ],
-    key=['hidden_size', 'line_size'],
+    key=['hidden_size', 'line_size', 'save_up_proj', 'calculate_grad_gate_up_proj'],
+    reset_to_zero=['grad_gate_ptr'],
 )
 @triton.jit
 def fused_up_proj_gate_sortpack_kernel(
@@ -25,6 +77,12 @@ def fused_up_proj_gate_sortpack_kernel(
     row_idx_ptr, gate_vals_ptr,        # (NB, max_rows) column-major (row-major in memory)
     output_ptr,
     up_proj_ptr,                       # optional output for pre-ReLU values
+    up_proj_cached_ptr,                # pointer to cached up_proj values  
+    grad_gate_ptr,                     # pointer to gate gradient output
+    grad_up_proj_ptr,                  # pointer to up_proj gradient output
+    stride_up_cached_bs, stride_up_cached_i,       # strides for up_proj_cached
+    stride_grad_gate_bs, stride_grad_gate_nb,      # strides for grad_gate output
+    stride_grad_up_proj_bs, stride_grad_up_proj_i, # strides for grad_up_proj output
     # sizes
     hidden_size: tl.constexpr, line_size: tl.constexpr, max_rows: tl.constexpr,
     # strides / leading dimensions
@@ -38,6 +96,7 @@ def fused_up_proj_gate_sortpack_kernel(
     apply_gate: tl.constexpr,
     apply_relu: tl.constexpr,
     save_up_proj: tl.constexpr,        # whether to save pre-ReLU values to up_proj_ptr
+    calculate_grad_gate_up_proj: tl.constexpr, # flag to enable gradient computation
     BLOCK_SIZE_BS: tl.constexpr, BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_LS: tl.constexpr, GROUP_SIZE_R: tl.constexpr,
 ):
@@ -81,10 +140,6 @@ def fused_up_proj_gate_sortpack_kernel(
     # Clamp negative gate values to zero
     gate_vals = tl.where(gate_vals > 0, gate_vals, 0.0)
 
-    # Early exit if this tile is fully padded
-    if tl.sum(gate_vals) == 0:
-        return
-
     # ------------------------------------------------------------------
     # Column offsets for the current tile
     # ------------------------------------------------------------------
@@ -92,6 +147,15 @@ def fused_up_proj_gate_sortpack_kernel(
     mask_ls   = offs_ls < line_size
     col_offset = block_idx * line_size
     global_cols = col_offset + offs_ls
+
+    # Early exit if this tile is fully padded
+    if tl.sum(gate_vals) == 0:
+        # If computing gradients, zero out grad_up_proj for this tile before returning
+        if calculate_grad_gate_up_proj:
+            grad_up_proj_ptrs = grad_up_proj_ptr + row_indices[:, None] * stride_grad_up_proj_bs + global_cols[None, :] * stride_grad_up_proj_i
+            zeros = tl.zeros((BLOCK_SIZE_BS, BLOCK_SIZE_LS), dtype=tl.float32)
+            tl.store(grad_up_proj_ptrs, zeros.to(out_dtype), mask=mask_bs[:, None] & mask_ls[None, :])
+        return
 
     # ------------------------------------------------------------------
     # Accumulator initialisation
@@ -113,21 +177,35 @@ def fused_up_proj_gate_sortpack_kernel(
         w_block = tl.load(w_ptrs, mask=mask_h[:, None] & mask_ls[None, :], other=0.0)
         acc += tl.dot(x_block, w_block)
 
-    # Apply gating first (before ReLU)
-    if apply_gate:
-        acc *= gate_vals[:, None]
-
-    # Store pre-ReLU gated values if requested (for backward pass caching)
+    # Apply activation (ReLU) if requested
+    if apply_relu:
+        acc = tl.where(acc > 0, acc, 0.0)
+    
+    # Store post-ReLU, pre-gating values if requested (for backward pass caching)
     if save_up_proj:
         up_proj_ptrs = up_proj_ptr + row_indices[:, None] * stride_up_proj_bs + global_cols[None, :] * stride_up_proj_i
         tl.store(up_proj_ptrs, acc.to(out_dtype), mask=mask_bs[:, None] & mask_ls[None, :])
 
-    # Apply activation (ReLU) if requested
-    if apply_relu:
-        acc = tl.where(acc > 0, acc, 0.0)
+    if apply_gate:
+        acc *= gate_vals[:, None]
 
     out_ptrs = output_ptr + row_indices[:, None] * stride_out_bs + global_cols[None, :] * stride_out_i
     tl.store(out_ptrs, acc.to(out_dtype), mask=mask_bs[:, None] & mask_ls[None, :])
+    
+    # Conditionally compute backward gradients if requested
+    if calculate_grad_gate_up_proj:
+        compute_backward_gradients_tile(
+            acc, up_proj_cached_ptr, 
+            grad_gate_ptr, grad_up_proj_ptr,
+            row_indices, gate_vals, block_idx, global_cols,
+            mask_bs, mask_ls,
+            stride_up_cached_bs, stride_up_cached_i,
+            stride_grad_gate_bs, stride_grad_gate_nb,
+            stride_grad_up_proj_bs, stride_grad_up_proj_i,
+            out_dtype,
+            line_size,
+            BLOCK_SIZE_BS, BLOCK_SIZE_LS,
+        )
 
 
 # =============================================================================
@@ -151,6 +229,10 @@ def fused_up_proj_gate_activation_sparse_triton_sortpack(
     max_rows: int = None,
     # Optimization parameter - moved to end for backward compatibility
     save_up_proj: bool = False,        # whether to save pre-ReLU values
+    calculate_grad_gate_up_proj: bool = False,
+    up_proj_cached: torch.Tensor = None, 
+    grad_gate_output: torch.Tensor = None,
+    grad_up_proj_output: torch.Tensor = None,
 ):
     """Sort-pack (ELLPACK) sparse fused MLP helper.
 
@@ -203,13 +285,40 @@ def fused_up_proj_gate_activation_sparse_triton_sortpack(
     # Conditionally allocate up_proj buffer for pre-ReLU caching
     # ------------------------------------------------------------------
     if save_up_proj:
-        up_proj_output = torch.empty((batch_seq_size, intermediate_size), device=x.device, dtype=out_dtype)
+        if zero_init:
+            up_proj_output = torch.zeros((batch_seq_size, intermediate_size), device=x.device, dtype=out_dtype)
+        else:
+            up_proj_output = torch.empty((batch_seq_size, intermediate_size), device=x.device, dtype=out_dtype)
         up_proj_ptr = up_proj_output
         stride_up_proj_bs, stride_up_proj_i = up_proj_output.stride()
     else:
         up_proj_output = None
         up_proj_ptr = output  # Use dummy pointer (won't be accessed due to save_up_proj=False)
         stride_up_proj_bs, stride_up_proj_i = 0, 0  # Dummy strides
+
+    # ------------------------------------------------------------------
+    # Handle gradient computation parameters
+    # ------------------------------------------------------------------
+    if calculate_grad_gate_up_proj:
+        if up_proj_cached is None or grad_gate_output is None or grad_up_proj_output is None:
+            raise ValueError("up_proj_cached, grad_gate_output, and grad_up_proj_output must be provided when calculate_grad_gate_up_proj=True")
+        up_proj_cached_ptr = up_proj_cached
+        grad_gate_ptr = grad_gate_output
+        grad_up_proj_ptr = grad_up_proj_output
+        
+        # Zero-initialize grad_gate_output since we use atomic_add for accumulation
+        grad_gate_output.zero_()
+        
+        stride_up_cached_bs, stride_up_cached_i = up_proj_cached.stride()
+        stride_grad_gate_bs, stride_grad_gate_nb = grad_gate_output.stride()
+        stride_grad_up_proj_bs, stride_grad_up_proj_i = grad_up_proj_output.stride()
+    else:
+        up_proj_cached_ptr = output  # Dummy pointer
+        grad_gate_ptr = output  # Dummy pointer
+        grad_up_proj_ptr = output  # Dummy pointer
+        stride_up_cached_bs, stride_up_cached_i = 0, 0
+        stride_grad_gate_bs, stride_grad_gate_nb = 0, 0
+        stride_grad_up_proj_bs, stride_grad_up_proj_i = 0, 0
 
     # ------------------------------------------------------------------
     # Grid size helper (same logic as CSR variant)
@@ -244,6 +353,12 @@ def fused_up_proj_gate_activation_sparse_triton_sortpack(
         gate_vals_flat,
         output,
         up_proj_ptr,
+        up_proj_cached_ptr,
+        grad_gate_ptr,
+        grad_up_proj_ptr,
+        stride_up_cached_bs, stride_up_cached_i,
+        stride_grad_gate_bs, stride_grad_gate_nb,
+        stride_grad_up_proj_bs, stride_grad_up_proj_i,
         hidden_size, line_size, max_rows,
         x_reshaped.stride(0), x_reshaped.stride(1),
         up_weight.stride(0), up_weight.stride(1),
@@ -254,6 +369,7 @@ def fused_up_proj_gate_activation_sparse_triton_sortpack(
         apply_gate=apply_gate,
         apply_relu=apply_relu,
         save_up_proj=save_up_proj,
+        calculate_grad_gate_up_proj=calculate_grad_gate_up_proj,
     )
 
     if save_up_proj:
