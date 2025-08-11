@@ -182,7 +182,6 @@ class _CastMLPFusedFunction(Function):
             # Allocate output buffers for gradients
             grad_gate_flat = torch.empty((BS, NB), device=grad_out_flat.device, dtype=torch.float32)
             grad_up_proj = torch.empty((BS, I), device=grad_out_flat.device, dtype=x.dtype)
-            grad_up_proj.zero_()
             
             # Compute grad_inter_flat AND gate/up_proj gradients in single kernel call
             grad_inter_flat = _up_sparse(
@@ -224,7 +223,7 @@ class _CastMLPFusedFunction(Function):
 
             # ---------------- grad w.r.t. gate -------------------
             grad_gate_flat = (
-                grad_inter_flat.view(BS, NB, LS) * up_proj_flat.view(BS, NB, LS)
+                grad_inter_flat.view(BS, NB, LS).float() * up_proj_flat.view(BS, NB, LS).float()
             ).sum(dim=2)
             pos_mask = (gate_flat > 0).to(grad_gate_flat.dtype)
             grad_gate_flat = grad_gate_flat * pos_mask
