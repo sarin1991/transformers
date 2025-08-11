@@ -1,6 +1,7 @@
 import torch
 from torch.autograd import Function
 import torch.nn.functional as F
+import os
 
 # Import existing Triton helpers (sort-pack variants)
 # Import Triton kernels - works with module execution from cast directory
@@ -95,13 +96,14 @@ class _CastMLPFusedFunction(Function):
                 gate_flat,
                 NB,
                 LS,
+                zero_init=False,  # Fastest path - up projection kernel handles sparse writes correctly
                 out_dtype=x.dtype,
                 gate_vals=gate_vals,
                 row_idx=row_idx,
                 block_counts=block_counts,
                 max_rows=max_rows,
-                save_up_proj=True,  # Cache pre-ReLU values for backward
-            )  # (BS, I) - post-gating intermediate, (BS, I) - pre-ReLU gated
+                save_up_proj=True,  # Cache post-ReLU, pre-gating values for backward
+            )  # (BS, I) - post-gating intermediate, (BS, I) - post-ReLU, pre-gating
         else:
             inter_flat = _up_sparse(
                 x_flat,
@@ -109,6 +111,7 @@ class _CastMLPFusedFunction(Function):
                 gate_flat,
                 NB,
                 LS,
+                zero_init=False,  # Fastest path - no initialization needed for inference
                 out_dtype=x.dtype,
                 gate_vals=gate_vals,
                 row_idx=row_idx,
@@ -170,35 +173,66 @@ class _CastMLPFusedFunction(Function):
             max_rows=max_rows,
         )  # (I, H)
 
-        # ---------------- grad_inter_flat = grad_out · W_downᵀ ----------------
+        # ---------------- grad_inter_flat = grad_out · W_downᵀ + grad w.r.t. gate/up_proj ----------------
         down_w_transposed = down_weight.t()  # (H, I)
+        
+        use_fused_grad_kernel = os.getenv("CAST_USE_FUSED_GRAD_KERNEL", "1") == "1"
+        
+        if use_fused_grad_kernel:
+            # Allocate output buffers for gradients
+            grad_gate_flat = torch.empty((BS, NB), device=grad_out_flat.device, dtype=torch.float32)
+            grad_up_proj = torch.empty((BS, I), device=grad_out_flat.device, dtype=x.dtype)
+            grad_up_proj.zero_()
+            
+            # Compute grad_inter_flat AND gate/up_proj gradients in single kernel call
+            grad_inter_flat = _up_sparse(
+                grad_out_flat,
+                down_w_transposed,
+                gate_flat,
+                NB,
+                LS,
+                out_dtype=grad_out.dtype,
+                apply_gate=False,
+                apply_relu=False,
+                gate_vals=gate_vals,
+                row_idx=row_idx,
+                block_counts=block_counts,
+                max_rows=max_rows,
+                calculate_grad_gate_up_proj=True,
+                up_proj_cached=up_proj_flat,
+                grad_gate_output=grad_gate_flat,
+                grad_up_proj_output=grad_up_proj,
+            )  # (BS, I)
+            
+            grad_gate = grad_gate_flat.view_as(gate)
+        else:
+            # Original approach: separate kernel call for grad_inter_flat, PyTorch for gradients
+            grad_inter_flat = _up_sparse(
+                grad_out_flat,
+                down_w_transposed,
+                gate_flat,
+                NB,
+                LS,
+                out_dtype=grad_out.dtype,
+                apply_gate=False,
+                apply_relu=False,
+                gate_vals=gate_vals,
+                row_idx=row_idx,
+                block_counts=block_counts,
+                max_rows=max_rows,
+            )  # (BS, I)
 
-        grad_inter_flat = _up_sparse(
-            grad_out_flat,
-            down_w_transposed,
-            gate_flat,
-            NB,
-            LS,
-            out_dtype=grad_out.dtype,
-            apply_gate=False,
-            apply_relu=False,
-            gate_vals=gate_vals,
-            row_idx=row_idx,
-            block_counts=block_counts,
-            max_rows=max_rows,
-        )  # (BS, I)
+            # ---------------- grad w.r.t. gate -------------------
+            grad_gate_flat = (
+                grad_inter_flat.view(BS, NB, LS) * up_proj_flat.view(BS, NB, LS)
+            ).sum(dim=2)
+            pos_mask = (gate_flat > 0).to(grad_gate_flat.dtype)
+            grad_gate_flat = grad_gate_flat * pos_mask
+            grad_gate = grad_gate_flat.view_as(gate)
 
-        # ---------------- grad w.r.t. gate -------------------
-        grad_gate_flat = (
-            grad_inter_flat.view(BS, NB, LS) * up_proj_flat.view(BS, NB, LS)
-        ).sum(dim=2)
-        pos_mask = (gate_flat > 0).to(grad_gate_flat.dtype)
-        grad_gate_flat = grad_gate_flat * pos_mask
-        grad_gate = grad_gate_flat.view_as(gate)
-
-        grad_up_relu = grad_inter_flat.view(BS, NB, LS) * gate_flat.to(grad_inter_flat.dtype).view(BS, NB, 1)
-        relu_mask = (up_proj_flat.view(BS, NB, LS) > 0)
-        grad_up_proj = (grad_up_relu * relu_mask).view(BS, I).to(x.dtype)
+            grad_up_relu = grad_inter_flat.view(BS, NB, LS) * gate_flat.to(grad_inter_flat.dtype).view(BS, NB, 1)
+            relu_mask = (up_proj_flat.view(BS, NB, LS) > 0)
+            grad_up_proj = (grad_up_relu * relu_mask).view(BS, I).to(x.dtype)
 
         # grad up weight
         grad_up_w_T = _wg_sparse(
