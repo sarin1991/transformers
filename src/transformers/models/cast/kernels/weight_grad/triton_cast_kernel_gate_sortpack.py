@@ -207,9 +207,11 @@ def fused_weight_grad_sparse_triton_sortpack(
     if gate.dtype != torch.float32:
         gate = gate.float()
 
-    # Contiguous views (ensure memory stride is compact)
-    inter_flat = intermediate.contiguous()
-    other_flat = other.contiguous()
+    # Assert that input tensors have efficient memory layout (at least one stride ≤ 1)
+    assert min(intermediate.stride()) <= 1, f"intermediate has inefficient stride pattern: {intermediate.stride()}"
+    assert min(other.stride()) <= 1, f"other has inefficient stride pattern: {other.stride()}"
+    inter_flat = intermediate
+    other_flat = other
 
     # ------------------------------------------------------------------
     # Require preprocessed gate data - no longer do internal preprocessing

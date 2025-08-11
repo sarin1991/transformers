@@ -257,7 +257,10 @@ def fused_up_proj_gate_activation_sparse_triton_sortpack(
         gate = gate.float()
 
     # Use inputs directly (already flattened)
-    x_reshaped = x.contiguous()  # (BS, H)
+    # Assert that input tensors have efficient memory layout (at least one stride ≤ 1)
+    assert min(x.stride()) <= 1, f"x has inefficient stride pattern: {x.stride()}"
+    assert min(up_weight.stride()) <= 1, f"up_weight has inefficient stride pattern: {up_weight.stride()}"
+    x_reshaped = x  # (BS, H)
 
     # ------------------------------------------------------------------
     # Require preprocessed gate data - no longer do internal preprocessing
