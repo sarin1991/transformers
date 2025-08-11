@@ -218,7 +218,7 @@ def fused_up_proj_gate_activation_sparse_triton_sortpack(
     gate: torch.Tensor,
     num_blocks: int,
     line_size: int,
-    zero_init: bool = True,
+    zero_init: bool = False,
     out_dtype: torch.dtype = torch.float32,
     apply_gate: bool = True,
     apply_relu: bool = True,
