@@ -46,9 +46,16 @@ def _generate_tensors(
 def _run_fused(x, g, up_w, down_w):
     return cast_mlp_fused(x, g, up_w, down_w)
 
+def _run_fused_no_grad(x, g, up_w, down_w):
+    with torch.no_grad():
+        return cast_mlp_fused(x, g, up_w, down_w)
 
 def _run_pytorch(x, g, up_w, down_w, compute_dtype=torch.float32):
     return reference_cast_mlp_pytorch(x, g, up_w, down_w, compute_dtype=compute_dtype)
+
+def _run_pytorch_no_grad(x, g, up_w, down_w, compute_dtype=torch.float32):
+    with torch.no_grad():
+        return reference_cast_mlp_pytorch(x, g, up_w, down_w, compute_dtype=compute_dtype)
 
 
 def _run_fused_backward(loss):
@@ -77,6 +84,7 @@ def main():
     parser.add_argument("--steps", type=int, default=50, help="Profiler steps")
     parser.add_argument("--profile-fused", action="store_true", help="Profile Triton fused kernel")
     parser.add_argument("--profile-pytorch", action="store_true", help="Profile PyTorch reference")
+    parser.add_argument("--forward-grad", action="store_true", help="Profile forward pass with gradient computation")
     parser.add_argument("--profile-backward", action="store_true", help="Profile backward pass instead of forward")
     parser.add_argument(
         "--dtype",
@@ -111,7 +119,7 @@ def main():
         dtype=dtype,
     )
     
-    if args.profile_backward:
+    if args.profile_backward or args.forward_grad:
         x = x.requires_grad_(True)
         gate = gate.requires_grad_(True)
         up_w = up_w.requires_grad_(True)
@@ -150,12 +158,20 @@ def main():
             pytorch_output_template = _run_pytorch(x, gate, up_w, down_w, compute_dtype=dtype)
             pytorch_loss = pytorch_output_template.sum()
             _profile("cast_mlp_pytorch_backward", lambda: _run_pytorch_backward(pytorch_loss))
-    else:
+    elif args.forward_grad:
+        # Forward pass with gradient computation (old default behavior)
         if args.profile_fused:
-            _profile("cast_mlp_fused", lambda: _run_fused(x, gate, up_w, down_w))
+            _profile("cast_mlp_fused_forward_grad", lambda: _run_fused(x, gate, up_w, down_w))
 
         if args.profile_pytorch:
-            _profile("cast_mlp_pytorch", lambda: _run_pytorch(x, gate, up_w, down_w, compute_dtype=dtype))
+            _profile("cast_mlp_pytorch_forward_grad", lambda: _run_pytorch(x, gate, up_w, down_w, compute_dtype=dtype))
+    else:
+        # Default: Forward pass with no gradient computation (fastest)
+        if args.profile_fused:
+            _profile("cast_mlp_fused_forward", lambda: _run_fused_no_grad(x, gate, up_w, down_w))
+
+        if args.profile_pytorch:
+            _profile("cast_mlp_pytorch_forward", lambda: _run_pytorch_no_grad(x, gate, up_w, down_w, compute_dtype=dtype))
 
 
 if __name__ == "__main__":
