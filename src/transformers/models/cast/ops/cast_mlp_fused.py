@@ -73,13 +73,18 @@ class _CastMLPFusedFunction(Function):
         # down_weight is expected to be (I, H) – transpose of up_weight
         assert down_weight.shape == (I, H), "down_weight must have shape (intermediate, hidden)"
 
-        # Ensure contiguous for raw-pointer access
-        up_weight   = up_weight.contiguous()
-        down_weight = down_weight.contiguous()
+        # Handle non-contiguous weights if necessary - only call contiguous() if ALL strides > 1
+        if up_weight.stride(0) > 1 and up_weight.stride(1) > 1:
+            up_weight = up_weight.contiguous()
+        if down_weight.stride(0) > 1 and down_weight.stride(1) > 1:
+            down_weight = down_weight.contiguous()
         gate = F.relu(gate)
 
         # Up-projection + gating (sparse)
         x_flat = x.view(B * S, H)
+        # Handle non-contiguous x_flat if necessary - only call contiguous() if ALL strides > 1
+        if x_flat.stride(0) > 1 and x_flat.stride(1) > 1:
+            x_flat = x_flat.contiguous()
         gate_flat = gate.view(B * S, NB)
         
         # Preprocess gate data once for all kernels
@@ -155,9 +160,15 @@ class _CastMLPFusedFunction(Function):
         BS = B * S
         I = inter_flat.shape[-1]
 
-        grad_out_flat = grad_out.contiguous().view(BS, H)
-        gate_flat     = gate.contiguous().view(BS, NB)
-        x_flat        = x.contiguous().view(BS, H)
+        # Handle non-contiguous inputs if necessary - only call contiguous() if ALL strides > 1
+        if grad_out.stride(0) > 1 and grad_out.stride(1) > 1 and grad_out.stride(2) > 1:
+            grad_out = grad_out.contiguous()
+        if x.stride(0) > 1 and x.stride(1) > 1 and x.stride(2) > 1:
+            x = x.contiguous()
+            
+        grad_out_flat = grad_out.view(BS, H)
+        gate_flat     = gate.view(BS, NB)
+        x_flat        = x.view(BS, H)
 
         # ---- Triton kernel path ----
         # ---------------- grad w.r.t. down_weight ----------------
