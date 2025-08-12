@@ -62,12 +62,30 @@ def compute_backward_gradients_tile(
     grad_up_proj_ptrs = grad_up_proj_ptr + row_indices[:, None] * stride_grad_up_proj_bs + global_cols[None, :] * stride_grad_up_proj_i
     tl.store(grad_up_proj_ptrs, grad_up_proj_block.to(out_dtype), mask=mask_bs[:, None] & mask_ls[None, :])
 
+_CONFIG_WARPS = (4, 8, 16, 32)
+_TILE_SIZES   = (64, 128)
+_NUM_STAGES = (1, 2, 3)
+_GROUP_SIZE_R_CONFIGS = (1, 4, 16)
+
+CONFIGS = []
+for tile in _TILE_SIZES:
+    for warps in _CONFIG_WARPS:
+        for num_stages in _NUM_STAGES:
+            for GROUP_SIZE_R in _GROUP_SIZE_R_CONFIGS:
+                CONFIGS.append(
+                    triton.Config(
+                        {
+                            'BLOCK_SIZE_BS': tile,
+                            'BLOCK_SIZE_LS':  tile,
+                            'BLOCK_SIZE_H':  tile,
+                            'GROUP_SIZE_R': GROUP_SIZE_R,
+                        },
+                        num_warps=warps,
+                        num_stages=num_stages,
+                    )
+                )
 @triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_SIZE_BS': 16, 'BLOCK_SIZE_H': 16, 'BLOCK_SIZE_LS': 16, 'GROUP_SIZE_R': 4}, num_warps=4),
-        triton.Config({'BLOCK_SIZE_BS': 32, 'BLOCK_SIZE_H': 32, 'BLOCK_SIZE_LS': 32, 'GROUP_SIZE_R': 4}, num_warps=8),
-        triton.Config({'BLOCK_SIZE_BS': 64, 'BLOCK_SIZE_H': 64, 'BLOCK_SIZE_LS': 64, 'GROUP_SIZE_R': 4}, num_warps=8, num_stages=2),
-    ],
+    configs=CONFIGS,
     key=['hidden_size', 'line_size', 'save_up_proj', 'calculate_grad_gate_up_proj'],
     reset_to_zero=['grad_gate_ptr'],
 )

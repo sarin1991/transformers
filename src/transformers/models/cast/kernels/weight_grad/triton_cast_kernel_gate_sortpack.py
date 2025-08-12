@@ -12,23 +12,25 @@ import triton.language as tl
 _CONFIG_WARPS  = (2, 4, 8)
 _TILE_SIZES    = (64, 128)
 _NUM_STAGES    = (2, 4)
+_GROUP_SIZE_R_CONFIGS = (1, 4, 16)
 
 CONFIGS = []
 for tile in _TILE_SIZES:
     for warps in _CONFIG_WARPS:
         for stages in _NUM_STAGES:
-            CONFIGS.append(
-                triton.Config(
-                    {
-                        "BLOCK_SIZE_BS": tile,
-                        "BLOCK_SIZE_LS": tile,
-                        "BLOCK_SIZE_H" : tile,
-                        "GROUP_SIZE_R" : 16,
-                    },
-                    num_warps=warps,
-                    num_stages=stages,
+            for GROUP_SIZE_R in _GROUP_SIZE_R_CONFIGS:
+                CONFIGS.append(
+                    triton.Config(
+                        {
+                            "BLOCK_SIZE_BS": tile,
+                            "BLOCK_SIZE_LS": tile,
+                            "BLOCK_SIZE_H" : tile,
+                            "GROUP_SIZE_R" : GROUP_SIZE_R,
+                        },
+                        num_warps=warps,
+                        num_stages=stages,
+                    )
                 )
-            )
 
 
 @triton.autotune(
