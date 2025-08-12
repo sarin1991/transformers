@@ -9,7 +9,7 @@ import triton.language as tl
 # =============================================================================
 
 # ----------------------------- autotune configs -----------------------------
-_CONFIG_WARPS  = (2, 4, 8)
+_CONFIG_WARPS  = (2, 4, 8, 16, 32)
 _TILE_SIZES    = (64, 128)
 _NUM_STAGES    = (2, 4)
 _GROUP_SIZE_R_CONFIGS = (1, 4, 16)
