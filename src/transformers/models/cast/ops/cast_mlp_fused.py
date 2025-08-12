@@ -78,7 +78,6 @@ class _CastMLPFusedFunction(Function):
             up_weight = up_weight.contiguous()
         if down_weight.stride(0) > 1 and down_weight.stride(1) > 1:
             down_weight = down_weight.contiguous()
-        gate = F.relu(gate)
 
         # Up-projection + gating (sparse)
         x_flat = x.view(B * S, H)
@@ -89,6 +88,15 @@ class _CastMLPFusedFunction(Function):
         
         # Preprocess gate data once for all kernels
         gate_vals, row_idx, block_counts, max_rows = _preprocess_gate_data(gate_flat)
+        
+        # Short-circuit if all gate values are zero/negative (max_rows == 0)
+        if max_rows == 0:
+            # Return zeros with the same shape as x
+            ctx.save_for_backward()  # Save empty context for backward
+            ctx.NB = NB
+            ctx.LS = LS
+            ctx.max_rows = max_rows
+            return torch.zeros_like(x)
         
         # Check if any input requires gradients (for backward pass optimization)
         needs_backward = any(t.requires_grad for t in [x, gate, up_weight, down_weight])
@@ -142,7 +150,7 @@ class _CastMLPFusedFunction(Function):
         out = out_flat.view(B, S, H)
 
         # Save tensors for backward
-        ctx.save_for_backward(x, gate, inter_flat, up_weight, down_weight, gate_vals, row_idx, block_counts, up_proj_flat)
+        ctx.save_for_backward(x_flat, gate_flat, inter_flat, up_weight, down_weight, gate_vals, row_idx, block_counts, up_proj_flat)
         ctx.NB = NB
         ctx.LS = LS
         ctx.max_rows = max_rows
@@ -150,25 +158,33 @@ class _CastMLPFusedFunction(Function):
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        x, gate, inter_flat, up_weight, down_weight, gate_vals, row_idx, block_counts, up_proj_flat = ctx.saved_tensors
+        x_flat, gate_flat, inter_flat, up_weight, down_weight, gate_vals, row_idx, block_counts, up_proj_flat = ctx.saved_tensors
         NB, LS, max_rows = ctx.NB, ctx.LS, ctx.max_rows
+        
+        # Short-circuit if max_rows == 0 (all gate values were zero/negative)
+        if max_rows == 0:
+            # Return zero gradients with correct shapes
+            B, S, H = grad_out.shape
+            I = NB * LS  # intermediate size
+            return (
+                torch.zeros_like(grad_out),  # grad_x
+                torch.zeros((B, S, NB), device=grad_out.device, dtype=torch.float32),  # grad_gate 
+                torch.zeros((H, I), device=grad_out.device, dtype=torch.float32),  # grad_up_weight
+                torch.zeros((I, H), device=grad_out.device, dtype=torch.float32),  # grad_down_weight  
+                None,  # grad_kernel (no gradient for string)
+            )
         
         # Assert that up_proj_flat was cached (should always be available in backward pass)
         assert up_proj_flat is not None, "up_proj_flat should be cached when requires_grad=True"
 
-        B, S, H = x.shape
+        B, S, H = grad_out.shape
         BS = B * S
         I = inter_flat.shape[-1]
-
-        # Handle non-contiguous inputs if necessary - only call contiguous() if ALL strides > 1
-        if grad_out.stride(0) > 1 and grad_out.stride(1) > 1 and grad_out.stride(2) > 1:
-            grad_out = grad_out.contiguous()
-        if x.stride(0) > 1 and x.stride(1) > 1 and x.stride(2) > 1:
-            x = x.contiguous()
             
         grad_out_flat = grad_out.view(BS, H)
-        gate_flat     = gate.view(BS, NB)
-        x_flat        = x.view(BS, H)
+        # Handle non-contiguous inputs if necessary - only call contiguous() if ALL strides > 1
+        if grad_out.stride(0) > 1 and grad_out.stride(1) > 1:
+            grad_out = grad_out.contiguous()
 
         # ---- Triton kernel path ----
         # ---------------- grad w.r.t. down_weight ----------------
@@ -192,7 +208,7 @@ class _CastMLPFusedFunction(Function):
         if use_fused_grad_kernel:
             # Allocate output buffers for gradients
             grad_gate_flat = torch.empty((BS, NB), device=grad_out_flat.device, dtype=torch.float32)
-            grad_up_proj = torch.empty((BS, I), device=grad_out_flat.device, dtype=x.dtype)
+            grad_up_proj = torch.empty((BS, I), device=grad_out_flat.device, dtype=x_flat.dtype)
             
             # Compute grad_inter_flat AND gate/up_proj gradients in single kernel call
             grad_inter_flat = _up_sparse(
@@ -214,7 +230,7 @@ class _CastMLPFusedFunction(Function):
                 grad_up_proj_output=grad_up_proj,
             )  # (BS, I)
             
-            grad_gate = grad_gate_flat.view_as(gate)
+            grad_gate = grad_gate_flat.view(B,S,NB)
         else:
             # Original approach: separate kernel call for grad_inter_flat, PyTorch for gradients
             grad_inter_flat = _up_sparse(
@@ -238,11 +254,11 @@ class _CastMLPFusedFunction(Function):
             ).sum(dim=2)
             pos_mask = (gate_flat > 0).to(grad_gate_flat.dtype)
             grad_gate_flat = grad_gate_flat * pos_mask
-            grad_gate = grad_gate_flat.view_as(gate)
+            grad_gate = grad_gate_flat.view(B,S,NB)
 
             grad_up_relu = grad_inter_flat.view(BS, NB, LS) * gate_flat.to(grad_inter_flat.dtype).view(BS, NB, 1)
             relu_mask = (up_proj_flat.view(BS, NB, LS) > 0)
-            grad_up_proj = (grad_up_relu * relu_mask).view(BS, I).to(x.dtype)
+            grad_up_proj = (grad_up_relu * relu_mask).view(BS, I).to(x_flat.dtype)
 
         # grad up weight
         grad_up_w_T = _wg_sparse(
@@ -270,7 +286,7 @@ class _CastMLPFusedFunction(Function):
             block_counts=block_counts,
             max_rows=max_rows,
         )
-        grad_x = grad_x_flat.view_as(x)
+        grad_x = grad_x_flat.view(B, S, H)
 
         grad_kernel = None
 
