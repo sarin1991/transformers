@@ -4,11 +4,11 @@ from typing import Tuple
 import torch
 import torch.nn.functional as F
 
-# Absolute imports to reference sort-pack up/down kernels
-from transformers.models.cast.kernels.up_proj.triton_cast_kernel_gate_sortpack import (
+# Imports referencing sort-pack up/down kernels within the cast package
+from kernels.up_proj.triton_cast_kernel_gate_sortpack import (
     fused_up_proj_gate_activation_sparse_triton_sortpack,
 )
-from transformers.models.cast.kernels.down_proj.triton_cast_kernel_gate_sortpack import (
+from kernels.down_proj.triton_cast_kernel_gate_sortpack import (
     fused_down_proj_sparse_triton_sortpack,
 )
 
