@@ -43,6 +43,12 @@ def time_cuda(fn, iters: int = 100):
 def main():
     parser = argparse.ArgumentParser(description="Benchmark fused up+down vs two-step sort-pack kernels")
     parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument(
+        "--sparsity",
+        type=str,
+        default="dynamic",
+        help="Fraction of zeros in gate (e.g., 0.9) or 'dynamic' to use 1 - 1/num_blocks per config",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -69,8 +75,20 @@ def main():
         x = torch.randn(bs, h, device="cuda", dtype=torch.float16)
         up_w = torch.randn(h, inter, device="cuda", dtype=torch.float16)
         down_w = torch.randn(inter, h, device="cuda", dtype=torch.float16)
+
+        if args.sparsity == "dynamic":
+            zeros_frac = 1.0 - (1.0 / nb)
+        else:
+            try:
+                zeros_frac = float(args.sparsity)
+            except ValueError as e:
+                raise ValueError(
+                    f"Invalid --sparsity value '{args.sparsity}'. Use 'dynamic' or a float between 0 and 1."
+                ) from e
+            zeros_frac = max(0.0, min(1.0, zeros_frac))
+
         gate = torch.rand(bs, nb, device="cuda", dtype=torch.float32)
-        gate[torch.rand_like(gate) < 0.9] = 0.0
+        gate[torch.rand_like(gate) < zeros_frac] = 0.0
 
         gate_vals, row_idx, block_counts, max_rows = _preprocess_gate(gate, nb)
 
