@@ -69,6 +69,7 @@ def fused_up_down_proj_sortpack_kernel(
     stride_up_bs, stride_up_i,
     # meta
     out_dtype: tl.constexpr,
+    in_dtype: tl.constexpr,
     apply_gate: tl.constexpr,
     apply_relu: tl.constexpr,
     save_up_proj: tl.constexpr,
@@ -147,6 +148,8 @@ def fused_up_down_proj_sortpack_kernel(
     if apply_gate:
         acc *= gate_vals[:, None]
 
+    acc_for_down = acc.to(in_dtype)
+
     # Down-proj accumulation into Y in chunks of H
     for h_out in range(0, hidden_size, BLOCK_SIZE_H):
         offs_h2 = h_out + tl.arange(0, BLOCK_SIZE_H)
@@ -154,8 +157,7 @@ def fused_up_down_proj_sortpack_kernel(
 
         wd_ptrs = w_down_ptr + global_cols[:, None] * stride_wd_ls + offs_h2[None, :] * stride_wd_h
         wdown_block = tl.load(wd_ptrs, mask=mask_ls[:, None] & mask_h2[None, :], other=0.0)
-
-        y_tile_out = tl.dot(acc, wdown_block)  # (BS_tile, H_tile)
+        y_tile_out = tl.dot(acc_for_down, wdown_block)  # (BS_tile, H_tile)
 
         y_ptrs = y_ptr + row_indices[:, None] * stride_y_bs + offs_h2[None, :] * stride_y_h
         tl.atomic_add(y_ptrs, y_tile_out.to(out_dtype), mask=mask_bs[:, None] & mask_h2[None, :], sem="relaxed")
@@ -267,6 +269,7 @@ def fused_up_down_proj_sparse_triton_sortpack(
         torch.float32: tl.float32,
     }
     triton_out_dtype = dtype_map[out_dtype]
+    triton_in_dtype = dtype_map[x.dtype]
 
     # Grid function needs knowledge of NB and max_rows; line_size is captured by autotune meta
     def grid(meta):
@@ -297,6 +300,7 @@ def fused_up_down_proj_sparse_triton_sortpack(
         y.stride(0), y.stride(1),
         stride_up_bs, stride_up_i,
         out_dtype=triton_out_dtype,
+        in_dtype=triton_in_dtype,
         apply_gate=apply_gate,
         apply_relu=apply_relu,
         save_up_proj=save_up_proj,
