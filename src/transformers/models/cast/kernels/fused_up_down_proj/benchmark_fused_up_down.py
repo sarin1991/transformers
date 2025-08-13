@@ -43,7 +43,6 @@ def time_cuda(fn, iters: int = 100):
 def main():
     parser = argparse.ArgumentParser(description="Benchmark fused up+down vs two-step sort-pack kernels")
     parser.add_argument("--iters", type=int, default=100)
-    parser.add_argument("--all-configs", action="store_true", help="Run a suite of configs")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -52,16 +51,15 @@ def main():
 
     torch.manual_seed(0)
 
-    if args.all_configs:
-        configs = [
-            (4, 8, 128, 4, 32),
-            (8, 16, 256, 8, 32),
-            (128, 32, 512, 8, 64),
-            (128, 128, 4096, 64, 64),
-            (128, 128, 4096, 8, 4096),
-        ]
-    else:
-        configs = [(128, 128, 4096, 64, 64)]
+    # Always use the full config suite (matches other kernels)
+    configs = [
+        (128, 128, 4096, 64, 64),
+        (128, 128, 4096, 256, 128),
+        (128, 128, 4096, 128, 256),
+        (128, 128, 4096, 64, 512),
+        (128, 128, 4096, 32, 1024),
+        (128, 128, 4096, 8, 4096),
+    ]
 
     print("\n=== Fused Up+Down Benchmark (SortPack) ===")
     for b, s, h, nb, ls in configs:

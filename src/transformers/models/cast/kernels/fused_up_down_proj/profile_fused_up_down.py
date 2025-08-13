@@ -93,6 +93,7 @@ def main():
     parser.add_argument("--hidden", type=int, default=4096)
     parser.add_argument("--num-blocks", type=int, default=64)
     parser.add_argument("--line-size", type=int, default=64)
+    parser.add_argument("--big-config", action="store_true", help="Use (batch=128, seq=128, hidden=4096, num_blocks=8, line_size=4096)")
     parser.add_argument("--sparsity", type=float, default=0.9)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--row-limit", type=int, default=30)
@@ -101,6 +102,13 @@ def main():
     if not torch.cuda.is_available():
         print("CUDA not available – exiting")
         return
+
+    if args.big_config:
+        args.batch = 128
+        args.seq = 128
+        args.hidden = 4096
+        args.num_blocks = 8
+        args.line_size = 4096
 
     x, up_w, down_w, gate = _make_tensors(args.batch, args.seq, args.hidden, args.num_blocks, args.line_size, args.sparsity)
     gate_vals, row_idx, block_counts, max_rows = _preprocess_gate(gate, args.num_blocks)

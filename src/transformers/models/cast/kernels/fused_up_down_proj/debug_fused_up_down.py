@@ -162,8 +162,22 @@ def main():
     parser.add_argument("--sparsity", type=float, default=0.9, help="Fraction of zeros in gate")
     parser.add_argument("--apply-relu", action="store_true", help="Apply ReLU in up-proj before gate")
     parser.add_argument("--no-gate", action="store_true", help="Disable gating multiply")
-    parser.add_argument("--configs", type=str, default="2,4,128,4,32;4,8,256,8,32;8,16,512,8,64",
-                        help="Semicolon-separated configs as B,S,H,NB,LS")
+    parser.add_argument(
+        "--configs",
+        type=str,
+        default=(
+            "4,8,128,4,32;"
+            "8,16,256,8,32;"
+            "128,32,512,8,64;"
+            "128,128,4096,64,64;"
+            "128,128,4096,256,128;"
+            "128,128,4096,128,256;"
+            "128,128,4096,64,512;"
+            "128,128,4096,32,1024;"
+            "128,128,4096,8,4096"
+        ),
+        help="Semicolon-separated configs as B,S,H,NB,LS (matches other kernels)",
+    )
 
     args = parser.parse_args()
 
