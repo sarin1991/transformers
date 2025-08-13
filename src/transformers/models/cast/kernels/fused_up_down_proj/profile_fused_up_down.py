@@ -15,15 +15,20 @@ from kernels.down_proj.triton_cast_kernel_gate_sortpack import (
 )
 
 
-def _make_tensors(batch: int, seq: int, hidden: int, nb: int, ls: int, sparsity: float):
+def _make_tensors(batch: int, seq: int, hidden: int, nb: int, ls: int, sparsity: float | str):
     bs = batch * seq
     inter = nb * ls
     x = torch.randn(bs, hidden, device="cuda", dtype=torch.float16)
     up_w = torch.randn(hidden, inter, device="cuda", dtype=torch.float16)
     down_w = torch.randn(inter, hidden, device="cuda", dtype=torch.float16)
     gate = torch.rand(bs, nb, device="cuda", dtype=torch.float32)
-    if sparsity > 0.0:
-        gate[torch.rand_like(gate) < sparsity] = 0.0
+    # Dynamic sparsity: expected 1 active block per row
+    if isinstance(sparsity, str) and sparsity == "dynamic":
+        zeros_frac = 1.0 - (1.0 / nb)
+    else:
+        zeros_frac = float(sparsity)
+    if zeros_frac > 0:
+        gate[torch.rand_like(gate) < zeros_frac] = 0.0
     return x, up_w, down_w, gate
 
 
@@ -94,7 +99,7 @@ def main():
     parser.add_argument("--num-blocks", type=int, default=64)
     parser.add_argument("--line-size", type=int, default=64)
     parser.add_argument("--big-config", action="store_true", help="Use (batch=128, seq=128, hidden=4096, num_blocks=8, line_size=4096)")
-    parser.add_argument("--sparsity", type=float, default=0.9)
+    parser.add_argument("--sparsity", type=str, default="dynamic", help="'dynamic' or a float in [0,1]")
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--row-limit", type=int, default=30)
     args = parser.parse_args()
