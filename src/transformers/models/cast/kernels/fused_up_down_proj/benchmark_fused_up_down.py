@@ -92,8 +92,9 @@ def main():
 
         gate_vals, row_idx, block_counts, max_rows = _preprocess_gate(gate, nb)
 
-        fused_ms = time_cuda(
-            lambda: fused_up_down_proj_sparse_triton_sortpack(
+        # Prepare callables
+        def fused_call():
+            return fused_up_down_proj_sparse_triton_sortpack(
                 x,
                 up_w,
                 down_w,
@@ -108,11 +109,9 @@ def main():
                 block_counts=block_counts,
                 max_rows=max_rows,
                 save_up_proj=False,
-            ),
-            iters=args.iters,
-        )
+            )
 
-        def run_two_step():
+        def two_step_call():
             inter_act = fused_up_proj_gate_activation_sparse_triton_sortpack(
                 x,
                 up_w,
@@ -126,7 +125,7 @@ def main():
                 block_counts=block_counts,
                 max_rows=max_rows,
             )
-            fused_down_proj_sparse_triton_sortpack(
+            return fused_down_proj_sparse_triton_sortpack(
                 inter_act,
                 down_w,
                 gate,
@@ -139,7 +138,15 @@ def main():
                 max_rows=max_rows,
             )
 
-        two_step_ms = time_cuda(run_two_step, iters=args.iters)
+        for _ in range(5):
+            fused_call()
+        torch.cuda.synchronize()
+        fused_ms = time_cuda(fused_call, iters=args.iters)
+
+        for _ in range(5):
+            two_step_call()
+        torch.cuda.synchronize()
+        two_step_ms = time_cuda(two_step_call, iters=args.iters)
 
         print(
             f"Config B={b} S={s} H={h} NB={nb} LS={ls} | Fused: {fused_ms:.3f} ms | Two-step: {two_step_ms:.3f} ms | Speedup: {two_step_ms / fused_ms:.2f}x"
