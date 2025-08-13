@@ -62,30 +62,54 @@ def compute_backward_gradients_tile(
     grad_up_proj_ptrs = grad_up_proj_ptr + row_indices[:, None] * stride_grad_up_proj_bs + global_cols[None, :] * stride_grad_up_proj_i
     tl.store(grad_up_proj_ptrs, grad_up_proj_block.to(out_dtype), mask=mask_bs[:, None] & mask_ls[None, :])
 
-_CONFIG_WARPS = (4, 8, 16, 32)
-_TILE_SIZES   = (64, 128)
-_NUM_STAGES = (1, 2, 3)
-_GROUP_SIZE_R_CONFIGS = (1, 4, 16)
+def get_triton_autotune_config():
+    """
+    Hand-picked subset of the full 2 × 4 × 3 × 3 search space.
+    – First three entries target very large / square tiles.
+    – The next six entries handle rectangular tiles (one or two skinny dims).
+    – The last three give fall-backs for very small GROUP_SIZE_R or
+      extremely large grids.
+    """
+    return [
+        # ------------------------------------------------------------------
+        # 1) Square / very large matrices
+        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_LS': 128, 'BLOCK_SIZE_H': 128,
+                       'GROUP_SIZE_R':  4},  num_warps=16, num_stages=3),
+        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_LS': 128, 'BLOCK_SIZE_H': 128,
+                       'GROUP_SIZE_R': 16},  num_warps=16, num_stages=2),
+        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_LS': 128, 'BLOCK_SIZE_H': 128,
+                       'GROUP_SIZE_R':  4},  num_warps=32, num_stages=1),
 
-CONFIGS = []
-for tile in _TILE_SIZES:
-    for warps in _CONFIG_WARPS:
-        for num_stages in _NUM_STAGES:
-            for GROUP_SIZE_R in _GROUP_SIZE_R_CONFIGS:
-                CONFIGS.append(
-                    triton.Config(
-                        {
-                            'BLOCK_SIZE_BS': tile,
-                            'BLOCK_SIZE_LS':  tile,
-                            'BLOCK_SIZE_H':  tile,
-                            'GROUP_SIZE_R': GROUP_SIZE_R,
-                        },
-                        num_warps=warps,
-                        num_stages=num_stages,
-                    )
-                )
+        # ------------------------------------------------------------------
+        # 2) One skinny dimension (64) – three permutations
+        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_LS': 128, 'BLOCK_SIZE_H':  64,
+                       'GROUP_SIZE_R':  4},  num_warps=8,  num_stages=2),
+        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_LS':  64, 'BLOCK_SIZE_H': 128,
+                       'GROUP_SIZE_R':  4},  num_warps=8,  num_stages=2),
+        triton.Config({'BLOCK_SIZE_BS':  64, 'BLOCK_SIZE_LS': 128, 'BLOCK_SIZE_H': 128,
+                       'GROUP_SIZE_R':  4},  num_warps=8,  num_stages=2),
+
+        # ------------------------------------------------------------------
+        # 3) Two skinny dimensions (64) – again all permutations
+        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_LS':  64, 'BLOCK_SIZE_H':  64,
+                       'GROUP_SIZE_R':  4},  num_warps=4,  num_stages=2),
+        triton.Config({'BLOCK_SIZE_BS':  64, 'BLOCK_SIZE_LS': 128, 'BLOCK_SIZE_H':  64,
+                       'GROUP_SIZE_R':  4},  num_warps=4,  num_stages=2),
+        triton.Config({'BLOCK_SIZE_BS':  64, 'BLOCK_SIZE_LS':  64, 'BLOCK_SIZE_H': 128,
+                       'GROUP_SIZE_R':  4},  num_warps=4,  num_stages=2),
+
+        # ------------------------------------------------------------------
+        # 4) Fallback / edge cases
+        triton.Config({'BLOCK_SIZE_BS':  64, 'BLOCK_SIZE_LS':  64, 'BLOCK_SIZE_H':  64,
+                       'GROUP_SIZE_R':  4},  num_warps=8,  num_stages=3),
+        triton.Config({'BLOCK_SIZE_BS':  64, 'BLOCK_SIZE_LS':  64, 'BLOCK_SIZE_H':  64,
+                       'GROUP_SIZE_R':  1},  num_warps=8,  num_stages=3),
+        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_LS': 128, 'BLOCK_SIZE_H':  64,
+                       'GROUP_SIZE_R': 16},  num_warps=16, num_stages=2),
+    ]
+
 @triton.autotune(
-    configs=CONFIGS,
+    configs=get_triton_autotune_config(),
     key=['hidden_size', 'line_size', 'save_up_proj', 'calculate_grad_gate_up_proj'],
     reset_to_zero=['grad_gate_ptr'],
 )
