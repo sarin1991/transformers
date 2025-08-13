@@ -7,10 +7,10 @@ from torch.profiler import ProfilerActivity, profile, record_function
 from .triton_cast_kernel_gate_sortpack_fused import (
     fused_up_down_proj_sparse_triton_sortpack,
 )
-from transformers.models.cast.kernels.up_proj.triton_cast_kernel_gate_sortpack import (
+from kernels.up_proj.triton_cast_kernel_gate_sortpack import (
     fused_up_proj_gate_activation_sparse_triton_sortpack,
 )
-from transformers.models.cast.kernels.down_proj.triton_cast_kernel_gate_sortpack import (
+from kernels.down_proj.triton_cast_kernel_gate_sortpack import (
     fused_down_proj_sparse_triton_sortpack,
 )
 
