@@ -7,7 +7,7 @@ from torch.profiler import ProfilerActivity, profile, record_function
 # Local imports – run from cast root directory
 #   cd src/transformers/models/cast/
 #   python -m ops.profile_cast_mlp
-from ops.cast_mlp_fused import cast_mlp_fused
+from ops.cast_mlp_fused import cast_mlp_fused, _CastMLPFusedFunction
 from ops.debug_cast_mlp_fused import reference_cast_mlp_pytorch, _make_sparse_gate
 
 
@@ -21,7 +21,7 @@ def _generate_tensors(
     hidden_size: int,
     num_blocks: int,
     line_size: int,
-    sparsity: float,
+    sparsity,
     dtype: torch.dtype = torch.float16,
     device: torch.device = torch.device("cuda"),
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -29,8 +29,20 @@ def _generate_tensors(
     intermediate_size = num_blocks * line_size
     batch_seq_size = batch_size * seq_len
 
+    # Calculate sparsity
+    if sparsity == "dynamic":
+        zeros_frac = 1.0 - (1.0 / num_blocks)
+    else:
+        try:
+            zeros_frac = float(sparsity)
+        except (ValueError, TypeError) as e:
+            raise ValueError(
+                f"Invalid --sparsity value '{sparsity}'. Use 'dynamic' or a float between 0 and 1."
+            ) from e
+        zeros_frac = max(0.0, min(1.0, zeros_frac))
+
     x = torch.randn(batch_size, seq_len, hidden_size, device=device, dtype=dtype)
-    gate = _make_sparse_gate(batch_seq_size, num_blocks, sparsity=sparsity).view(
+    gate = _make_sparse_gate(batch_seq_size, num_blocks, sparsity=zeros_frac).view(
         batch_size, seq_len, num_blocks
     )
     up_weight = torch.randn(hidden_size, intermediate_size, device=device, dtype=dtype)
@@ -66,6 +78,32 @@ def _run_pytorch_backward(loss):
     loss.backward(retain_graph=True)
 
 
+def _setup_direct_backward_context(x, gate, up_w, down_w):
+    """Setup context for direct kernel backward profiling."""
+    # Create mock context
+    class MockContext:
+        def __init__(self):
+            pass
+            
+        def save_for_backward(self, *tensors):
+            self.saved_tensors = tensors
+    
+    ctx = MockContext()
+    
+    # Run actual forward pass to populate context with real intermediate tensors
+    fused_output = _CastMLPFusedFunction.forward(ctx, x, gate, up_w, down_w)
+    
+    # Create gradient output identical to fused_loss.sum() case
+    grad_out = torch.tensor(1.0, device=fused_output.device, dtype=fused_output.dtype).expand_as(fused_output)
+    
+    return ctx, grad_out
+
+
+def _run_direct_kernel_backward(ctx, grad_out):
+    """Direct kernel backward call for profiling."""
+    _CastMLPFusedFunction.backward(ctx, grad_out)
+
+
 # -----------------------------------------------------------------------------
 # Main CLI entry
 # -----------------------------------------------------------------------------
@@ -80,12 +118,21 @@ def main():
     parser.add_argument("--hidden", type=int, default=4096)
     parser.add_argument("--num-blocks", type=int, default=8)
     parser.add_argument("--line-size", type=int, default=4096)
-    parser.add_argument("--sparsity", type=float, default=0.9, help="Fraction of zeros in gate tensor")
+    parser.add_argument(
+        "--sparsity",
+        default="dynamic",
+        help="Fraction of zeros in gate (e.g., 0.9) or 'dynamic' to use 1 - 1/num_blocks per config",
+    )
     parser.add_argument("--steps", type=int, default=50, help="Profiler steps")
     parser.add_argument("--profile-fused", action="store_true", help="Profile Triton fused kernel")
     parser.add_argument("--profile-pytorch", action="store_true", help="Profile PyTorch reference")
     parser.add_argument("--forward-grad", action="store_true", help="Profile forward pass with gradient computation")
     parser.add_argument("--profile-backward", action="store_true", help="Profile backward pass instead of forward")
+    parser.add_argument(
+        "--measure-total-backward",
+        action="store_true",
+        help="Measure total backward (autograd) instead of direct kernel backward when profiling backward",
+    )
     parser.add_argument(
         "--dtype",
         default="float16",
@@ -148,13 +195,18 @@ def main():
 
     if args.profile_backward:
         if args.profile_fused:
-            # Pre-compute forward pass output as template
-            fused_output_template = _run_fused(x, gate, up_w, down_w)
-            fused_loss = fused_output_template.sum()
-            _profile("cast_mlp_fused_backward", lambda: _run_fused_backward(fused_loss))
+            if args.measure_total_backward:
+                # Total autograd path (includes PyTorch overhead)
+                fused_output_template = _run_fused(x, gate, up_w, down_w)
+                fused_loss = fused_output_template.sum()
+                _profile("cast_mlp_fused_backward_total", lambda: _run_fused_backward(fused_loss))
+            else:
+                # Direct kernel backward (no PyTorch autograd overhead)
+                ctx, grad_out = _setup_direct_backward_context(x, gate, up_w, down_w)
+                _profile("cast_mlp_fused_backward_kernel", lambda: _run_direct_kernel_backward(ctx, grad_out))
 
         if args.profile_pytorch:
-            # Pre-compute forward pass output as template
+            # PyTorch reference always uses total autograd path
             pytorch_output_template = _run_pytorch(x, gate, up_w, down_w, compute_dtype=dtype)
             pytorch_loss = pytorch_output_template.sum()
             _profile("cast_mlp_pytorch_backward", lambda: _run_pytorch_backward(pytorch_loss))
