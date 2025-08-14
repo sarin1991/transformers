@@ -4,12 +4,12 @@ import torch
 # Local imports – run from cast root directory
 #   cd src/transformers/models/cast/
 #   python -m ops.benchmark_cast_mlp
-from ops.cast_mlp_fused import cast_mlp_fused
+from ops.cast_mlp_fused import cast_mlp_fused, _CastMLPFusedFunction
 from ops.debug_cast_mlp_fused import reference_cast_mlp_pytorch, _make_sparse_gate
 
 
 
-def benchmark_cast_mlp(num_iters: int = 100, sparsity: float = 0.9, dtype: torch.dtype = torch.float16):
+def benchmark_cast_mlp(num_iters: int = 100, sparsity = "dynamic", dtype: torch.dtype = torch.float16, measure_total_backward: bool = False):
     """Benchmark CAST fused MLP against a PyTorch reference implementation.
 
     The reference is implemented in *debug_cast_mlp_fused.py* to keep results consistent across
@@ -24,24 +24,33 @@ def benchmark_cast_mlp(num_iters: int = 100, sparsity: float = 0.9, dtype: torch
 
     # (batch, seq_len, hidden_size, num_blocks, line_size)
     configs = [
-        (4, 8, 128, 4, 32),
-        (8, 16, 256, 8, 32),
-        (128, 32, 512, 8, 64),
-        (128, 256, 4096, 64, 64),
-        (128, 256, 4096, 256, 128),
-        (128, 256, 4096, 128, 256),
-        (128, 256, 4096, 64, 512),
-        (128, 256, 4096, 32, 1024),
-        (128, 256, 4096, 8, 4096),
+        (128, 256, 4096, 256, 64),
+        (128, 256, 4096, 128, 128),
+        (128, 256, 4096, 64, 256),
+        (128, 256, 4096, 32, 512),
+        (128, 256, 4096, 16, 1024),
+        (128, 256, 4096, 4, 4096),
     ]
 
     for batch_size, seq_len, hidden_size, num_blocks, line_size in configs:
         intermediate_size = num_blocks * line_size
         batch_seq_size = batch_size * seq_len
 
+        # Calculate sparsity
+        if sparsity == "dynamic":
+            zeros_frac = 1.0 - (1.0 / num_blocks)
+        else:
+            try:
+                zeros_frac = float(sparsity)
+            except (ValueError, TypeError) as e:
+                raise ValueError(
+                    f"Invalid --sparsity value '{sparsity}'. Use 'dynamic' or a float between 0 and 1."
+                ) from e
+            zeros_frac = max(0.0, min(1.0, zeros_frac))
+
         cfg_str = (
             f"B={batch_size} S={seq_len} H={hidden_size} "
-            f"NB={num_blocks} LS={line_size} | I={intermediate_size}"
+            f"NB={num_blocks} LS={line_size} | I={intermediate_size} | Sparsity={zeros_frac:.3f}"
         )
         print(f"\nConfig: {cfg_str}  |  Iters: {num_iters}")
 
@@ -49,7 +58,7 @@ def benchmark_cast_mlp(num_iters: int = 100, sparsity: float = 0.9, dtype: torch
         # Create random tensors (no gradients for forward-only benchmarking)
         # ------------------------------------------------------------------
         x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=dtype)
-        gate = _make_sparse_gate(batch_seq_size, num_blocks, sparsity=sparsity).view(
+        gate = _make_sparse_gate(batch_seq_size, num_blocks, sparsity=zeros_frac).view(
             batch_size, seq_len, num_blocks
         )
         up_weight = torch.randn(hidden_size, intermediate_size, device="cuda", dtype=dtype)
@@ -123,24 +132,68 @@ def benchmark_cast_mlp(num_iters: int = 100, sparsity: float = 0.9, dtype: torch
 
         print(f"PyTorch reference: {ref_bwd_ms:.3f} ms")
 
-        # Triton fused backward
-        fused_output = cast_mlp_fused(x_grad, gate_grad, up_weight_grad, down_weight_grad)
-        fused_loss = fused_output.sum()
-        for _ in range(5):
-            fused_loss.backward(retain_graph=True)
-        torch.cuda.synchronize()
+        if measure_total_backward:
+            # Triton fused backward - total autograd path (includes PyTorch overhead)
+            fused_output = cast_mlp_fused(x_grad, gate_grad, up_weight_grad, down_weight_grad)
+            fused_loss = fused_output.sum()
+            for _ in range(5):
+                fused_loss.backward(retain_graph=True)
+            torch.cuda.synchronize()
 
-        t_start_fused_bwd = torch.cuda.Event(enable_timing=True)
-        t_end_fused_bwd = torch.cuda.Event(enable_timing=True)
-        t_start_fused_bwd.record()
-        for _ in range(num_iters):
-            fused_loss.backward(retain_graph=True)
-        t_end_fused_bwd.record()
-        torch.cuda.synchronize()
-        fused_bwd_ms = t_start_fused_bwd.elapsed_time(t_end_fused_bwd) / num_iters
+            t_start_fused_bwd = torch.cuda.Event(enable_timing=True)
+            t_end_fused_bwd = torch.cuda.Event(enable_timing=True)
+            t_start_fused_bwd.record()
+            for _ in range(num_iters):
+                fused_loss.backward(retain_graph=True)
+            t_end_fused_bwd.record()
+            torch.cuda.synchronize()
+            fused_bwd_ms = t_start_fused_bwd.elapsed_time(t_end_fused_bwd) / num_iters
+        else:
+            # Triton fused backward - direct kernel call (no PyTorch autograd overhead)
+            # Setup tensors and run forward pass to populate context
+            x_fused = x.clone().requires_grad_(True)
+            gate_fused = gate.clone().requires_grad_(True) 
+            up_weight_fused = up_weight.clone().requires_grad_(True)
+            down_weight_fused = down_weight.clone().requires_grad_(True)
+            
+            # Create mock context that mimics the real Function context
+            class MockContext:
+                def __init__(self):
+                    pass
+                    
+                def save_for_backward(self, *tensors):
+                    self.saved_tensors = tensors
+            
+            ctx = MockContext()
+            
+            # Run actual forward pass to populate context with real intermediate tensors
+            fused_output = _CastMLPFusedFunction.forward(ctx, x_fused, gate_fused, up_weight_fused, down_weight_fused)
+            
+            # Context now contains:
+            # - saved_tensors: (x_flat, gate_flat, inter_flat, up_weight, down_weight, gate_vals, row_idx, block_counts, up_proj_flat)
+            # - ctx.NB, ctx.LS, ctx.max_rows (set by forward)
+            
+            # Create gradient output identical to fused_loss.sum() case
+            # fused_loss.sum().backward() creates a gradient with stride 0 (broadcasted)
+            grad_out = torch.tensor(1.0, device=fused_output.device, dtype=fused_output.dtype).expand_as(fused_output)
+            
+            # Warm-up direct backward calls
+            for _ in range(5):
+                _CastMLPFusedFunction.backward(ctx, grad_out)
+            torch.cuda.synchronize()
+
+            t_start_fused_bwd = torch.cuda.Event(enable_timing=True)
+            t_end_fused_bwd = torch.cuda.Event(enable_timing=True)
+            t_start_fused_bwd.record()
+            for _ in range(num_iters):
+                _CastMLPFusedFunction.backward(ctx, grad_out)
+            t_end_fused_bwd.record()
+            torch.cuda.synchronize()
+            fused_bwd_ms = t_start_fused_bwd.elapsed_time(t_end_fused_bwd) / num_iters
 
         speedup_bwd = ref_bwd_ms / fused_bwd_ms if fused_bwd_ms > 0.0 else float('inf')
-        print(f"Triton fused:     {fused_bwd_ms:.3f} ms | Speed-up: {speedup_bwd:.2f}×")
+        kernel_type = "Total (autograd)" if measure_total_backward else "Direct kernel"
+        print(f"Triton fused ({kernel_type}): {fused_bwd_ms:.3f} ms | Speed-up: {speedup_bwd:.2f}×")
 
         # Combined forward + backward
         total_ref = ref_ms + ref_bwd_ms
@@ -154,7 +207,16 @@ def benchmark_cast_mlp(num_iters: int = 100, sparsity: float = 0.9, dtype: torch
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark CAST fused MLP kernel")
     parser.add_argument("--iters", type=int, default=100, help="Iterations per configuration")
-    parser.add_argument("--sparsity", type=float, default=0.9, help="Fraction of zeros in gate tensor")
+    parser.add_argument(
+        "--sparsity",
+        default="dynamic",
+        help="Fraction of zeros in gate (e.g., 0.9) or 'dynamic' to use 1 - 1/num_blocks per config",
+    )
+    parser.add_argument(
+        "--measure-total-backward",
+        action="store_true",
+        help="Measure total backward (autograd) instead of direct kernel backward",
+    )
     parser.add_argument(
         "--dtype",
         default="float16",
@@ -175,4 +237,9 @@ if __name__ == "__main__":
     except ImportError:
         print("❌ Triton is not available. Please install it for full performance.")
 
-    benchmark_cast_mlp(num_iters=args.iters, sparsity=args.sparsity, dtype=dtype_map[args.dtype]) 
+    benchmark_cast_mlp(
+        num_iters=args.iters, 
+        sparsity=args.sparsity, 
+        dtype=dtype_map[args.dtype], 
+        measure_total_backward=args.measure_total_backward
+    ) 
