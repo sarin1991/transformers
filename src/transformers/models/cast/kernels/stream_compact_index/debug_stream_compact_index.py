@@ -15,6 +15,7 @@ def verify_mappings(gate: torch.Tensor, mappings: dict):
     
     nb_maxrows_to_bs = mappings['nb_maxrows_to_bs']
     nb_maxrows_to_actidx = mappings['nb_maxrows_to_actidx']
+    nb_maxrows_gate_vals = mappings['nb_maxrows_gate_vals']
     bs_nb_to_actidx = mappings['bs_nb_to_actidx']
     max_rows = mappings['max_rows']
     total_act_idx = mappings['total_act_idx']
@@ -48,17 +49,19 @@ def verify_mappings(gate: torch.Tensor, mappings: dict):
     # Verify nb_maxrows mappings consistency
     for nb in range(NB):
         for local_row in range(max_rows):
+            gate_val = nb_maxrows_gate_vals[nb, local_row].item()
             bs_mapped = nb_maxrows_to_bs[nb, local_row].item()
             act_idx_mapped = nb_maxrows_to_actidx[nb, local_row].item()
             
-            if bs_mapped >= 0:  # Valid entry
-                if bs_mapped >= BS:
-                    print(f"ERROR: Invalid bs_mapped {bs_mapped} >= {BS}")
+            # Only validate positions with positive gate values (active entries)
+            if gate_val > 0:  # Valid/active entry
+                if bs_mapped < 0 or bs_mapped >= BS:
+                    print(f"ERROR: Invalid bs_mapped {bs_mapped} for active entry at ({nb}, {local_row})")
                     errors += 1
                     continue
                     
                 if act_idx_mapped < 0 or act_idx_mapped >= total_act_idx:
-                    print(f"ERROR: Invalid act_idx_mapped {act_idx_mapped}")
+                    print(f"ERROR: Invalid act_idx_mapped {act_idx_mapped} for active entry at ({nb}, {local_row})")
                     errors += 1
                     continue
                 
@@ -68,6 +71,7 @@ def verify_mappings(gate: torch.Tensor, mappings: dict):
                     print(f"ERROR: Inconsistent act_idx mapping at ({nb}, {local_row}): "
                           f"nb_maxrows says {act_idx_mapped}, bs_nb says {expected_act_idx}")
                     errors += 1
+            # Note: For gate_val <= 0 (padding entries), bs_mapped and act_idx_mapped values are undefined/uninitialized
     
     if errors == 0:
         print("✅ All mappings verified successfully!")
