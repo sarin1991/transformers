@@ -20,6 +20,11 @@ from triton_cast_kernel_csr import (
 from triton_cast_kernel_gate_sortpack import (
     fused_up_proj_gate_activation_sparse_triton_sortpack as fused_up_proj_gate_activation_sparse_triton_sortpack,
 )
+# Stream compact helper
+from triton_cast_kernel_stream_compact import (
+    fused_up_proj_gate_activation_sparse_triton_stream_compact as fused_up_proj_gate_activation_sparse_triton_stream_compact,
+)
+from kernels.stream_compact_index import create_stream_compact_index
 
 
 # -----------------------------------------------------------------------------
@@ -179,6 +184,25 @@ def _run_sortpack(
         max_rows=max_rows,
     )
 
+# Stream compact helper
+def _run_stream_compact(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    gate: torch.Tensor,
+    num_blocks: int,
+    line_size: int,
+    mappings: dict,
+):
+    fused_up_proj_gate_activation_sparse_triton_stream_compact(
+        x,
+        w,
+        gate,
+        num_blocks,
+        line_size,
+        mappings=mappings,
+        out_dtype=torch.float16,
+    )
+
 
 # -----------------------------------------------------------------------------
 # Main CLI
@@ -218,6 +242,9 @@ def main():
     )
     parser.add_argument(
         "--profile-sortpack", action="store_true", help="Include SortPack sparse helper in the profile",
+    )
+    parser.add_argument(
+        "--profile-stream-compact", action="store_true", help="Include StreamCompact sparse helper in the profile",
     )
     parser.add_argument(
         "--row-limit",
@@ -260,24 +287,27 @@ def main():
     # By **default** we always profile the sparse helper.  If neither helper
     # is requested explicitly, we profile *both*.  This guarantees that the
     # sparse path is included unless the script is modified to disable it.
-    if not (args.profile_dense or args.profile_sparse or args.profile_optimized or args.profile_csr or args.profile_sortpack):
+    if not (args.profile_dense or args.profile_sparse or args.profile_optimized or args.profile_csr or args.profile_sortpack or args.profile_stream_compact):
         # No flags → profile all helpers
         args.profile_dense = True
         args.profile_sparse = True
         args.profile_optimized = True
         args.profile_csr = True
         args.profile_sortpack = True
-    elif args.profile_dense and not (args.profile_sparse or args.profile_optimized or args.profile_csr or args.profile_sortpack):
+        args.profile_stream_compact = True
+    elif args.profile_dense and not (args.profile_sparse or args.profile_optimized or args.profile_csr or args.profile_sortpack or args.profile_stream_compact):
         # User asked for dense only – still include all sparse paths by default
         args.profile_sparse = True
         args.profile_optimized = True
         args.profile_csr = True
         args.profile_sortpack = True
-    elif args.profile_sparse and not (args.profile_optimized or args.profile_csr or args.profile_sortpack):
+        args.profile_stream_compact = True
+    elif args.profile_sparse and not (args.profile_optimized or args.profile_csr or args.profile_sortpack or args.profile_stream_compact):
         # baseline sparse only → also add optimized and csr for comparison
         args.profile_optimized = True
         args.profile_csr = True
         args.profile_sortpack = True
+        args.profile_stream_compact = True
 
     device = torch.device("cuda")
 
@@ -304,6 +334,9 @@ def main():
         return gate_vals, row_idx, block_counts, max_rows
 
     gate_vals, row_idx, block_counts, max_rows = preprocess_gate(gate_fp32, args.blocks)
+    
+    # Preprocess stream compact mappings once (outside profiler)
+    mappings = create_stream_compact_index(gate_fp32)
 
     # Warm-up each helper once outside the profiler
     if args.profile_dense:
@@ -316,6 +349,8 @@ def main():
         _run_csr(x_fp16, w_fp16, gate_fp32, args.blocks, args.line, args.zero_init, gate_vals, row_idx, block_counts, max_rows)
     if args.profile_sortpack:
         _run_sortpack(x_fp16, w_fp16, gate_fp32, args.blocks, args.line, args.zero_init, gate_vals, row_idx, block_counts, max_rows)
+    if args.profile_stream_compact:
+        _run_stream_compact(x_fp16, w_fp16, gate_fp32, args.blocks, args.line, mappings)
     torch.cuda.synchronize()
 
     activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
@@ -337,6 +372,9 @@ def main():
             if args.profile_sortpack:
                 with record_function("SORTPACK_HELPER"):
                     _run_sortpack(x_fp16, w_fp16, gate_fp32, args.blocks, args.line, args.zero_init, gate_vals, row_idx, block_counts, max_rows)
+            if args.profile_stream_compact:
+                with record_function("STREAM_COMPACT_HELPER"):
+                    _run_stream_compact(x_fp16, w_fp16, gate_fp32, args.blocks, args.line, mappings)
         torch.cuda.synchronize()
 
     print("\n========= PROFILER SUMMARY =========")
@@ -355,6 +393,8 @@ def main():
         print("CSR_HELPER shows the single-kernel CSR path.")
     if args.profile_sortpack:
         print("SORTPACK_HELPER shows the sort-pack path.")
+    if args.profile_stream_compact:
+        print("STREAM_COMPACT_HELPER shows the memory-optimized stream compact path.")
 
 
 if __name__ == "__main__":

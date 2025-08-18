@@ -13,6 +13,10 @@ from triton_cast_kernel_csr import (
 from triton_cast_kernel_gate_sortpack import (
     fused_up_proj_gate_activation_sparse_triton_sortpack as fused_up_proj_gate_activation_sparse_triton_sortpack,
 )
+from triton_cast_kernel_stream_compact import (
+    fused_up_proj_gate_activation_sparse_triton_stream_compact as fused_up_proj_gate_activation_sparse_triton_stream_compact,
+)
+from kernels.stream_compact_index import create_stream_compact_index
 import argparse
 
 
@@ -82,6 +86,11 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
 
         gate_vals_dense, row_idx_dense, block_counts_dense, max_rows_dense = preprocess_gate(gate_fp32, num_blocks)
         
+        # Preprocess stream compact mappings once for all stream compact kernels
+        def preprocess_stream_compact(gate_tensor):
+            """Create stream compact mappings once for reuse"""
+            return create_stream_compact_index(gate_tensor)
+        
         if run_all:
             # ---- Triton timing (autotuned) ----
             
@@ -127,6 +136,9 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
         mask_sparse = torch.rand_like(gate_sparse) < 0.9  # 90% zeros
         gate_sparse[mask_sparse] = 0.0
         gate_vals_sparse, row_idx_sparse, block_counts_sparse, max_rows_sparse = preprocess_gate(gate_sparse, num_blocks)
+        
+        # Preprocess stream compact mappings for sparse gate
+        mappings_sparse = preprocess_stream_compact(gate_sparse)
 
         if run_all:
             # ---- Sparse benchmark (10% non-zero gate) ----
@@ -291,6 +303,43 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
         if run_all:
             base_line += f" | vs baseline sparse: {sparse_ms/sortpack_ms:.2f}x | vs optimized: {opt_ms/sortpack_ms:.2f}x | vs old CSR: {csr_ms/sortpack_ms:.2f}x"
         print(base_line)
+
+        # ---- StreamCompact benchmark (always) ----
+        # Reuse preprocessed sparse gate data and mappings
+
+        for _ in range(5):
+            _ = fused_up_proj_gate_activation_sparse_triton_stream_compact(
+                x_fp16,
+                up_weight_fp16.t(),
+                gate_sparse,
+                num_blocks,
+                line_size,
+                mappings=mappings_sparse,
+                out_dtype=torch.float16,
+            )
+        torch.cuda.synchronize()
+
+        start_stream_compact = torch.cuda.Event(enable_timing=True)
+        end_stream_compact = torch.cuda.Event(enable_timing=True)
+        start_stream_compact.record(torch.cuda.current_stream())
+        for _ in range(num_iters):
+            _ = fused_up_proj_gate_activation_sparse_triton_stream_compact(
+                x_fp16,
+                up_weight_fp16.t(),
+                gate_sparse,
+                num_blocks,
+                line_size,
+                mappings=mappings_sparse,
+                out_dtype=torch.float16,
+            )
+        end_stream_compact.record(torch.cuda.current_stream())
+        torch.cuda.synchronize()
+        stream_compact_ms = start_stream_compact.elapsed_time(end_stream_compact) / num_iters
+
+        stream_compact_line = f"Triton (StreamCompact, 10% nnz): {stream_compact_ms:.3f} ms | Speed-up vs PyTorch: {torch_ms/stream_compact_ms:.2f}x | vs SortPack: {sortpack_ms/stream_compact_ms:.2f}x"
+        if run_all:
+            stream_compact_line += f" | vs baseline sparse: {sparse_ms/stream_compact_ms:.2f}x | vs optimized: {opt_ms/stream_compact_ms:.2f}x | vs old CSR: {csr_ms/stream_compact_ms:.2f}x"
+        print(stream_compact_line)
 
 
 if __name__ == "__main__":
