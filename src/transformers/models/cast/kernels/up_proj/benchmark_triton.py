@@ -1,19 +1,19 @@
 import torch
 import torch.nn.functional as F
-from triton_kernels import (
+from .triton_kernels import (
     fused_up_proj_gate_activation_triton,
     fused_up_proj_gate_activation_sparse_triton,
 )
-from triton_cast_kernel import (
+from .triton_cast_kernel import (
     fused_up_proj_gate_activation_sparse_triton_optimized as fused_up_proj_gate_activation_sparse_triton_opt,
 )
-from triton_cast_kernel_csr import (
+from .triton_cast_kernel_csr import (
     fused_up_proj_gate_activation_sparse_triton_csr as fused_up_proj_gate_activation_sparse_triton_csr,
 )  # New CSR helper
-from triton_cast_kernel_gate_sortpack import (
+from .triton_cast_kernel_gate_sortpack import (
     fused_up_proj_gate_activation_sparse_triton_sortpack as fused_up_proj_gate_activation_sparse_triton_sortpack,
 )
-from triton_cast_kernel_stream_compact import (
+from .triton_cast_kernel_stream_compact import (
     fused_up_proj_gate_activation_sparse_triton_stream_compact as fused_up_proj_gate_activation_sparse_triton_stream_compact,
 )
 from kernels.stream_compact_index import create_stream_compact_index
