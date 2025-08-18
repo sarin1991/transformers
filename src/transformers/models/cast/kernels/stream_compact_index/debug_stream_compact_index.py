@@ -1,5 +1,5 @@
 import torch
-from triton_stream_compact_index import create_stream_compact_index
+from kernels.stream_compact_index.triton_stream_compact_index import create_stream_compact_index
 
 
 def verify_mappings(gate: torch.Tensor, mappings: dict):
