@@ -1,7 +1,7 @@
 import torch
 import triton
 import triton.language as tl
-from triton_cast_kernel_gate_sortpack import fused_weight_grad_sparse_triton_sortpack
+from .triton_cast_kernel_gate_sortpack import fused_weight_grad_sparse_triton_sortpack
 
 # -----------------------------------------------------------------------------
 # Autotuning configurations – reuse the same philosophy as up_proj/down_proj

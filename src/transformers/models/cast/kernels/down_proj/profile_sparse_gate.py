@@ -5,8 +5,8 @@ import torch
 import torch.nn.functional as F
 from torch.profiler import ProfilerActivity, profile, record_function
 
-from triton_kernels import fused_down_proj_triton
-from triton_cast_kernel_gate_sortpack import fused_down_proj_sparse_triton_sortpack
+from .triton_kernels import fused_down_proj_triton
+from .triton_cast_kernel_gate_sortpack import fused_down_proj_sparse_triton_sortpack
 
 
 # -----------------------------------------------------------------------------
