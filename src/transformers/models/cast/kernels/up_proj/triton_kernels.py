@@ -516,6 +516,7 @@ def debug_large_scale(use_sparse_gate: bool = False):
             gate_fp32,
             num_blocks,
             line_size,
+            zero_init=True,  # Required for sparse data to avoid uninitialized output positions
             gate_vals=gate_vals,
             row_idx=row_idx,
             block_counts=block_counts,
