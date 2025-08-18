@@ -6,22 +6,22 @@ import torch.nn.functional as F
 from torch.profiler import ProfilerActivity, profile, record_function
 
 # Import the dense & sparse helpers from the same package
-from triton_kernels import (
+from .triton_kernels import (
     fused_up_proj_gate_activation_triton,
     fused_up_proj_gate_activation_sparse_triton,
 )
-from triton_cast_kernel import (
+from .triton_cast_kernel import (
     fused_up_proj_gate_activation_sparse_triton_optimized as fused_up_proj_gate_activation_sparse_triton_opt,
 )
-from triton_cast_kernel_csr import (
+from .triton_cast_kernel_csr import (
     fused_up_proj_gate_activation_sparse_triton_csr as fused_up_proj_gate_activation_sparse_triton_csr,
 )
 # SortPack helper
-from triton_cast_kernel_gate_sortpack import (
+from .triton_cast_kernel_gate_sortpack import (
     fused_up_proj_gate_activation_sparse_triton_sortpack as fused_up_proj_gate_activation_sparse_triton_sortpack,
 )
 # Stream compact helper
-from triton_cast_kernel_stream_compact import (
+from .triton_cast_kernel_stream_compact import (
     fused_up_proj_gate_activation_sparse_triton_stream_compact as fused_up_proj_gate_activation_sparse_triton_stream_compact,
 )
 from kernels.stream_compact_index import create_stream_compact_index

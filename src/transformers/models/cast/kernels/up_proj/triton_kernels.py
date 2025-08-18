@@ -3,18 +3,18 @@ import triton
 import triton.language as tl
 from typing import Optional
 import torch.nn.functional as F
-from triton_cast_kernel import (
+from .triton_cast_kernel import (
     fused_up_proj_gate_activation_sparse_triton_optimized as fused_up_proj_gate_activation_sparse_triton_opt,
 )
-from triton_cast_kernel_csr import (
+from .triton_cast_kernel_csr import (
     fused_up_proj_gate_activation_sparse_triton_csr as fused_up_proj_gate_activation_sparse_triton_csr,
 )
 # Unified CSR builder+compute helper
-from triton_cast_kernel_gate_sortpack import (
+from .triton_cast_kernel_gate_sortpack import (
     fused_up_proj_gate_activation_sparse_triton_sortpack as fused_up_proj_gate_activation_sparse_triton_sortpack,
 )
 # Stream compact helper
-from triton_cast_kernel_stream_compact import (
+from .triton_cast_kernel_stream_compact import (
     fused_up_proj_gate_activation_sparse_triton_stream_compact as fused_up_proj_gate_activation_sparse_triton_stream_compact,
 )
 # Stream compact index preprocessing
