@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 from typing import Optional
 import torch.nn.functional as F
-from triton_cast_kernel_gate_sortpack import fused_down_proj_sparse_triton_sortpack
+from .triton_cast_kernel_gate_sortpack import fused_down_proj_sparse_triton_sortpack
 
 # -----------------------------------------------------------------------------
 # Dynamically build Triton autotune configurations

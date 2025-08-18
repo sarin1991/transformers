@@ -7,8 +7,8 @@ from torch.profiler import ProfilerActivity, profile, record_function
 # Local imports – run from cast root directory
 #   cd src/transformers/models/cast/
 #   python -m ops.profile_cast_mlp
-from ops.cast_mlp_fused import cast_mlp_fused, _CastMLPFusedFunction
-from ops.debug_cast_mlp_fused import reference_cast_mlp_pytorch, _make_sparse_gate
+from .cast_mlp_fused import cast_mlp_fused, _CastMLPFusedFunction
+from .debug_cast_mlp_fused import reference_cast_mlp_pytorch, _make_sparse_gate
 
 
 # -----------------------------------------------------------------------------

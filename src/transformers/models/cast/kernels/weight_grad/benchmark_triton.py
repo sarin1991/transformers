@@ -2,8 +2,8 @@ import torch
 import torch.nn.functional as F
 import argparse
 
-from triton_kernels import fused_weight_grad_triton
-from triton_cast_kernel_gate_sortpack import fused_weight_grad_sparse_triton_sortpack
+from .triton_kernels import fused_weight_grad_triton
+from .triton_cast_kernel_gate_sortpack import fused_weight_grad_sparse_triton_sortpack
 
 
 def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
