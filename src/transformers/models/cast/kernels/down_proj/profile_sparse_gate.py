@@ -103,6 +103,12 @@ def _run_streamcompact(x_sparse: torch.Tensor, w: torch.Tensor, num_blocks: int,
                                                 mappings=mappings, out_dtype=torch.float16)
 
 
+# StreamCompact with two-stage reduction
+def _run_streamcompact_2stage(x_sparse: torch.Tensor, w: torch.Tensor, num_blocks: int, line_size: int, mappings: dict):
+    fused_down_proj_sparse_triton_stream_compact(x_sparse, w, num_blocks, line_size, 
+                                                mappings=mappings, out_dtype=torch.float16, two_stage_reduction=True)
+
+
 # -----------------------------------------------------------------------------
 # CLI
 # -----------------------------------------------------------------------------
@@ -127,6 +133,7 @@ def main():
     parser.add_argument("--profile-dense", action="store_true", help="Profile dense Triton helper")
     parser.add_argument("--profile-sortpack", action="store_true", help="Profile SortPack Triton helper")
     parser.add_argument("--profile-streamcompact", action="store_true", help="Profile StreamCompact Triton helper")
+    parser.add_argument("--profile-streamcompact-2stage", action="store_true", help="Profile StreamCompact with two-stage reduction (atomic-free)")
     parser.add_argument("--profile-pytorch", action="store_true", help="Profile PyTorch baseline")
     args = parser.parse_args()
 
@@ -165,7 +172,7 @@ def main():
     x_sparse = convert_dense_to_stream_compact(x_fp16, stream_compact_mappings, args.num_blocks, args.line_size)
 
     # Ensure at least one kernel selected
-    if not (args.profile_dense or args.profile_sortpack or args.profile_streamcompact or args.profile_pytorch):
+    if not (args.profile_dense or args.profile_sortpack or args.profile_streamcompact or getattr(args, 'profile_streamcompact_2stage', False) or args.profile_pytorch):
         args.profile_dense = True  # default to dense
 
     def _profile(name: str, run_fn):
@@ -202,19 +209,33 @@ def main():
     if args.profile_streamcompact:
         _profile("triton_down_proj_streamcompact", lambda: _run_streamcompact(x_sparse, w_fp16, args.num_blocks, args.line_size, stream_compact_mappings))
 
+    if getattr(args, 'profile_streamcompact_2stage', False):
+        _profile("triton_down_proj_streamcompact_2stage", lambda: _run_streamcompact_2stage(x_sparse, w_fp16, args.num_blocks, args.line_size, stream_compact_mappings))
+
     if args.profile_pytorch:
         _profile("pytorch_down_proj", lambda: _run_pytorch(x_fp16, w_fp16))
 
-    if args.profile_dense and (args.profile_sortpack or args.profile_streamcompact):
+    if args.profile_dense and (args.profile_sortpack or args.profile_streamcompact or getattr(args, 'profile_streamcompact_2stage', False)):
         methods = []
         if args.profile_sortpack:
             methods.append("triton_down_proj_sortpack")
         if args.profile_streamcompact:
             methods.append("triton_down_proj_streamcompact")
+        if getattr(args, 'profile_streamcompact_2stage', False):
+            methods.append("triton_down_proj_streamcompact_2stage")
         methods_str = " vs ".join(["triton_down_proj_dense"] + methods)
         print(f"\nTip: compare {methods_str} blocks above.")
-    elif args.profile_sortpack and args.profile_streamcompact:
-        print("\nTip: compare triton_down_proj_sortpack vs triton_down_proj_streamcompact blocks above.")
+    elif (args.profile_sortpack or args.profile_streamcompact or getattr(args, 'profile_streamcompact_2stage', False)):
+        methods = []
+        if args.profile_sortpack:
+            methods.append("triton_down_proj_sortpack")
+        if args.profile_streamcompact:
+            methods.append("triton_down_proj_streamcompact") 
+        if getattr(args, 'profile_streamcompact_2stage', False):
+            methods.append("triton_down_proj_streamcompact_2stage")
+        if len(methods) > 1:
+            methods_str = " vs ".join(methods)
+            print(f"\nTip: compare {methods_str} blocks above.")
 
 
 if __name__ == "__main__":

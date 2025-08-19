@@ -248,6 +248,7 @@ def debug_large_scale(use_sparse_gate: bool = False, use_fp32: bool = False):
     overall_max_diff_dense = 0.0
     overall_max_diff_sortpack = 0.0
     overall_max_diff_streamcompact = 0.0
+    overall_max_diff_streamcompact_2stage = 0.0
 
     for batch_size, seq_len, hidden_size, num_blocks, line_size in configs:
         intermediate_size = num_blocks * line_size
@@ -321,6 +322,16 @@ def debug_large_scale(use_sparse_gate: bool = False, use_fp32: bool = False):
             line_size,
             mappings=stream_compact_mappings,
         )
+        
+        # Triton StreamCompact with two-stage reduction (atomic-free)
+        out_streamcompact_2stage = fused_down_proj_sparse_triton_stream_compact(
+            x_sparse,
+            down_weight,
+            num_blocks,
+            line_size,
+            mappings=stream_compact_mappings,
+            two_stage_reduction=True,
+        )
 
         max_diff_dense = torch.max(torch.abs(ref_fp32 - out_dense)).item()
         mean_diff_dense = torch.mean(torch.abs(ref_fp32 - out_dense)).item()
@@ -330,17 +341,22 @@ def debug_large_scale(use_sparse_gate: bool = False, use_fp32: bool = False):
         
         max_diff_streamcompact = torch.max(torch.abs(ref_fp32 - out_streamcompact)).item()
         mean_diff_streamcompact = torch.mean(torch.abs(ref_fp32 - out_streamcompact)).item()
+        
+        max_diff_streamcompact_2stage = torch.max(torch.abs(ref_fp32 - out_streamcompact_2stage)).item()
+        mean_diff_streamcompact_2stage = torch.mean(torch.abs(ref_fp32 - out_streamcompact_2stage)).item()
 
         overall_max_diff_dense = max(overall_max_diff_dense, max_diff_dense)
         overall_max_diff_sortpack = max(overall_max_diff_sortpack, max_diff_sort)
         overall_max_diff_streamcompact = max(overall_max_diff_streamcompact, max_diff_streamcompact)
+        overall_max_diff_streamcompact_2stage = max(overall_max_diff_streamcompact_2stage, max_diff_streamcompact_2stage)
 
         print(f"Dense      → max diff {max_diff_dense:.6e} | mean diff {mean_diff_dense:.6e}")
         print(f"SortPk     → max diff {max_diff_sort:.6e} | mean diff {mean_diff_sort:.6e}")
         print(f"StreamCmpt → max diff {max_diff_streamcompact:.6e} | mean diff {mean_diff_streamcompact:.6e}")
+        print(f"StreamCmpt2→ max diff {max_diff_streamcompact_2stage:.6e} | mean diff {mean_diff_streamcompact_2stage:.6e}")
 
     print(
-        f"\nOverall max diff across configs | Dense: {overall_max_diff_dense:.6e} | SortPk: {overall_max_diff_sortpack:.6e} | StreamCmpt: {overall_max_diff_streamcompact:.6e}"
+        f"\nOverall max diff across configs | Dense: {overall_max_diff_dense:.6e} | SortPk: {overall_max_diff_sortpack:.6e} | StreamCmpt: {overall_max_diff_streamcompact:.6e} | StreamCmpt2: {overall_max_diff_streamcompact_2stage:.6e}"
     )
 
 
