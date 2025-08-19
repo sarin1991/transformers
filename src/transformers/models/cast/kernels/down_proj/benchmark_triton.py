@@ -4,6 +4,38 @@ import argparse
 
 from .triton_kernels import fused_down_proj_triton
 from .triton_cast_kernel_gate_sortpack import fused_down_proj_sparse_triton_sortpack
+from .triton_cast_kernel_down_proj_stream_compact import fused_down_proj_sparse_triton_stream_compact
+from kernels.stream_compact_index import create_stream_compact_index
+
+
+def convert_dense_to_stream_compact(x_dense, mappings, num_blocks, line_size):
+    """Convert (BS, I) dense → (act_idx, LS) sparse format using stream compact mappings"""
+    BS, I = x_dense.shape
+    
+    # Early exit if no active elements
+    if mappings['total_act_idx'] == 0:
+        return torch.empty(0, line_size, device=x_dense.device, dtype=x_dense.dtype)
+    
+    # Reshape to block format: (BS, I) → (BS, NB, LS)
+    x_reshaped = x_dense.view(BS, num_blocks, line_size)
+    
+    # Extract stream compact mappings
+    bs_nb_to_actidx = mappings['bs_nb_to_actidx']  # (BS, NB) → act_idx
+    total_act_idx = mappings['total_act_idx']
+    
+    # Build sparse tensor: (act_idx, LS)
+    x_sparse = torch.zeros(total_act_idx, line_size, 
+                          device=x_dense.device, 
+                          dtype=x_dense.dtype)
+    
+    # Fill sparse tensor using mappings
+    active_mask = bs_nb_to_actidx >= 0
+    if active_mask.sum() > 0:
+        active_bs, active_nb = torch.where(active_mask)
+        act_indices = bs_nb_to_actidx[active_bs, active_nb]
+        x_sparse[act_indices] = x_reshaped[active_bs, active_nb]
+    
+    return x_sparse
 
 
 def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
@@ -81,6 +113,10 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
             return gate_vals, row_idx, block_counts, max_rows
 
         gate_vals, row_idx, block_counts, max_rows = preprocess_gate(gate_fp32, num_blocks)
+        
+        # Stream compact preprocessing
+        stream_compact_mappings = create_stream_compact_index(gate_fp32)
+        x_sparse = convert_dense_to_stream_compact(x_fp16, stream_compact_mappings, num_blocks, line_size)
 
         if run_all:
             # ---- Triton timing ----
@@ -159,6 +195,38 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
 
             print(
                 f"Triton (SortPack): {sortpack_ms:.3f} ms | Speed-up vs PyTorch: {torch_ms / sortpack_ms:.2f}× | vs dense: {triton_ms / sortpack_ms:.2f}×"
+            )
+            
+            # ---- Triton StreamCompact sparse (10% nnz) ----
+            for _ in range(5):
+                _ = fused_down_proj_sparse_triton_stream_compact(
+                    x_sparse,
+                    weight_fp16,
+                    num_blocks,
+                    line_size,
+                    mappings=stream_compact_mappings,
+                    out_dtype=torch.float16,
+                )
+            torch.cuda.synchronize()
+
+            start_sc = torch.cuda.Event(enable_timing=True)
+            end_sc = torch.cuda.Event(enable_timing=True)
+            start_sc.record(torch.cuda.current_stream())
+            for _ in range(num_iters):
+                _ = fused_down_proj_sparse_triton_stream_compact(
+                    x_sparse,
+                    weight_fp16,
+                    num_blocks,
+                    line_size,
+                    mappings=stream_compact_mappings,
+                    out_dtype=torch.float16,
+                )
+            end_sc.record(torch.cuda.current_stream())
+            torch.cuda.synchronize()
+            streamcompact_ms = start_sc.elapsed_time(end_sc) / num_iters
+
+            print(
+                f"Triton (StreamCmpt): {streamcompact_ms:.3f} ms | Speed-up vs PyTorch: {torch_ms / streamcompact_ms:.2f}× | vs dense: {triton_ms / streamcompact_ms:.2f}× | vs SortPack: {sortpack_ms / streamcompact_ms:.2f}×"
             )
 
 
