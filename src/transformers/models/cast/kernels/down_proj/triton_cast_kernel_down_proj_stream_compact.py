@@ -56,7 +56,7 @@ def get_triton_autotune_config():
 
 @triton.autotune(
     configs=get_triton_autotune_config(),
-    key=["hidden_size", "line_size"],
+    key=["hidden_size", "line_size", "two_stage_reduction"],
     reset_to_zero=['output_ptr'],
 )
 @triton.jit
