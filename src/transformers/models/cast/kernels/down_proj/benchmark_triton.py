@@ -228,6 +228,40 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
             print(
                 f"Triton (StreamCmpt): {streamcompact_ms:.3f} ms | Speed-up vs PyTorch: {torch_ms / streamcompact_ms:.2f}× | vs dense: {triton_ms / streamcompact_ms:.2f}× | vs SortPack: {sortpack_ms / streamcompact_ms:.2f}×"
             )
+            
+            # ---- Triton StreamCompact with two-stage reduction (atomic-free) ----
+            for _ in range(5):
+                _ = fused_down_proj_sparse_triton_stream_compact(
+                    x_sparse,
+                    weight_fp16,
+                    num_blocks,
+                    line_size,
+                    mappings=stream_compact_mappings,
+                    out_dtype=torch.float16,
+                    two_stage_reduction=True,
+                )
+            torch.cuda.synchronize()
+
+            start_sc2 = torch.cuda.Event(enable_timing=True)
+            end_sc2 = torch.cuda.Event(enable_timing=True)
+            start_sc2.record(torch.cuda.current_stream())
+            for _ in range(num_iters):
+                _ = fused_down_proj_sparse_triton_stream_compact(
+                    x_sparse,
+                    weight_fp16,
+                    num_blocks,
+                    line_size,
+                    mappings=stream_compact_mappings,
+                    out_dtype=torch.float16,
+                    two_stage_reduction=True,
+                )
+            end_sc2.record(torch.cuda.current_stream())
+            torch.cuda.synchronize()
+            streamcompact_2stage_ms = start_sc2.elapsed_time(end_sc2) / num_iters
+
+            print(
+                f"Triton (StreamCmpt2): {streamcompact_2stage_ms:.3f} ms | Speed-up vs PyTorch: {torch_ms / streamcompact_2stage_ms:.2f}× | vs dense: {triton_ms / streamcompact_2stage_ms:.2f}× | vs SortPack: {sortpack_ms / streamcompact_2stage_ms:.2f}× | vs StreamCmpt: {streamcompact_ms / streamcompact_2stage_ms:.2f}×"
+            )
 
 
 if __name__ == "__main__":

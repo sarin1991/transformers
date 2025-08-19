@@ -71,7 +71,7 @@ def fused_down_proj_stream_compact_kernel(
     max_rows_per_block_ptr,         # (NB,) number of active rows per block
     
     # Output tensor
-    output_ptr,                     # (BS, H) output tensor
+    output_ptr,                     # (BS, H) or (act_idx, H) depending on two_stage_reduction
     
     # Sizes
     hidden_size: tl.constexpr, 
@@ -81,10 +81,11 @@ def fused_down_proj_stream_compact_kernel(
     # Strides
     stride_x_actidx, stride_x_ls,
     stride_w_ls, stride_w_h,
-    stride_out_bs, stride_out_h,
+    stride_out_dim0, stride_out_h,  # dim0 = BS or act_idx depending on mode
     
     # Meta-params
     out_dtype: tl.constexpr,
+    two_stage_reduction: tl.constexpr,  # New flag
     
     # Block sizes from autotune
     BLOCK_SIZE_BS: tl.constexpr, 
@@ -182,10 +183,136 @@ def fused_down_proj_stream_compact_kernel(
         acc += tl.dot(x_block, w_block)
 
     # ------------------------------------------------------------------
-    # Atomic add into output tensor using BS indices
+    # Write output: atomic add (single-stage) or direct store (two-stage)
     # ------------------------------------------------------------------
-    out_ptrs = output_ptr + bs_indices[:, None] * stride_out_bs + offs_h[None, :] * stride_out_h
-    tl.atomic_add(out_ptrs, acc.to(out_dtype), mask=row_active[:, None] & mask_h[None, :], sem="relaxed")
+    if two_stage_reduction:
+        # Two-stage: store directly to (act_idx, H) without atomics
+        out_ptrs = output_ptr + act_indices[:, None] * stride_out_dim0 + offs_h[None, :] * stride_out_h
+        tl.store(out_ptrs, acc.to(out_dtype), mask=row_active[:, None] & mask_h[None, :])
+    else:
+        # Single-stage: atomic add into final (BS, H) output 
+        out_ptrs = output_ptr + bs_indices[:, None] * stride_out_dim0 + offs_h[None, :] * stride_out_h
+        tl.atomic_add(out_ptrs, acc.to(out_dtype), mask=row_active[:, None] & mask_h[None, :], sem="relaxed")
+
+
+# =============================================================================
+# Stage 2: Custom summation kernel (act_idx, H) -> (BS, H)
+# =============================================================================
+
+def get_summation_autotune_config():
+    """Autotune configurations for summation kernel - simpler than main kernel"""
+    return [
+        triton.Config({'BLOCK_SIZE_BS': 64, 'BLOCK_SIZE_H': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_H': 64}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE_BS': 64, 'BLOCK_SIZE_H': 128}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_H': 128}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE_BS': 32, 'BLOCK_SIZE_H': 128}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_H': 32}, num_warps=4, num_stages=3),
+    ]
+
+
+@triton.autotune(
+    configs=get_summation_autotune_config(),
+    key=["batch_seq_size", "hidden_size"],
+)
+@triton.jit
+def stream_compact_summation_kernel(
+    # Input tensors
+    intermediate_ptr,        # (act_idx, H) intermediate results
+    bs_nb_to_actidx_ptr,     # (BS, NB) -> act_idx mapping (-1 for inactive)
+    
+    # Output tensor
+    output_ptr,              # (BS, H) final output
+    
+    # Sizes
+    batch_seq_size: tl.constexpr,
+    hidden_size: tl.constexpr, 
+    num_blocks: tl.constexpr,
+    
+    # Strides
+    stride_inter_actidx, stride_inter_h,
+    stride_mapping_bs, stride_mapping_nb,
+    stride_out_bs, stride_out_h,
+    
+    # Meta-params
+    out_dtype: tl.constexpr,
+    
+    # Block sizes from autotune
+    BLOCK_SIZE_BS: tl.constexpr,
+    BLOCK_SIZE_H: tl.constexpr,
+):
+    """Sum intermediate (act_idx, H) results to final (BS, H) output.
+    
+    Each CTA processes a tile of (BLOCK_SIZE_BS, BLOCK_SIZE_H) in the final output
+    by iterating through all NB blocks and accumulating contributions.
+    """
+    
+    pid = tl.program_id(0)
+    
+    # ------------------------------------------------------------------
+    # Decompose program ID into (bs_chunk, h_chunk)
+    # ------------------------------------------------------------------
+    num_h_chunks = tl.cdiv(hidden_size, BLOCK_SIZE_H)
+    
+    bs_chunk = pid // num_h_chunks
+    h_chunk = pid % num_h_chunks
+    
+    # ------------------------------------------------------------------
+    # Calculate this CTA's responsibility ranges
+    # ------------------------------------------------------------------
+    bs_start = bs_chunk * BLOCK_SIZE_BS
+    h_start = h_chunk * BLOCK_SIZE_H
+    
+    offs_bs = bs_start + tl.arange(0, BLOCK_SIZE_BS)  # Local BS indices
+    offs_h = h_start + tl.arange(0, BLOCK_SIZE_H)     # Local H indices
+    
+    mask_bs = offs_bs < batch_seq_size
+    mask_h = offs_h < hidden_size
+    
+    # ------------------------------------------------------------------
+    # Initialize accumulator
+    # ------------------------------------------------------------------
+    acc = tl.zeros((BLOCK_SIZE_BS, BLOCK_SIZE_H), dtype=tl.float32)
+    
+    # ------------------------------------------------------------------
+    # Iterate through NB dimension and accumulate contributions
+    # ------------------------------------------------------------------
+    for nb in range(num_blocks):
+        # Load act_idx mappings for current (BS, NB) pairs
+        mapping_ptrs = (bs_nb_to_actidx_ptr 
+                       + offs_bs * stride_mapping_bs 
+                       + nb * stride_mapping_nb)
+        
+        act_indices = tl.load(mapping_ptrs, mask=mask_bs, other=-1)
+        
+        # Mask for active elements (act_idx >= 0)
+        active_mask = act_indices >= 0
+        
+        # Early exit: skip if no active elements in this NB slice
+        if tl.sum(active_mask) == 0:
+            continue
+        
+        # Load corresponding intermediate values (act_idx, H)
+        inter_ptrs = (intermediate_ptr 
+                     + act_indices[:, None] * stride_inter_actidx 
+                     + offs_h[None, :] * stride_inter_h)
+        
+        inter_vals = tl.load(inter_ptrs, 
+                            mask=active_mask[:, None] & mask_h[None, :], 
+                            other=0.0)
+        
+        # Accumulate contributions
+        acc += inter_vals
+    
+    # ------------------------------------------------------------------
+    # Store final results
+    # ------------------------------------------------------------------
+    out_ptrs = (output_ptr 
+               + offs_bs[:, None] * stride_out_bs 
+               + offs_h[None, :] * stride_out_h)
+    
+    tl.store(out_ptrs, acc.to(out_dtype), 
+             mask=mask_bs[:, None] & mask_h[None, :])
 
 
 # =============================================================================
@@ -200,6 +327,7 @@ def fused_down_proj_sparse_triton_stream_compact(
     *,
     mappings: dict,
     out_dtype: torch.dtype = torch.float32,
+    two_stage_reduction: bool = False,
 ):
     """Stream compact sparse helper for Cast down-projection.
 
@@ -211,6 +339,9 @@ def fused_down_proj_sparse_triton_stream_compact(
             - nb_maxrows_to_actidx: (NB, max_rows) -> act_idx mapping
             - max_rows: maximum active rows per block
             - max_rows_per_block: (NB,) active rows per block
+        two_stage_reduction : bool, default False
+            - False: Use atomic adds to produce final result
+            - True: Generate intermediate (act_idx, H), then sum to final result (avoids atomics)
 
     Returns:
         output: (BS, H) down projection result
@@ -246,8 +377,14 @@ def fused_down_proj_sparse_triton_stream_compact(
     assert min(x.stride()) <= 1, f"x has inefficient stride pattern: {x.stride()}"
     assert min(down_weight.stride()) <= 1, f"down_weight has inefficient stride pattern: {down_weight.stride()}"
 
-    # Allocate output tensor – must start at zeros because kernel writes via atomic_add.
-    output = torch.zeros((batch_seq_size, hidden_size), device=x.device, dtype=out_dtype)
+    if two_stage_reduction:
+        # Stage 1: Generate intermediate (act_idx, H) results without atomic adds
+        output_tensor = torch.empty((total_act_idx, hidden_size), device=x.device, dtype=out_dtype)
+        stride_out_dim0 = output_tensor.stride(0)
+    else:
+        # Original single-stage approach with atomic adds
+        output_tensor = torch.zeros((batch_seq_size, hidden_size), device=x.device, dtype=out_dtype)
+        stride_out_dim0 = output_tensor.stride(0)
 
     # Grid helper
     def grid(meta):
@@ -282,7 +419,7 @@ def fused_down_proj_sparse_triton_stream_compact(
         max_rows_per_block,
         
         # Output
-        output,
+        output_tensor,
         
         # Sizes
         hidden_size, line_size, max_rows,
@@ -290,13 +427,50 @@ def fused_down_proj_sparse_triton_stream_compact(
         # Strides
         x.stride(0), x.stride(1),
         down_weight.stride(0), down_weight.stride(1),
-        output.stride(0), output.stride(1),
+        stride_out_dim0, output_tensor.stride(1),
         
         # Meta-params
         out_dtype=triton_out_dtype,
+        two_stage_reduction=two_stage_reduction,
     )
 
-    return output
+    if two_stage_reduction:
+        # Stage 2: Sum intermediate results to final (BS, H) output
+        final_output = torch.empty((batch_seq_size, hidden_size), device=x.device, dtype=out_dtype)
+        
+        # Grid for summation kernel
+        def summation_grid(meta):
+            BLK_BS = meta["BLOCK_SIZE_BS"]
+            BLK_H = meta["BLOCK_SIZE_H"]
+            
+            num_bs_chunks = triton.cdiv(batch_seq_size, BLK_BS)
+            num_h_chunks = triton.cdiv(hidden_size, BLK_H)
+            return (num_bs_chunks * num_h_chunks,)
+        
+        # Launch summation kernel
+        stream_compact_summation_kernel[summation_grid](
+            # Input tensors
+            output_tensor,       # (act_idx, H) intermediate results
+            bs_nb_to_actidx,     # (BS, NB) -> act_idx mapping
+            
+            # Output tensor
+            final_output,        # (BS, H) final output
+            
+            # Sizes
+            batch_seq_size, hidden_size, num_blocks,
+            
+            # Strides
+            output_tensor.stride(0), output_tensor.stride(1),        # intermediate strides
+            bs_nb_to_actidx.stride(0), bs_nb_to_actidx.stride(1),   # mapping strides
+            final_output.stride(0), final_output.stride(1),         # output strides
+            
+            # Meta-params
+            out_dtype=triton_out_dtype,
+        )
+        
+        return final_output
+    else:
+        return output_tensor
 
 
 if __name__ == "__main__":
