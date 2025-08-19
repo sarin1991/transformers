@@ -197,6 +197,7 @@ def create_stream_compact_index(gate: torch.Tensor):
         'nb_maxrows_to_actidx': nb_maxrows_to_actidx,
         'nb_maxrows_gate_vals': nb_maxrows_gate_vals,
         'bs_nb_to_actidx': bs_nb_to_actidx,
+        'bs_nb_to_gate_vals': gate,  # Original (BS, NB) gate tensor
         'max_rows': max_rows,
         'total_act_idx': total_act_idx,
         'block_offsets': block_offsets,

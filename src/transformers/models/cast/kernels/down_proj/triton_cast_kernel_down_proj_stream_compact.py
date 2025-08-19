@@ -68,6 +68,7 @@ def fused_down_proj_stream_compact_kernel(
     # Index mappings from stream compact preprocessing  
     nb_maxrows_to_bs_ptr,           # (NB, max_rows) -> BS index
     nb_maxrows_to_actidx_ptr,       # (NB, max_rows) -> act_idx
+    nb_maxrows_gate_vals_ptr,       # (NB, max_rows) -> gate values
     max_rows_per_block_ptr,         # (NB,) number of active rows per block
     
     # Output tensor
@@ -132,19 +133,22 @@ def fused_down_proj_stream_compact_kernel(
 
     base_ptr = block_idx * max_rows
     
-    # Load indices from stream compact mappings
+    # Load indices and gate values from stream compact mappings
     act_indices = tl.load(nb_maxrows_to_actidx_ptr + base_ptr + rows_in_block,
                          mask=mask_bs, other=0)
     bs_indices = tl.load(nb_maxrows_to_bs_ptr + base_ptr + rows_in_block,
                         mask=mask_bs, other=0)
+    gate_vals = tl.load(nb_maxrows_gate_vals_ptr + base_ptr + rows_in_block,
+                       mask=mask_bs, other=0.0)
 
     # Check if this block has active rows
     blk_rows = tl.load(max_rows_per_block_ptr + block_idx)
     if blk_rows == 0:
         return
 
-    # Determine which rows are actually active (not padding)
-    row_active = rows_in_block < blk_rows
+    # Determine which rows are actually active based on gate values
+    gate_vals = tl.where(gate_vals > 0, gate_vals, 0.0)  # Set negative gate values to zero
+    row_active = gate_vals > 0.0  # bool mask per row
 
     # If tile is fully padded, exit early
     if tl.sum(row_active) == 0:
@@ -202,12 +206,14 @@ def fused_down_proj_stream_compact_kernel(
 def get_summation_autotune_config():
     """Autotune configurations for summation kernel - simpler than main kernel"""
     return [
-        triton.Config({'BLOCK_SIZE_BS': 64, 'BLOCK_SIZE_H': 64}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_H': 64}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_SIZE_BS': 64, 'BLOCK_SIZE_H': 128}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_H': 128}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_SIZE_BS': 32, 'BLOCK_SIZE_H': 128}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_H': 32}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE_BS': 64, 'BLOCK_SIZE_H': 64, 'BLOCK_NB': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_H': 64, 'BLOCK_NB': 32}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE_BS': 64, 'BLOCK_SIZE_H': 128, 'BLOCK_NB': 32}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_H': 128, 'BLOCK_NB': 32}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE_BS': 32, 'BLOCK_SIZE_H': 128, 'BLOCK_NB': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_H': 32, 'BLOCK_NB': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE_BS': 64, 'BLOCK_SIZE_H': 64, 'BLOCK_NB': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_H': 128, 'BLOCK_NB': 64}, num_warps=8, num_stages=2),
     ]
 
 
@@ -220,6 +226,7 @@ def stream_compact_summation_kernel(
     # Input tensors
     intermediate_ptr,        # (act_idx, H) intermediate results
     bs_nb_to_actidx_ptr,     # (BS, NB) -> act_idx mapping (-1 for inactive)
+    bs_nb_to_gate_vals_ptr,  # (BS, NB) -> gate values
     
     # Output tensor
     output_ptr,              # (BS, H) final output
@@ -232,6 +239,7 @@ def stream_compact_summation_kernel(
     # Strides
     stride_inter_actidx, stride_inter_h,
     stride_mapping_bs, stride_mapping_nb,
+    stride_gate_bs, stride_gate_nb,
     stride_out_bs, stride_out_h,
     
     # Meta-params
@@ -240,6 +248,7 @@ def stream_compact_summation_kernel(
     # Block sizes from autotune
     BLOCK_SIZE_BS: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
+    BLOCK_NB: tl.constexpr,
 ):
     """Sum intermediate (act_idx, H) results to final (BS, H) output.
     
@@ -275,34 +284,45 @@ def stream_compact_summation_kernel(
     acc = tl.zeros((BLOCK_SIZE_BS, BLOCK_SIZE_H), dtype=tl.float32)
     
     # ------------------------------------------------------------------
-    # Iterate through NB dimension and accumulate contributions
+    # Iterate through NB dimension in blocks and accumulate contributions
     # ------------------------------------------------------------------
-    for nb in range(num_blocks):
-        # Load act_idx mappings for current (BS, NB) pairs
+    for nb_start in range(0, num_blocks, BLOCK_NB):
+        # Load gate values and mappings for this NB block
+        offs_nb = nb_start + tl.arange(0, BLOCK_NB)
+        mask_nb = offs_nb < num_blocks
+        
+        gate_ptrs = (bs_nb_to_gate_vals_ptr 
+                    + offs_bs[:, None] * stride_gate_bs 
+                    + offs_nb[None, :] * stride_gate_nb)
+        
+        gate_vals_block = tl.load(gate_ptrs, mask=mask_bs[:, None] & mask_nb[None, :], other=0.0)
+        gate_vals_block = tl.where(gate_vals_block > 0, gate_vals_block, 0.0)
+        
+        # Load act_idx mappings for this NB block
         mapping_ptrs = (bs_nb_to_actidx_ptr 
-                       + offs_bs * stride_mapping_bs 
-                       + nb * stride_mapping_nb)
+                       + offs_bs[:, None] * stride_mapping_bs 
+                       + offs_nb[None, :] * stride_mapping_nb)
         
-        act_indices = tl.load(mapping_ptrs, mask=mask_bs, other=-1)
+        act_indices_block = tl.load(mapping_ptrs, mask=mask_bs[:, None] & mask_nb[None, :], other=-1)
         
-        # Mask for active elements (act_idx >= 0)
-        active_mask = act_indices >= 0
+        # Mask for active elements (gate > 0 and act_idx >= 0)
+        active_mask_block = (gate_vals_block > 0.0) & (act_indices_block >= 0) & mask_bs[:, None] & mask_nb[None, :]
         
-        # Only process if we have active elements in this NB slice
-        has_active = tl.sum(active_mask) > 0
+        # Load intermediate values using 2D act_indices_block shape
+        # Shape: (BLOCK_SIZE_BS, BLOCK_NB, BLOCK_SIZE_H)
+        inter_ptrs = (intermediate_ptr 
+                     + act_indices_block[:, :, None] * stride_inter_actidx 
+                     + offs_h[None, None, :] * stride_inter_h)
         
-        if has_active:
-            # Load corresponding intermediate values (act_idx, H)
-            inter_ptrs = (intermediate_ptr 
-                         + act_indices[:, None] * stride_inter_actidx 
-                         + offs_h[None, :] * stride_inter_h)
-            
-            inter_vals = tl.load(inter_ptrs, 
-                                mask=active_mask[:, None] & mask_h[None, :], 
-                                other=0.0)
-            
-            # Accumulate contributions
-            acc += inter_vals
+        inter_vals_3d = tl.load(inter_ptrs, 
+                               mask=active_mask_block[:, :, None] & mask_h[None, None, :], 
+                               other=0.0)
+        
+        # Sum across NB dimension to get (BLOCK_SIZE_BS, BLOCK_SIZE_H)
+        inter_vals_2d = tl.sum(inter_vals_3d, axis=1)
+        
+        # Accumulate contributions
+        acc += inter_vals_2d
     
     # ------------------------------------------------------------------
     # Store final results
@@ -362,9 +382,11 @@ def fused_down_proj_sparse_triton_stream_compact(
     # Extract mappings
     nb_maxrows_to_bs = mappings['nb_maxrows_to_bs']           # (NB, max_rows)
     nb_maxrows_to_actidx = mappings['nb_maxrows_to_actidx']   # (NB, max_rows)  
+    nb_maxrows_gate_vals = mappings['nb_maxrows_gate_vals']   # (NB, max_rows)
     max_rows = mappings['max_rows']
     max_rows_per_block = mappings['max_rows_per_block']       # (NB,)
     bs_nb_to_actidx = mappings['bs_nb_to_actidx']             # (BS, NB)
+    bs_nb_to_gate_vals = mappings['bs_nb_to_gate_vals']       # (BS, NB)
     
     # Get batch_seq_size from bs_nb_to_actidx shape
     batch_seq_size = bs_nb_to_actidx.shape[0]
@@ -416,6 +438,7 @@ def fused_down_proj_sparse_triton_stream_compact(
         # Index mappings
         nb_maxrows_to_bs,
         nb_maxrows_to_actidx,
+        nb_maxrows_gate_vals,
         max_rows_per_block,
         
         # Output
@@ -452,6 +475,7 @@ def fused_down_proj_sparse_triton_stream_compact(
             # Input tensors
             output_tensor,       # (act_idx, H) intermediate results
             bs_nb_to_actidx,     # (BS, NB) -> act_idx mapping
+            bs_nb_to_gate_vals,  # (BS, NB) -> gate values
             
             # Output tensor
             final_output,        # (BS, H) final output
@@ -462,6 +486,7 @@ def fused_down_proj_sparse_triton_stream_compact(
             # Strides
             output_tensor.stride(0), output_tensor.stride(1),        # intermediate strides
             bs_nb_to_actidx.stride(0), bs_nb_to_actidx.stride(1),   # mapping strides
+            bs_nb_to_gate_vals.stride(0), bs_nb_to_gate_vals.stride(1), # gate strides
             final_output.stride(0), final_output.stride(1),         # output strides
             
             # Meta-params
