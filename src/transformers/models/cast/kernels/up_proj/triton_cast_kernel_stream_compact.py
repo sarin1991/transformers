@@ -64,6 +64,7 @@ def fused_up_proj_stream_compact_kernel(
     
     # Output tensor
     output_ptr,                     # (act_idx, LS) dense output
+    up_proj_ptr,                    # (act_idx, LS) pre-gating values (optional)
     
     # Sizes
     hidden_size: tl.constexpr,
@@ -74,11 +75,13 @@ def fused_up_proj_stream_compact_kernel(
     stride_x_bs, stride_x_h,
     stride_w_h, stride_w_i,
     stride_out_actidx, stride_out_ls,
+    stride_up_proj_actidx, stride_up_proj_ls,
     
     # Meta-params
     out_dtype: tl.constexpr,
     apply_gate: tl.constexpr,
     apply_relu: tl.constexpr,
+    save_up_proj: tl.constexpr,
     
     # Block sizes from autotune
     BLOCK_SIZE_BS: tl.constexpr, 
@@ -189,6 +192,11 @@ def fused_up_proj_stream_compact_kernel(
     if apply_relu:
         acc = tl.where(acc > 0, acc, 0.0)
 
+    # Store post-ReLU, pre-gating values if requested (for backward pass caching)
+    if save_up_proj:
+        up_proj_ptrs = up_proj_ptr + act_indices[:, None] * stride_up_proj_actidx + offs_ls[None, :] * stride_up_proj_ls
+        tl.store(up_proj_ptrs, acc.to(out_dtype), mask=row_active[:, None] & mask_ls[None, :])
+
     # Apply gating if requested
     if apply_gate:
         acc *= gate_vals[:, None]
@@ -237,12 +245,12 @@ def fused_up_proj_gate_activation_sparse_triton_stream_compact(
         out_dtype: output data type
         apply_gate: whether to apply gating
         apply_relu: whether to apply ReLU activation
-        save_up_proj: save pre-gating values (not implemented yet)
+        save_up_proj: save pre-gating values to up_proj_output
         calculate_grad_gate_up_proj: compute gradients (not implemented yet)
         
     Returns:
         output: (act_idx, LS) dense tensor containing only active computations
-        up_proj_output: if save_up_proj=True (not implemented)
+        up_proj_output: if save_up_proj=True, (act_idx, LS) pre-gating values
     """
     
     batch_seq_size, hidden_size = x.shape
@@ -275,6 +283,16 @@ def fused_up_proj_gate_activation_sparse_triton_stream_compact(
     
     # Allocate output tensor in dense format (act_idx, LS)
     output = torch.empty((total_act_idx, line_size), device=x.device, dtype=out_dtype)
+    
+    # Conditionally allocate up_proj buffer for pre-gating caching
+    if save_up_proj:
+        up_proj_output = torch.empty((total_act_idx, line_size), device=x.device, dtype=out_dtype)
+        up_proj_ptr = up_proj_output
+        stride_up_proj_actidx, stride_up_proj_ls = up_proj_output.stride()
+    else:
+        up_proj_output = None
+        up_proj_ptr = output  # Use dummy pointer (won't be accessed due to save_up_proj=False)
+        stride_up_proj_actidx, stride_up_proj_ls = 0, 0  # Dummy strides
     
     # Grid calculation
     def grid(meta):
@@ -310,6 +328,7 @@ def fused_up_proj_gate_activation_sparse_triton_stream_compact(
         
         # Output
         output,
+        up_proj_ptr,
         
         # Sizes
         hidden_size, line_size, max_rows,
@@ -318,23 +337,24 @@ def fused_up_proj_gate_activation_sparse_triton_stream_compact(
         x_contiguous.stride(0), x_contiguous.stride(1),
         up_weight_contiguous.stride(0), up_weight_contiguous.stride(1),
         output.stride(0), output.stride(1),
+        stride_up_proj_actidx, stride_up_proj_ls,
         
         # Meta-params
         out_dtype=triton_out_dtype,
         apply_gate=apply_gate,
         apply_relu=apply_relu,
+        save_up_proj=save_up_proj,
     )
     
-    # Handle save_up_proj and gradient computation if requested
-    if save_up_proj:
-        # TODO: Implement pre-gating value caching for backward pass
-        raise NotImplementedError("save_up_proj not yet implemented for stream_compact")
-    
+    # Handle gradient computation if requested
     if calculate_grad_gate_up_proj:
         # TODO: Implement gradient computation in forward pass
         raise NotImplementedError("calculate_grad_gate_up_proj not yet implemented for stream_compact")
     
-    return output
+    if save_up_proj:
+        return output, up_proj_output  # (gated + ReLU, pre-gated + ReLU)
+    else:
+        return output  # (gated + ReLU)
 
 
 if __name__ == "__main__":
