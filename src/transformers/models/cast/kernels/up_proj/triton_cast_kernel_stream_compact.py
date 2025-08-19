@@ -267,9 +267,11 @@ def fused_up_proj_gate_activation_sparse_triton_stream_compact(
     if max_rows == 0 or total_act_idx == 0:
         return torch.zeros((0, line_size), device=x.device, dtype=out_dtype)
     
-    # Ensure input tensors are contiguous  
-    x_contiguous = x.contiguous()
-    up_weight_contiguous = up_weight.contiguous()
+    # Assert that input tensors have efficient memory layout (at least one stride ≤ 1)
+    assert min(x.stride()) <= 1, f"x has inefficient stride pattern: {x.stride()}"
+    assert min(up_weight.stride()) <= 1, f"up_weight has inefficient stride pattern: {up_weight.stride()}"
+    x_contiguous = x  # No copy needed
+    up_weight_contiguous = up_weight  # No copy needed
     
     # Allocate output tensor in dense format (act_idx, LS)
     output = torch.empty((total_act_idx, line_size), device=x.device, dtype=out_dtype)
