@@ -206,14 +206,12 @@ def fused_down_proj_stream_compact_kernel(
 def get_summation_autotune_config():
     """Autotune configurations for summation kernel - simpler than main kernel"""
     return [
-        triton.Config({'BLOCK_SIZE_BS': 64, 'BLOCK_SIZE_H': 64, 'BLOCK_NB': 32}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_H': 64, 'BLOCK_NB': 32}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_SIZE_BS': 64, 'BLOCK_SIZE_H': 128, 'BLOCK_NB': 32}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_H': 128, 'BLOCK_NB': 32}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_SIZE_BS': 32, 'BLOCK_SIZE_H': 128, 'BLOCK_NB': 64}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_H': 32, 'BLOCK_NB': 64}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_SIZE_BS': 64, 'BLOCK_SIZE_H': 64, 'BLOCK_NB': 64}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_H': 128, 'BLOCK_NB': 64}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE_BS': 64, 'BLOCK_SIZE_H': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_H': 64}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE_BS': 64, 'BLOCK_SIZE_H': 128}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_H': 128}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE_BS': 32, 'BLOCK_SIZE_H': 128}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_H': 32}, num_warps=4, num_stages=3),
     ]
 
 
@@ -248,7 +246,6 @@ def stream_compact_summation_kernel(
     # Block sizes from autotune
     BLOCK_SIZE_BS: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
-    BLOCK_NB: tl.constexpr,
 ):
     """Sum intermediate (act_idx, H) results to final (BS, H) output.
     
@@ -284,45 +281,42 @@ def stream_compact_summation_kernel(
     acc = tl.zeros((BLOCK_SIZE_BS, BLOCK_SIZE_H), dtype=tl.float32)
     
     # ------------------------------------------------------------------
-    # Iterate through NB dimension in blocks and accumulate contributions
+    # Iterate through NB dimension and accumulate contributions
     # ------------------------------------------------------------------
-    for nb_start in range(0, num_blocks, BLOCK_NB):
-        # Load gate values and mappings for this NB block
-        offs_nb = nb_start + tl.arange(0, BLOCK_NB)
-        mask_nb = offs_nb < num_blocks
-        
+    for nb in range(num_blocks):
+        # Load gate values for current (BS, NB) pairs
         gate_ptrs = (bs_nb_to_gate_vals_ptr 
-                    + offs_bs[:, None] * stride_gate_bs 
-                    + offs_nb[None, :] * stride_gate_nb)
+                    + offs_bs * stride_gate_bs 
+                    + nb * stride_gate_nb)
         
-        gate_vals_block = tl.load(gate_ptrs, mask=mask_bs[:, None] & mask_nb[None, :], other=0.0)
-        gate_vals_block = tl.where(gate_vals_block > 0, gate_vals_block, 0.0)
+        gate_vals = tl.load(gate_ptrs, mask=mask_bs, other=0.0)
+        gate_vals = tl.where(gate_vals > 0, gate_vals, 0.0)  # Set negative gate values to zero
         
-        # Load act_idx mappings for this NB block
+        # Load act_idx mappings for current (BS, NB) pairs
         mapping_ptrs = (bs_nb_to_actidx_ptr 
-                       + offs_bs[:, None] * stride_mapping_bs 
-                       + offs_nb[None, :] * stride_mapping_nb)
+                       + offs_bs * stride_mapping_bs 
+                       + nb * stride_mapping_nb)
         
-        act_indices_block = tl.load(mapping_ptrs, mask=mask_bs[:, None] & mask_nb[None, :], other=-1)
+        act_indices = tl.load(mapping_ptrs, mask=mask_bs, other=-1)
         
         # Mask for active elements (gate > 0 and act_idx >= 0)
-        active_mask_block = (gate_vals_block > 0.0) & (act_indices_block >= 0) & mask_bs[:, None] & mask_nb[None, :]
+        active_mask = (gate_vals > 0.0) & (act_indices >= 0)
         
-        # Load intermediate values using 2D act_indices_block shape
-        # Shape: (BLOCK_SIZE_BS, BLOCK_NB, BLOCK_SIZE_H)
-        inter_ptrs = (intermediate_ptr 
-                     + act_indices_block[:, :, None] * stride_inter_actidx 
-                     + offs_h[None, None, :] * stride_inter_h)
+        # Only process if we have active elements in this NB slice
+        has_active = tl.sum(active_mask) > 0
         
-        inter_vals_3d = tl.load(inter_ptrs, 
-                               mask=active_mask_block[:, :, None] & mask_h[None, None, :], 
-                               other=0.0)
-        
-        # Sum across NB dimension to get (BLOCK_SIZE_BS, BLOCK_SIZE_H)
-        inter_vals_2d = tl.sum(inter_vals_3d, axis=1)
-        
-        # Accumulate contributions
-        acc += inter_vals_2d
+        if has_active:
+            # Load corresponding intermediate values (act_idx, H)
+            inter_ptrs = (intermediate_ptr 
+                         + act_indices[:, None] * stride_inter_actidx 
+                         + offs_h[None, :] * stride_inter_h)
+            
+            inter_vals = tl.load(inter_ptrs, 
+                                mask=active_mask[:, None] & mask_h[None, :], 
+                                other=0.0)
+            
+            # Accumulate contributions
+            acc += inter_vals
     
     # ------------------------------------------------------------------
     # Store final results
