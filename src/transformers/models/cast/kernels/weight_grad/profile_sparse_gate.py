@@ -7,6 +7,8 @@ from torch.profiler import ProfilerActivity, profile, record_function
 
 from .triton_kernels import fused_weight_grad_triton
 from .triton_cast_kernel_gate_sortpack import fused_weight_grad_sparse_triton_sortpack
+from .triton_cast_kernel_weight_grad_stream_compact import fused_weight_grad_sparse_triton_stream_compact
+from kernels.stream_compact_index import create_stream_compact_index
 
 
 # -----------------------------------------------------------------------------
@@ -49,6 +51,36 @@ def _generate_tensors(
     return intermediate_fp16, other_fp16, gate, intermediate_fp16_t
 
 
+def convert_dense_to_stream_compact(intermediate_dense, mappings, num_blocks, line_size):
+    """Convert (BS, I) dense → (act_idx, LS) sparse format using stream compact mappings"""
+    BS, I = intermediate_dense.shape
+    
+    # Early exit if no active elements
+    if mappings['total_act_idx'] == 0:
+        return torch.empty(0, line_size, device=intermediate_dense.device, dtype=intermediate_dense.dtype)
+    
+    # Reshape to block format: (BS, I) → (BS, NB, LS)
+    intermediate_reshaped = intermediate_dense.view(BS, num_blocks, line_size)
+    
+    # Extract stream compact mappings
+    bs_nb_to_actidx = mappings['bs_nb_to_actidx']  # (BS, NB) → act_idx
+    total_act_idx = mappings['total_act_idx']
+    
+    # Build sparse tensor: (act_idx, LS)
+    intermediate_sparse = torch.zeros(total_act_idx, line_size, 
+                                    device=intermediate_dense.device, 
+                                    dtype=intermediate_dense.dtype)
+    
+    # Fill sparse tensor using mappings
+    active_mask = bs_nb_to_actidx >= 0
+    if active_mask.sum() > 0:
+        active_bs, active_nb = torch.where(active_mask)
+        act_indices = bs_nb_to_actidx[active_bs, active_nb]
+        intermediate_sparse[act_indices] = intermediate_reshaped[active_bs, active_nb]
+    
+    return intermediate_sparse
+
+
 # -----------------------------------------------------------------------------
 # Runners
 # -----------------------------------------------------------------------------
@@ -69,6 +101,12 @@ def _run_sortpack(intermediate: torch.Tensor, other: torch.Tensor, gate: torch.T
                   gate_vals: torch.Tensor = None, row_idx: torch.Tensor = None, block_counts: torch.Tensor = None, max_rows: int = None):
     fused_weight_grad_sparse_triton_sortpack(intermediate, other, gate, num_blocks, line_size, out_dtype=torch.float16,
                                               gate_vals=gate_vals, row_idx=row_idx, block_counts=block_counts, max_rows=max_rows)
+
+
+# StreamCompact
+def _run_streamcompact(intermediate_sparse: torch.Tensor, other: torch.Tensor, num_blocks: int, line_size: int, mappings: dict):
+    fused_weight_grad_sparse_triton_stream_compact(intermediate_sparse, other, num_blocks, line_size, 
+                                                   mappings=mappings, out_dtype=torch.float16)
 
 
 # -----------------------------------------------------------------------------
@@ -94,6 +132,7 @@ def main():
     parser.add_argument("--steps", type=int, default=50, help="Profiler steps")
     parser.add_argument("--profile-dense", action="store_true", help="Profile dense Triton helper")
     parser.add_argument("--profile-sortpack", action="store_true", help="Profile SortPack Triton helper")
+    parser.add_argument("--profile-streamcompact", action="store_true", help="Profile StreamCompact Triton helper")
     parser.add_argument("--profile-pytorch", action="store_true", help="Profile PyTorch baseline")
     args = parser.parse_args()
 
@@ -126,9 +165,14 @@ def main():
         return gate_vals, row_idx, block_counts, max_rows
 
     gate_vals, row_idx, block_counts, max_rows = preprocess_gate(gate, args.num_blocks)
+    
+    # Stream compact preprocessing
+    stream_compact_mappings = create_stream_compact_index(gate)
+    intermediate_sparse = convert_dense_to_stream_compact(
+        intermediate_fp16, stream_compact_mappings, args.num_blocks, args.line_size)
 
     # Ensure at least one kernel selected
-    if not (args.profile_dense or args.profile_sortpack or args.profile_pytorch):
+    if not (args.profile_dense or args.profile_sortpack or args.profile_streamcompact or args.profile_pytorch):
         args.profile_dense = True  # default to dense
 
     def _profile(name: str, run_fn):
@@ -162,11 +206,22 @@ def main():
         _profile("triton_weight_grad_sortpack", lambda: _run_sortpack(intermediate_fp16, other_fp16, gate, args.num_blocks, args.line_size,
                                                                       gate_vals=gate_vals, row_idx=row_idx, block_counts=block_counts, max_rows=max_rows))
 
+    if args.profile_streamcompact:
+        _profile("triton_weight_grad_streamcompact", lambda: _run_streamcompact(intermediate_sparse, other_fp16, args.num_blocks, args.line_size, stream_compact_mappings))
+
     if args.profile_pytorch:
         _profile("pytorch_weight_grad", lambda: _run_pytorch(intermediate_fp16_t, other_fp16))
 
-    if args.profile_dense and args.profile_sortpack:
-        print("\nTip: compare triton_weight_grad_dense vs triton_weight_grad_sortpack blocks above.")
+    if args.profile_dense and (args.profile_sortpack or args.profile_streamcompact):
+        methods = []
+        if args.profile_sortpack:
+            methods.append("triton_weight_grad_sortpack")
+        if args.profile_streamcompact:
+            methods.append("triton_weight_grad_streamcompact")
+        methods_str = " vs ".join(["triton_weight_grad_dense"] + methods)
+        print(f"\nTip: compare {methods_str} blocks above.")
+    elif args.profile_sortpack and args.profile_streamcompact:
+        print("\nTip: compare triton_weight_grad_sortpack vs triton_weight_grad_streamcompact blocks above.")
 
 
 if __name__ == "__main__":
