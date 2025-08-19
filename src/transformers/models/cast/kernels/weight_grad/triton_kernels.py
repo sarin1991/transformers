@@ -255,9 +255,11 @@ def compare_all_backends(ref, dense, sortpack, stream_compact):
     print(f"StreamCmpt vs Ref:     max {diff_stream_compact['max']:.6e} | mean {diff_stream_compact['mean']:.6e}")
     print(f"SortPack vs StreamCmpt: max {diff_sparse_cross['max']:.6e} | mean {diff_sparse_cross['mean']:.6e}")
     
-    # Validation: sparse cross-diff should be near machine precision
-    if diff_sparse_cross['max'] > 1e-6:
+    # Validation: sparse cross-diff should be reasonable for fp16 precision
+    if diff_sparse_cross['max'] > 1e-4:  # Relaxed threshold for fp16
         print(f"⚠️  WARNING: Sort pack vs Stream compact diff too large: {diff_sparse_cross['max']:.6e}")
+    elif diff_sparse_cross['max'] > 1e-5:
+        print(f"ℹ️  INFO: Sort pack vs Stream compact diff is within fp16 tolerance: {diff_sparse_cross['max']:.6e}")
     
     return {
         'dense': diff_dense,
