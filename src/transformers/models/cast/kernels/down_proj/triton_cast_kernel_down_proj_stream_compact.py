@@ -135,7 +135,7 @@ def fused_down_proj_stream_compact_kernel(
     
     # Load indices and gate values from stream compact mappings
     act_indices = tl.load(nb_maxrows_to_actidx_ptr + base_ptr + rows_in_block,
-                         mask=mask_bs, other=0)
+                         mask=mask_bs, other=-1)
     bs_indices = tl.load(nb_maxrows_to_bs_ptr + base_ptr + rows_in_block,
                         mask=mask_bs, other=0)
     gate_vals = tl.load(nb_maxrows_gate_vals_ptr + base_ptr + rows_in_block,
