@@ -288,21 +288,21 @@ def stream_compact_summation_kernel(
         # Mask for active elements (act_idx >= 0)
         active_mask = act_indices >= 0
         
-        # Early exit: skip if no active elements in this NB slice
-        if tl.sum(active_mask) == 0:
-            continue
+        # Only process if we have active elements in this NB slice
+        has_active = tl.sum(active_mask) > 0
         
-        # Load corresponding intermediate values (act_idx, H)
-        inter_ptrs = (intermediate_ptr 
-                     + act_indices[:, None] * stride_inter_actidx 
-                     + offs_h[None, :] * stride_inter_h)
-        
-        inter_vals = tl.load(inter_ptrs, 
-                            mask=active_mask[:, None] & mask_h[None, :], 
-                            other=0.0)
-        
-        # Accumulate contributions
-        acc += inter_vals
+        if has_active:
+            # Load corresponding intermediate values (act_idx, H)
+            inter_ptrs = (intermediate_ptr 
+                         + act_indices[:, None] * stride_inter_actidx 
+                         + offs_h[None, :] * stride_inter_h)
+            
+            inter_vals = tl.load(inter_ptrs, 
+                                mask=active_mask[:, None] & mask_h[None, :], 
+                                other=0.0)
+            
+            # Accumulate contributions
+            acc += inter_vals
     
     # ------------------------------------------------------------------
     # Store final results
