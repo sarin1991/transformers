@@ -4,6 +4,8 @@ import triton.language as tl
 from typing import Optional
 import torch.nn.functional as F
 from .triton_cast_kernel_gate_sortpack import fused_down_proj_sparse_triton_sortpack
+from .triton_cast_kernel_down_proj_stream_compact import fused_down_proj_sparse_triton_stream_compact
+from kernels.stream_compact_index import create_stream_compact_index
 
 # -----------------------------------------------------------------------------
 # Dynamically build Triton autotune configurations
@@ -205,6 +207,36 @@ def _make_sparse_gate(batch_seq_size: int, num_blocks: int, sparsity: float = 0.
     return gate
 
 
+def convert_dense_to_stream_compact(x_dense, mappings, num_blocks, line_size):
+    """Convert (BS, I) dense → (act_idx, LS) sparse format using stream compact mappings"""
+    BS, I = x_dense.shape
+    
+    # Early exit if no active elements
+    if mappings['total_act_idx'] == 0:
+        return torch.empty(0, line_size, device=x_dense.device, dtype=x_dense.dtype)
+    
+    # Reshape to block format: (BS, I) → (BS, NB, LS)
+    x_reshaped = x_dense.view(BS, num_blocks, line_size)
+    
+    # Extract stream compact mappings
+    bs_nb_to_actidx = mappings['bs_nb_to_actidx']  # (BS, NB) → act_idx
+    total_act_idx = mappings['total_act_idx']
+    
+    # Build sparse tensor: (act_idx, LS)
+    x_sparse = torch.zeros(total_act_idx, line_size, 
+                          device=x_dense.device, 
+                          dtype=x_dense.dtype)
+    
+    # Fill sparse tensor using mappings
+    active_mask = bs_nb_to_actidx >= 0
+    if active_mask.sum() > 0:
+        active_bs, active_nb = torch.where(active_mask)
+        act_indices = bs_nb_to_actidx[active_bs, active_nb]
+        x_sparse[act_indices] = x_reshaped[active_bs, active_nb]
+    
+    return x_sparse
+
+
 def debug_large_scale(use_sparse_gate: bool = False, use_fp32: bool = False):
     """Run numerical correctness checks on several shapes."""
     configs = [
@@ -215,6 +247,7 @@ def debug_large_scale(use_sparse_gate: bool = False, use_fp32: bool = False):
 
     overall_max_diff_dense = 0.0
     overall_max_diff_sortpack = 0.0
+    overall_max_diff_streamcompact = 0.0
 
     for batch_size, seq_len, hidden_size, num_blocks, line_size in configs:
         intermediate_size = num_blocks * line_size
@@ -249,6 +282,10 @@ def debug_large_scale(use_sparse_gate: bool = False, use_fp32: bool = False):
             return gate_vals, row_idx, block_counts, max_rows
 
         gate_vals, row_idx, block_counts, max_rows = preprocess_gate(gate, num_blocks)
+        
+        # Stream compact preprocessing
+        stream_compact_mappings = create_stream_compact_index(gate)
+        x_sparse = convert_dense_to_stream_compact(x, stream_compact_mappings, num_blocks, line_size)
 
         # Triton dense helper
         out_dense = fused_down_proj_triton(
@@ -275,21 +312,35 @@ def debug_large_scale(use_sparse_gate: bool = False, use_fp32: bool = False):
             block_counts=block_counts,
             max_rows=max_rows,
         )
+        
+        # Triton StreamCompact sparse helper
+        out_streamcompact = fused_down_proj_sparse_triton_stream_compact(
+            x_sparse,
+            down_weight,
+            num_blocks,
+            line_size,
+            mappings=stream_compact_mappings,
+        )
 
         max_diff_dense = torch.max(torch.abs(ref_fp32 - out_dense)).item()
         mean_diff_dense = torch.mean(torch.abs(ref_fp32 - out_dense)).item()
 
         max_diff_sort = torch.max(torch.abs(ref_fp32 - out_sortpack)).item()
         mean_diff_sort = torch.mean(torch.abs(ref_fp32 - out_sortpack)).item()
+        
+        max_diff_streamcompact = torch.max(torch.abs(ref_fp32 - out_streamcompact)).item()
+        mean_diff_streamcompact = torch.mean(torch.abs(ref_fp32 - out_streamcompact)).item()
 
         overall_max_diff_dense = max(overall_max_diff_dense, max_diff_dense)
         overall_max_diff_sortpack = max(overall_max_diff_sortpack, max_diff_sort)
+        overall_max_diff_streamcompact = max(overall_max_diff_streamcompact, max_diff_streamcompact)
 
-        print(f"Dense   → max diff {max_diff_dense:.6e} | mean diff {mean_diff_dense:.6e}")
-        print(f"SortPk  → max diff {max_diff_sort:.6e} | mean diff {mean_diff_sort:.6e}")
+        print(f"Dense      → max diff {max_diff_dense:.6e} | mean diff {mean_diff_dense:.6e}")
+        print(f"SortPk     → max diff {max_diff_sort:.6e} | mean diff {mean_diff_sort:.6e}")
+        print(f"StreamCmpt → max diff {max_diff_streamcompact:.6e} | mean diff {mean_diff_streamcompact:.6e}")
 
     print(
-        f"\nOverall max diff across configs | Dense: {overall_max_diff_dense:.6e} | SortPk: {overall_max_diff_sortpack:.6e}"
+        f"\nOverall max diff across configs | Dense: {overall_max_diff_dense:.6e} | SortPk: {overall_max_diff_sortpack:.6e} | StreamCmpt: {overall_max_diff_streamcompact:.6e}"
     )
 
 
