@@ -233,7 +233,10 @@ def fused_down_proj_sparse_triton_stream_compact(
     nb_maxrows_to_actidx = mappings['nb_maxrows_to_actidx']   # (NB, max_rows)  
     max_rows = mappings['max_rows']
     max_rows_per_block = mappings['max_rows_per_block']       # (NB,)
-    batch_seq_size = mappings['batch_seq_size']               # BS
+    bs_nb_to_actidx = mappings['bs_nb_to_actidx']             # (BS, NB)
+    
+    # Get batch_seq_size from bs_nb_to_actidx shape
+    batch_seq_size = bs_nb_to_actidx.shape[0]
     
     # Early exit if no active elements
     if max_rows == 0 or total_act_idx == 0:
