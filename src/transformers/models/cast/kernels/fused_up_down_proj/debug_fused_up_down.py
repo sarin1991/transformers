@@ -159,22 +159,23 @@ def main():
     parser = argparse.ArgumentParser(description="Debug fused up+down vs two-kernel reference (sort-pack)")
     parser.add_argument("--dtype", default="float16", choices=["float16", "bfloat16", "float32"], help="Input/weight dtype")
     parser.add_argument("--out-dtype", default="float32", choices=["float16", "bfloat16", "float32"], help="Output dtype for kernels")
-    parser.add_argument("--sparsity", type=float, default=0.9, help="Fraction of zeros in gate")
+    parser.add_argument(
+        "--sparsity",
+        default="dynamic",
+        help="Fraction of zeros in gate (e.g., 0.9) or 'dynamic' to use 1 - 1/num_blocks per config",
+    )
     parser.add_argument("--apply-relu", action="store_true", help="Apply ReLU in up-proj before gate")
     parser.add_argument("--no-gate", action="store_true", help="Disable gating multiply")
     parser.add_argument(
         "--configs",
         type=str,
         default=(
-            "4,8,128,4,32;"
-            "8,16,256,8,32;"
-            "128,32,512,8,64;"
-            "128,128,4096,64,64;"
-            "128,128,4096,256,128;"
-            "128,128,4096,128,256;"
-            "128,128,4096,64,512;"
-            "128,128,4096,32,1024;"
-            "128,128,4096,8,4096"
+            "128,256,4096,256,64;"
+            "128,256,4096,128,128;"
+            "128,256,4096,64,256;"
+            "128,256,4096,32,512;"
+            "128,256,4096,16,1024;"
+            "128,256,4096,4,4096"
         ),
         help="Semicolon-separated configs as B,S,H,NB,LS (matches other kernels)",
     )
@@ -193,19 +194,34 @@ def main():
     print("=== Fused Up+Down: Accuracy vs Two-Kernel Reference ===")
     for cfg in [c.strip() for c in args.configs.split(";") if c.strip()]:
         b, s, h, nb, ls = map(int, cfg.split(","))
+        
+        # Calculate sparsity
+        if args.sparsity == "dynamic":
+            zeros_frac = 1.0 - (1.0 / nb)
+        else:
+            try:
+                zeros_frac = float(args.sparsity)
+            except (ValueError, TypeError) as e:
+                raise ValueError(
+                    f"Invalid --sparsity value '{args.sparsity}'. Use 'dynamic' or a float between 0 and 1."
+                ) from e
+            zeros_frac = max(0.0, min(1.0, zeros_frac))
+        
+        print(f"Config B={b} S={s} H={h} NB={nb} LS={ls} | Sparsity={zeros_frac:.3f}")
+        
         rel_max, rel_mean, abs_max, abs_mean = run_accuracy_once(
             batch_size=b,
             seq_len=s,
             hidden_size=h,
             num_blocks=nb,
             line_size=ls,
-            sparsity=args.sparsity,
+            sparsity=zeros_frac,
             dtype=dtype,
             out_dtype=out_dtype,
             apply_relu=args.apply_relu,
             apply_gate=apply_gate,
         )
-        print(f"Config B={b} S={s} H={h} NB={nb} LS={ls} | rel_max={rel_max:.3e} rel_mean={rel_mean:.3e} | abs_max={abs_max:.3e} abs_mean={abs_mean:.3e}")
+        print(f"  rel_max={rel_max:.3e} rel_mean={rel_mean:.3e} | abs_max={abs_max:.3e} abs_mean={abs_mean:.3e}")
 
 
 if __name__ == "__main__":

@@ -20,7 +20,20 @@ from kernels.stream_compact_index import create_stream_compact_index
 import argparse
 
 
-def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
+def _make_sparse_gate(batch_seq_size: int, num_blocks: int, sparsity: float = 0.9):
+    """Build a gate tensor with given sparsity on CUDA.
+    
+    sparsity denotes the fraction of zeros (e.g. 0.9 → 10 % non-zero).
+    Returns a torch.float32 tensor on the current CUDA device.
+    """
+    gate = torch.rand(batch_seq_size, num_blocks, device="cuda", dtype=torch.float32)
+    if sparsity > 0.0:
+        mask = torch.rand_like(gate) < sparsity  # True for zeros
+        gate[mask] = 0.0
+    return gate
+
+
+def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False, sparsity: str = "dynamic"):
     """Time PyTorch reference vs Triton fused kernel on several shapes."""
     if not torch.cuda.is_available():
         print("CUDA not available – skipping benchmark.")
@@ -29,27 +42,39 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
     print("\n=== Performance Benchmark (fp16 inputs, fp32 gate/output) ===")
 
     configs = [
-        (4, 8, 128, 4, 32),
-        (8, 16, 256, 8, 32),
-        (128, 32, 512, 8, 64),
-        (128, 128, 4096, 64, 64),
-        (128, 128, 4096, 256, 128),
-        (128, 128, 4096, 128, 256),
-        (128, 128, 4096, 64, 512),
-        (128, 128, 4096, 32, 1024),
-        (128, 128, 4096, 8, 4096),
+        (128, 256, 4096, 256, 64),
+        (128, 256, 4096, 128, 128),
+        (128, 256, 4096, 64, 256),
+        (128, 256, 4096, 32, 512),
+        (128, 256, 4096, 16, 1024),
+        (128, 256, 4096, 4, 4096),
     ]
 
     for batch_size, seq_len, hidden_size, num_blocks, line_size in configs:
         intermediate_size = num_blocks * line_size
-        cfg = f"{batch_size}x{seq_len}x{hidden_size}x{num_blocks}x{line_size}"
+        
+        # Calculate sparsity
+        if sparsity == "dynamic":
+            zeros_frac = 1.0 - (1.0 / num_blocks)
+        else:
+            try:
+                zeros_frac = float(sparsity)
+            except (ValueError, TypeError) as e:
+                raise ValueError(
+                    f"Invalid --sparsity value '{sparsity}'. Use 'dynamic' or a float between 0 and 1."
+                ) from e
+            zeros_frac = max(0.0, min(1.0, zeros_frac))
+        
+        cfg = f"{batch_size}x{seq_len}x{hidden_size}x{num_blocks}x{line_size} | Sparsity={zeros_frac:.3f}"
         print(f"\nConfig: {cfg}  |  Iters: {num_iters}")
 
         # Random tensors
         batch_seq_size = batch_size * seq_len
         x_fp16 = torch.randn(batch_seq_size, hidden_size, device="cuda", dtype=torch.float16)
         up_weight_fp16 = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=torch.float16)
-        gate_fp32 = torch.rand(batch_seq_size, num_blocks, device="cuda", dtype=torch.float32)
+        
+        # Create sparse gate with calculated sparsity
+        gate_fp32 = _make_sparse_gate(batch_seq_size, num_blocks, sparsity=zeros_frac)
 
         # ---- PyTorch timing ----
         # Warm-up for PyTorch (5 runs)
@@ -131,10 +156,8 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
 
             print(f"Triton (autotuned): {triton_ms:.3f} ms | Speed-up: {torch_ms/triton_ms:.2f}x")
 
-        # Create sparse gate data for sparse benchmarks
-        gate_sparse = gate_fp32.clone()
-        mask_sparse = torch.rand_like(gate_sparse) < 0.9  # 90% zeros
-        gate_sparse[mask_sparse] = 0.0
+        # Create sparse gate data for sparse benchmarks using the same sparsity
+        gate_sparse = _make_sparse_gate(batch_seq_size, num_blocks, sparsity=zeros_frac)
         gate_vals_sparse, row_idx_sparse, block_counts_sparse, max_rows_sparse = preprocess_gate(gate_sparse, num_blocks)
         
         # Preprocess stream compact mappings for sparse gate
@@ -179,7 +202,7 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
             torch.cuda.synchronize()
             sparse_ms = start_sp.elapsed_time(end_sp) / num_iters
 
-            print(f"Triton (sparse helper, 10% nnz): {sparse_ms:.3f} ms | Speed-up vs PyTorch: {torch_ms/sparse_ms:.2f}x")
+            print(f"Triton (sparse helper, {zeros_frac:.1%} nnz): {sparse_ms:.3f} ms | Speed-up vs PyTorch: {torch_ms/sparse_ms:.2f}x")
 
             # ---- Optimized sparse benchmark (10% non-zero gate) ----
             for _ in range(5):
@@ -219,9 +242,9 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
             torch.cuda.synchronize()
             opt_ms = start_opt.elapsed_time(end_opt) / num_iters
 
-            print(f"Triton (optimized sparse, 10% nnz): {opt_ms:.3f} ms | Speed-up vs PyTorch: {torch_ms/opt_ms:.2f}x | Speed-up vs baseline sparse: {sparse_ms/opt_ms:.2f}x")
+            print(f"Triton (optimized sparse, {zeros_frac:.1%} nnz): {opt_ms:.3f} ms | Speed-up vs PyTorch: {torch_ms/opt_ms:.2f}x | Speed-up vs baseline sparse: {sparse_ms/opt_ms:.2f}x")
 
-            # ---- CSR sparse benchmark (10% non-zero gate) ----
+            # ---- CSR sparse benchmark ({zeros_frac:.1%} non-zero gate) ----
             for _ in range(5):
                 _ = fused_up_proj_gate_activation_sparse_triton_csr(
                     x_fp16,
@@ -299,7 +322,7 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
         torch.cuda.synchronize()
         sortpack_ms = start_sortpack.elapsed_time(end_sortpack) / num_iters
 
-        base_line = f"Triton (SortPack, 10% nnz): {sortpack_ms:.3f} ms | Speed-up vs PyTorch: {torch_ms/sortpack_ms:.2f}x"
+        base_line = f"Triton (SortPack, {zeros_frac:.1%} nnz): {sortpack_ms:.3f} ms | Speed-up vs PyTorch: {torch_ms/sortpack_ms:.2f}x"
         if run_all:
             base_line += f" | vs baseline sparse: {sparse_ms/sortpack_ms:.2f}x | vs optimized: {opt_ms/sortpack_ms:.2f}x | vs old CSR: {csr_ms/sortpack_ms:.2f}x"
         print(base_line)
@@ -336,7 +359,7 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
         torch.cuda.synchronize()
         stream_compact_ms = start_stream_compact.elapsed_time(end_stream_compact) / num_iters
 
-        stream_compact_line = f"Triton (StreamCompact, 10% nnz): {stream_compact_ms:.3f} ms | Speed-up vs PyTorch: {torch_ms/stream_compact_ms:.2f}x | vs SortPack: {sortpack_ms/stream_compact_ms:.2f}x"
+        stream_compact_line = f"Triton (StreamCompact, {zeros_frac:.1%} nnz): {stream_compact_ms:.3f} ms | Speed-up vs PyTorch: {torch_ms/stream_compact_ms:.2f}x | vs SortPack: {sortpack_ms/stream_compact_ms:.2f}x"
         if run_all:
             stream_compact_line += f" | vs baseline sparse: {sparse_ms/stream_compact_ms:.2f}x | vs optimized: {opt_ms/stream_compact_ms:.2f}x | vs old CSR: {csr_ms/stream_compact_ms:.2f}x"
         print(stream_compact_line)
@@ -346,6 +369,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark Cast up-proj kernels")
     parser.add_argument("--all", action="store_true", help="Run all helper variants (dense, sparse, etc.)")
     parser.add_argument("--iters", type=int, default=100, help="Iterations per config")
+    parser.add_argument("--sparsity", type=str, default="dynamic", help="Sparsity for sparse benchmarks (e.g., 0.1, 0.9, dynamic)")
     args = parser.parse_args()
 
     try:
@@ -355,4 +379,4 @@ if __name__ == "__main__":
         print("❌ Triton is not available. Please install it.")
         exit(1)
 
-    benchmark_fused_vs_pytorch(num_iters=args.iters, run_all=args.all) 
+    benchmark_fused_vs_pytorch(num_iters=args.iters, run_all=args.all, sparsity=args.sparsity) 
