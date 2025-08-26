@@ -211,12 +211,10 @@ def fused_down_proj_stream_compact_kernel(
 def get_summation_autotune_config():
     """Autotune configurations for 1D summation kernel with loop pipelining"""
     return [
-        triton.Config({'BLOCK_SIZE_H': 1024, 'NUM_STAGES_LOOP': 4}),
-        triton.Config({'BLOCK_SIZE_H': 1024, 'NUM_STAGES_LOOP': 6}),
-        triton.Config({'BLOCK_SIZE_H': 2048, 'NUM_STAGES_LOOP': 4}),
-        triton.Config({'BLOCK_SIZE_H': 512, 'NUM_STAGES_LOOP': 6}),
-        triton.Config({'BLOCK_SIZE_H': 1024, 'NUM_STAGES_LOOP': 3}),
-        triton.Config({'BLOCK_SIZE_H': 2048, 'NUM_STAGES_LOOP': 3}),
+        triton.Config({'BLOCK_SIZE_H': 2048}),
+        triton.Config({'BLOCK_SIZE_H': 1024}),
+        triton.Config({'BLOCK_SIZE_H': 512}),
+        triton.Config({'BLOCK_SIZE_H': 256}),
     ]
 
 
@@ -305,7 +303,7 @@ def stream_compact_summation_kernel(
     # ------------------------------------------------------------------
     # Pipelined loop over NB dimension with vectorized access pattern
     # ------------------------------------------------------------------
-    for nb in tl.range(num_blocks, num_stages=NUM_STAGES_LOOP):
+    for nb in tl.static_range(num_blocks):
         # Reconstruct act_idx using preloaded values
         act_idx = block_offsets[nb] + local_indices[nb]
         
