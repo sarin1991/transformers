@@ -249,7 +249,6 @@ def stream_compact_summation_kernel(
     
     # Block sizes from autotune
     BLOCK_SIZE_H: tl.constexpr,
-    NUM_STAGES_LOOP: tl.constexpr,
 ):
     """Sum intermediate (act_idx, H) results to final (BS, H) output.
     
