@@ -392,7 +392,8 @@ def stream_compact_to_dense_blocks(stream_compact_output, mappings, batch_seq_si
     # Get active positions and their corresponding act_idx values
     bs_indices, nb_indices = torch.nonzero(active_mask, as_tuple=True)
     # Reconstruct act_indices from local indices + block offsets
-    local_indices = bs_nb_to_local_idx[active_mask]  # Only active local indices
+    bs_nb_to_local_idx_int32 = bs_nb_to_local_idx.to(torch.int32)
+    local_indices = bs_nb_to_local_idx_int32[active_mask]  # Only active local indices
     act_indices = block_offsets[nb_indices] + local_indices
     
     # Vectorized assignment

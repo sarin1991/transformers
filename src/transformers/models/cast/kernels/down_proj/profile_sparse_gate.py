@@ -70,8 +70,9 @@ def convert_dense_to_stream_compact(x_dense, mappings, num_blocks, line_size):
     active_mask = bs_nb_to_local_idx != 65535
     if active_mask.sum() > 0:
         active_bs, active_nb = torch.where(active_mask)
-        # Reconstruct act_indices from local indices + block offsets
-        local_indices = bs_nb_to_local_idx[active_bs, active_nb]
+        # Convert to int32 for indexing, then reconstruct act_indices
+        bs_nb_to_local_idx_int32 = bs_nb_to_local_idx.to(torch.int32)
+        local_indices = bs_nb_to_local_idx_int32[active_bs, active_nb]
         act_indices = block_offsets[active_nb] + local_indices
         x_sparse[act_indices] = x_reshaped[active_bs, active_nb]
     
