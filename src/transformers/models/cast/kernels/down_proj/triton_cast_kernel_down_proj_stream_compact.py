@@ -252,6 +252,7 @@ def stream_compact_summation_kernel(
     # Block sizes from autotune
     BLOCK_SIZE_H: tl.constexpr,
     NUM_STAGES_LOOP: tl.constexpr,
+    BLOCK_SIZE_NB: tl.constexpr,
 ):
     """Sum intermediate (act_idx, H) results to final (BS, H) output.
     
@@ -302,11 +303,11 @@ def stream_compact_summation_kernel(
     # Compute active flags for all blocks at once  
     is_active = (gate_vals > 0) & (local_indices != 65535)
     
-    nb_range = tl.arange(0, 32)
+    nb_range = tl.arange(0, BLOCK_SIZE_NB)
     # ------------------------------------------------------------------
     # Pipelined loop over NB dimension with vectorized access pattern
     # ------------------------------------------------------------------
-    for nb_start in tl.range(0, num_blocks, 32, num_stages=NUM_STAGES_LOOP):
+    for nb_start in tl.range(0, num_blocks, BLOCK_SIZE_NB, num_stages=NUM_STAGES_LOOP):
         nb_offsets = tl.minimum(nb_start + nb_range, num_blocks)
         nb_mask = nb_offsets < num_blocks
         
