@@ -285,38 +285,23 @@ def stream_compact_summation_kernel(
     # Initialize 1D accumulator for this H chunk
     # ------------------------------------------------------------------
     acc = tl.zeros((BLOCK_SIZE_H,), dtype=tl.float32)
-    
-    # ------------------------------------------------------------------
-    # Vectorized metadata loading outside the loop
-    # ------------------------------------------------------------------
-    offs_nb = tl.arange(0, num_blocks)
-    
-    # Load all gate values for this BS row
-    gate_vals = tl.load(bs_nb_to_gate_vals_ptr + bs_idx * stride_gate_bs + offs_nb * stride_gate_nb)
-    
-    # Load all local indices for this BS row
-    local_indices = tl.load(bs_nb_to_local_idx_ptr + bs_idx * stride_mapping_bs + offs_nb * stride_mapping_nb)
-    
-    # Load all block offsets
-    block_offsets = tl.load(block_offsets_ptr + offs_nb)
-    
-    # Compute active flags for all blocks at once  
-    is_active = (gate_vals > 0) & (local_indices != 65535)
-    
     nb_range = tl.arange(0, BLOCK_SIZE_NB)
     # ------------------------------------------------------------------
     # Pipelined loop over NB dimension with vectorized access pattern
     # ------------------------------------------------------------------
     for nb_start in tl.range(0, num_blocks, BLOCK_SIZE_NB, num_stages=NUM_STAGES_LOOP):
-        nb_offsets = tl.minimum(nb_start + nb_range, num_blocks)
+        nb_offsets = nb_start + nb_range
         nb_mask = nb_offsets < num_blocks
-        
+        block_offsets = tl.load(block_offsets_ptr + nb_offsets, mask = nb_mask, other=0)
+        local_indices = tl.load(bs_nb_to_local_idx_ptr + bs_idx * stride_mapping_bs + nb_offsets * stride_mapping_nb, mask= nb_mask, other= 65535)
+        is_active = (local_indices != 65535)
+
         # Reconstruct act_idx using preloaded values
-        act_idx = block_offsets[nb_offsets] + local_indices[nb_offsets]
+        act_idx = block_offsets + local_indices.to(tl.int64)
         
         # Load intermediate values using active mask instead of if statement
-        inter_ptrs = intermediate_ptr + act_idx * stride_inter_actidx + offs_h * stride_inter_h
-        inter_vals = tl.load(inter_ptrs, mask=mask_h & is_active[nb_offsets] & nb_mask, other=0.0)
+        inter_ptrs = intermediate_ptr + act_idx[:, None] * stride_inter_actidx + offs_h[None, :] * stride_inter_h
+        inter_vals = tl.load(inter_ptrs, mask=mask_h[None, :] & is_active[:, None], other=0.0)
         
         # Accumulate contributions (zeros will be added for inactive blocks)
         acc += tl.sum(inter_vals, axis=0)
