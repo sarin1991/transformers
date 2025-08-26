@@ -31,12 +31,14 @@ def verify_mappings(gate: torch.Tensor, mappings: dict):
     active_positions = torch.nonzero(mask, as_tuple=False)  # (num_active, 2)
     
     errors = 0
+    # Convert to int32 for indexing
+    bs_nb_to_local_idx_int32 = bs_nb_to_local_idx.to(torch.int32)
     for i, (bs, nb) in enumerate(active_positions):
         bs_item, nb_item = bs.item(), nb.item()
         
         # Check bs_nb_to_local_idx mapping and reconstruct act_idx
-        local_idx = bs_nb_to_local_idx[bs_item, nb_item].item()
-        if local_idx < 0:
+        local_idx = bs_nb_to_local_idx_int32[bs_item, nb_item].item()
+        if local_idx == 65535:
             print(f"ERROR: Invalid local_idx {local_idx} for active position ({bs_item}, {nb_item})")
             errors += 1
         else:
@@ -76,7 +78,7 @@ def verify_mappings(gate: torch.Tensor, mappings: dict):
                     continue
                 
                 # Check consistency with bs_nb_to_local_idx + block_offsets  
-                expected_local_idx = bs_nb_to_local_idx[bs_mapped, nb].item()
+                expected_local_idx = bs_nb_to_local_idx_int32[bs_mapped, nb].item()
                 expected_act_idx = block_offsets[nb].item() + expected_local_idx
                 if act_idx_mapped != expected_act_idx:
                     print(f"ERROR: Inconsistent act_idx mapping at ({nb}, {local_row}): "
