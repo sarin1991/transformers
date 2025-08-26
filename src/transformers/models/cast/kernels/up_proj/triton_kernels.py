@@ -378,7 +378,8 @@ def stream_compact_to_dense_blocks(stream_compact_output, mappings, batch_seq_si
     Returns:
         dense_blocks: (BS, NB, LS) tensor with zeros for inactive blocks
     """
-    bs_nb_to_actidx = mappings['bs_nb_to_actidx']  # (BS, NB)
+    bs_nb_to_local_idx = mappings['bs_nb_to_local_idx']  # (BS, NB) → local row index
+    block_offsets = mappings['block_offsets']             # (NB,) → block start offsets
     
     # Create output tensor (zeros for inactive blocks)
     dense_blocks = torch.zeros((batch_seq_size, num_blocks, line_size), 
@@ -386,11 +387,13 @@ def stream_compact_to_dense_blocks(stream_compact_output, mappings, batch_seq_si
                               dtype=stream_compact_output.dtype)
     
     # Vectorized approach using advanced indexing
-    active_mask = bs_nb_to_actidx >= 0  # (BS, NB)
+    active_mask = bs_nb_to_local_idx >= 0  # (BS, NB)
     
     # Get active positions and their corresponding act_idx values
     bs_indices, nb_indices = torch.nonzero(active_mask, as_tuple=True)
-    act_indices = bs_nb_to_actidx[active_mask]  # Only active act_idx values
+    # Reconstruct act_indices from local indices + block offsets
+    local_indices = bs_nb_to_local_idx[active_mask]  # Only active local indices
+    act_indices = block_offsets[nb_indices] + local_indices
     
     # Vectorized assignment
     dense_blocks[bs_indices, nb_indices, :] = stream_compact_output[act_indices, :]
