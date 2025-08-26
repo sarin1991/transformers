@@ -211,10 +211,12 @@ def fused_down_proj_stream_compact_kernel(
 def get_summation_autotune_config():
     """Autotune configurations for 1D summation kernel with loop pipelining"""
     return [
-        triton.Config({'BLOCK_SIZE_H': 2048}),
-        triton.Config({'BLOCK_SIZE_H': 1024}),
-        triton.Config({'BLOCK_SIZE_H': 512}),
-        triton.Config({'BLOCK_SIZE_H': 256}),
+        triton.Config({'BLOCK_SIZE_H': 1024, 'NUM_STAGES_LOOP': 4, 'BLOCK_SIZE_NB': 32}),
+        triton.Config({'BLOCK_SIZE_H': 1024, 'NUM_STAGES_LOOP': 6, 'BLOCK_SIZE_NB': 16}),
+        triton.Config({'BLOCK_SIZE_H': 2048, 'NUM_STAGES_LOOP': 4, 'BLOCK_SIZE_NB': 4}),
+        triton.Config({'BLOCK_SIZE_H': 512, 'NUM_STAGES_LOOP': 6, 'BLOCK_SIZE_NB': 64}),
+        triton.Config({'BLOCK_SIZE_H': 1024, 'NUM_STAGES_LOOP': 3, 'BLOCK_SIZE_NB': 16}),
+        triton.Config({'BLOCK_SIZE_H': 2048, 'NUM_STAGES_LOOP': 3, 'BLOCK_SIZE_NB': 8}),
     ]
 
 
@@ -249,6 +251,7 @@ def stream_compact_summation_kernel(
     
     # Block sizes from autotune
     BLOCK_SIZE_H: tl.constexpr,
+    NUM_STAGES_LOOP: tl.constexpr,
 ):
     """Sum intermediate (act_idx, H) results to final (BS, H) output.
     
@@ -299,19 +302,23 @@ def stream_compact_summation_kernel(
     # Compute active flags for all blocks at once  
     is_active = (gate_vals > 0) & (local_indices != 65535)
     
+    nb_range = tl.arange(0, 32)
     # ------------------------------------------------------------------
     # Pipelined loop over NB dimension with vectorized access pattern
     # ------------------------------------------------------------------
-    for nb in tl.static_range(num_blocks):
+    for nb_start in tl.range(0, num_blocks, 32, num_stages=NUM_STAGES_LOOP):
+        nb_offsets = tl.minimum(nb_start + nb_range, num_blocks)
+        nb_mask = nb_offsets < num_blocks
+        
         # Reconstruct act_idx using preloaded values
-        act_idx = block_offsets[nb] + local_indices[nb]
+        act_idx = block_offsets[nb_offsets] + local_indices[nb_offsets]
         
         # Load intermediate values using active mask instead of if statement
         inter_ptrs = intermediate_ptr + act_idx * stride_inter_actidx + offs_h * stride_inter_h
-        inter_vals = tl.load(inter_ptrs, mask=mask_h & is_active[nb], other=0.0)
+        inter_vals = tl.load(inter_ptrs, mask=mask_h & is_active[nb_offsets] & nb_mask, other=0.0)
         
         # Accumulate contributions (zeros will be added for inactive blocks)
-        acc += inter_vals
+        acc += tl.sum(inter_vals, axis=0)
     
     # ------------------------------------------------------------------
     # Store final results for this BS row
