@@ -8,6 +8,19 @@ from .triton_cast_kernel_weight_grad_stream_compact import fused_weight_grad_spa
 from kernels.stream_compact_index import create_stream_compact_index
 
 
+def _make_sparse_gate(batch_seq_size: int, num_blocks: int, sparsity: float = 0.9):
+    """Build a gate tensor with given sparsity on CUDA.
+    
+    sparsity denotes the fraction of zeros (e.g. 0.9 → 10 % non-zero).
+    Returns a torch.float32 tensor on the current CUDA device.
+    """
+    gate = torch.rand(batch_seq_size, num_blocks, device="cuda", dtype=torch.float32)
+    if sparsity > 0.0:
+        mask = torch.rand_like(gate) < sparsity  # True for zeros
+        gate[mask] = 0.0
+    return gate
+
+
 def convert_dense_to_stream_compact(intermediate_dense, mappings, num_blocks, line_size):
     """Convert (BS, I) dense → (act_idx, LS) sparse format using stream compact mappings"""
     BS, I = intermediate_dense.shape
@@ -42,7 +55,7 @@ def convert_dense_to_stream_compact(intermediate_dense, mappings, num_blocks, li
     return intermediate_sparse
 
 
-def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
+def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False, sparsity: str = "dynamic"):
     """Time PyTorch reference vs Triton fused weight-grad kernel on several shapes.
 
     The signature mirrors *down_proj/benchmark_triton.py* for consistency.
@@ -56,29 +69,38 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
 
     # (batch, seq_len, hidden_size, num_blocks, line_size)
     configs = [
-        (4, 8, 128, 4, 32),
-        (8, 16, 256, 8, 32),
-        (128, 32, 512, 8, 64),
-        (128, 256, 4096, 64, 64),
-        (128, 256, 4096, 256, 128),
-        (128, 256, 4096, 128, 256),
-        (128, 256, 4096, 64, 512),
-        (128, 256, 4096, 32, 1024),
-        (128, 256, 4096, 8, 4096),
+        (128, 256, 4096, 256, 64),
+        (128, 256, 4096, 128, 128),
+        (128, 256, 4096, 64, 256),
+        (128, 256, 4096, 32, 512),
+        (128, 256, 4096, 16, 1024),
+        (128, 256, 4096, 4, 4096),
     ]
 
     for batch_size, seq_len, hidden_size, num_blocks, line_size in configs:
         intermediate_size = num_blocks * line_size
-        cfg = f"{batch_size}x{seq_len} | H={hidden_size} NB={num_blocks} LS={line_size}"
+        
+        # Calculate sparsity
+        if sparsity == "dynamic":
+            zeros_frac = 1.0 - (1.0 / num_blocks)
+        else:
+            try:
+                zeros_frac = float(sparsity)
+            except (ValueError, TypeError) as e:
+                raise ValueError(
+                    f"Invalid --sparsity value '{sparsity}'. Use 'dynamic' or a float between 0 and 1."
+                ) from e
+            zeros_frac = max(0.0, min(1.0, zeros_frac))
+        
+        cfg = f"{batch_size}x{seq_len} | H={hidden_size} NB={num_blocks} LS={line_size} | Sparsity={zeros_frac:.3f}"
         print(f"\nConfig: {cfg}  |  Iters: {num_iters}")
 
         # Random tensors
         intermediate_fp16 = torch.randn(batch_size * seq_len, intermediate_size, device="cuda", dtype=torch.float16)
         other_fp16 = torch.randn(batch_size * seq_len, hidden_size, device="cuda", dtype=torch.float16)
-        gate_fp32 = torch.rand(batch_size * seq_len, num_blocks, device="cuda", dtype=torch.float32)
-        # Introduce sparsity (90 % zeros) to emulate typical gating pattern
-        mask_sparse = torch.rand_like(gate_fp32) < 0.9
-        gate_fp32[mask_sparse] = 0.0
+        
+        # Create sparse gate with calculated sparsity
+        gate_fp32 = _make_sparse_gate(batch_size * seq_len, num_blocks, sparsity=zeros_frac)
 
         # Apply sparsity to intermediate tensor
         gate_expanded = gate_fp32.unsqueeze(-1).expand(-1, -1, line_size).reshape(batch_size * seq_len, intermediate_size)
@@ -238,6 +260,11 @@ def benchmark_fused_vs_pytorch(num_iters: int = 100, run_all: bool = False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark Cast weight-grad kernel")
     parser.add_argument("--iters", type=int, default=100, help="Iterations per config")
+    parser.add_argument(
+        "--sparsity",
+        default="dynamic",
+        help="Fraction of zeros in gate (e.g., 0.9) or 'dynamic' to use 1 - 1/num_blocks per config",
+    )
     args = parser.parse_args()
 
     try:
@@ -247,4 +274,4 @@ if __name__ == "__main__":
         print("❌ Triton is not available. Please install it.")
         exit(1)
 
-    benchmark_fused_vs_pytorch(num_iters=args.iters, run_all=True)
+    benchmark_fused_vs_pytorch(num_iters=args.iters, run_all=True, sparsity=args.sparsity)
