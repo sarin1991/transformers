@@ -67,7 +67,8 @@ def fused_down_proj_stream_compact_kernel(
     
     # Index mappings from stream compact preprocessing  
     nb_maxrows_to_bs_ptr,           # (NB, max_rows) -> BS index
-    nb_maxrows_to_actidx_ptr,       # (NB, max_rows) -> act_idx
+    nb_maxrows_to_local_idx_ptr,    # (NB, max_rows) -> local row index
+    block_offsets_ptr,              # (NB,) -> block start offsets
     nb_maxrows_gate_vals_ptr,       # (NB, max_rows) -> gate values
     max_rows_per_block_ptr,         # (NB,) number of active rows per block
     
@@ -133,9 +134,13 @@ def fused_down_proj_stream_compact_kernel(
 
     base_ptr = block_idx * max_rows
     
-    # Load indices and gate values from stream compact mappings
-    act_indices = tl.load(nb_maxrows_to_actidx_ptr + base_ptr + rows_in_block,
-                         mask=mask_bs, other=-1)
+    # Load block offset once (constant for this block)
+    block_offset = tl.load(block_offsets_ptr + block_idx)
+    
+    # Load local indices and reconstruct act_indices from stream compact mappings
+    local_indices = tl.load(nb_maxrows_to_local_idx_ptr + base_ptr + rows_in_block,
+                           mask=mask_bs, other=0)
+    act_indices = block_offset + local_indices.to(tl.int64)
     bs_indices = tl.load(nb_maxrows_to_bs_ptr + base_ptr + rows_in_block,
                         mask=mask_bs, other=0)
     gate_vals = tl.load(nb_maxrows_gate_vals_ptr + base_ptr + rows_in_block,
@@ -204,14 +209,14 @@ def fused_down_proj_stream_compact_kernel(
 # =============================================================================
 
 def get_summation_autotune_config():
-    """Autotune configurations for summation kernel - simpler than main kernel"""
+    """Autotune configurations for 1D summation kernel with loop pipelining"""
     return [
-        triton.Config({'BLOCK_SIZE_BS': 64, 'BLOCK_SIZE_H': 64}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_H': 64}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_SIZE_BS': 64, 'BLOCK_SIZE_H': 128}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_H': 128}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_SIZE_BS': 32, 'BLOCK_SIZE_H': 128}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_SIZE_BS': 128, 'BLOCK_SIZE_H': 32}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE_H': 1024, 'NUM_STAGES_LOOP': 4}),
+        triton.Config({'BLOCK_SIZE_H': 1024, 'NUM_STAGES_LOOP': 6}),
+        triton.Config({'BLOCK_SIZE_H': 2048, 'NUM_STAGES_LOOP': 4}),
+        triton.Config({'BLOCK_SIZE_H': 512, 'NUM_STAGES_LOOP': 6}),
+        triton.Config({'BLOCK_SIZE_H': 1024, 'NUM_STAGES_LOOP': 3}),
+        triton.Config({'BLOCK_SIZE_H': 2048, 'NUM_STAGES_LOOP': 3}),
     ]
 
 
@@ -223,7 +228,8 @@ def get_summation_autotune_config():
 def stream_compact_summation_kernel(
     # Input tensors
     intermediate_ptr,        # (act_idx, H) intermediate results
-    bs_nb_to_actidx_ptr,     # (BS, NB) -> act_idx mapping (-1 for inactive)
+    bs_nb_to_local_idx_ptr,  # (BS, NB) -> local row index (-1 for inactive)
+    block_offsets_ptr,       # (NB,) -> block start offsets
     bs_nb_to_gate_vals_ptr,  # (BS, NB) -> gate values
     
     # Output tensor
@@ -244,89 +250,78 @@ def stream_compact_summation_kernel(
     out_dtype: tl.constexpr,
     
     # Block sizes from autotune
-    BLOCK_SIZE_BS: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
+    NUM_STAGES_LOOP: tl.constexpr,
 ):
     """Sum intermediate (act_idx, H) results to final (BS, H) output.
     
-    Each CTA processes a tile of (BLOCK_SIZE_BS, BLOCK_SIZE_H) in the final output
+    1D tiling: Each CTA processes one BS row and a chunk of H dimension.
     by iterating through all NB blocks and accumulating contributions.
     """
     
     pid = tl.program_id(0)
     
-    # ------------------------------------------------------------------
-    # Decompose program ID into (bs_chunk, h_chunk)
+    # ------------------------------------------------------------------  
+    # 1D grid indexing: map PID to (BS, H_chunk)
     # ------------------------------------------------------------------
     num_h_chunks = tl.cdiv(hidden_size, BLOCK_SIZE_H)
     
-    bs_chunk = pid // num_h_chunks
+    bs_idx = pid // num_h_chunks
     h_chunk = pid % num_h_chunks
     
+    # Guard against out-of-bounds grid launches
+    if bs_idx >= batch_seq_size or h_chunk >= num_h_chunks:
+        return
+    
     # ------------------------------------------------------------------
-    # Calculate this CTA's responsibility ranges
+    # Calculate this CTA's H range
     # ------------------------------------------------------------------
-    bs_start = bs_chunk * BLOCK_SIZE_BS
     h_start = h_chunk * BLOCK_SIZE_H
-    
-    offs_bs = bs_start + tl.arange(0, BLOCK_SIZE_BS)  # Local BS indices
-    offs_h = h_start + tl.arange(0, BLOCK_SIZE_H)     # Local H indices
-    
-    mask_bs = offs_bs < batch_seq_size
+    offs_h = h_start + tl.arange(0, BLOCK_SIZE_H)
     mask_h = offs_h < hidden_size
     
     # ------------------------------------------------------------------
-    # Initialize accumulator
+    # Initialize 1D accumulator for this H chunk
     # ------------------------------------------------------------------
-    acc = tl.zeros((BLOCK_SIZE_BS, BLOCK_SIZE_H), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_SIZE_H,), dtype=tl.float32)
     
     # ------------------------------------------------------------------
-    # Iterate through NB dimension and accumulate contributions
+    # Vectorized metadata loading outside the loop
     # ------------------------------------------------------------------
-    for nb in range(num_blocks):
-        # Load gate values for current (BS, NB) pairs
-        gate_ptrs = (bs_nb_to_gate_vals_ptr 
-                    + offs_bs * stride_gate_bs 
-                    + nb * stride_gate_nb)
-        
-        gate_vals = tl.load(gate_ptrs, mask=mask_bs, other=0.0)
-        gate_vals = tl.where(gate_vals > 0, gate_vals, 0.0)  # Set negative gate values to zero
-        
-        # Load act_idx mappings for current (BS, NB) pairs
-        mapping_ptrs = (bs_nb_to_actidx_ptr 
-                       + offs_bs * stride_mapping_bs 
-                       + nb * stride_mapping_nb)
-        
-        act_indices = tl.load(mapping_ptrs, mask=mask_bs, other=-1)
-        
-        # Mask for active elements (gate > 0 and act_idx >= 0)
-        active_mask = (gate_vals > 0.0) & (act_indices >= 0)
-        
-        # Only process if we have active elements in this NB slice
-        has_active = tl.sum(active_mask) > 0
-        
-        if has_active:
-            # Load corresponding intermediate values (act_idx, H)
-            inter_ptrs = (intermediate_ptr 
-                         + act_indices[:, None] * stride_inter_actidx 
-                         + offs_h[None, :] * stride_inter_h)
-            
-            inter_vals = tl.load(inter_ptrs, 
-                                mask=active_mask[:, None] & mask_h[None, :], 
-                                other=0.0)
-            
-            # Accumulate contributions
-            acc += inter_vals
+    offs_nb = tl.arange(0, num_blocks)
+    
+    # Load all gate values for this BS row
+    gate_vals = tl.load(bs_nb_to_gate_vals_ptr + bs_idx * stride_gate_bs + offs_nb * stride_gate_nb)
+    
+    # Load all local indices for this BS row
+    local_indices = tl.load(bs_nb_to_local_idx_ptr + bs_idx * stride_mapping_bs + offs_nb * stride_mapping_nb)
+    
+    # Load all block offsets
+    block_offsets = tl.load(block_offsets_ptr + offs_nb)
+    
+    # Compute active flags for all blocks at once
+    is_active = (gate_vals > 0) & (local_indices >= 0)
     
     # ------------------------------------------------------------------
-    # Store final results
+    # Pipelined loop over NB dimension with vectorized access pattern
     # ------------------------------------------------------------------
-    out_ptrs = (output_ptr 
-               + offs_bs[:, None] * stride_out_bs 
-               + offs_h[None, :] * stride_out_h)
+    for nb in tl.range(num_blocks, num_stages=NUM_STAGES_LOOP):
+        # Reconstruct act_idx using preloaded values
+        act_idx = block_offsets[nb] + local_indices[nb]
+        
+        # Load intermediate values using active mask instead of if statement
+        inter_ptrs = intermediate_ptr + act_idx * stride_inter_actidx + offs_h * stride_inter_h
+        inter_vals = tl.load(inter_ptrs, mask=mask_h & is_active[nb], other=0.0)
+        
+        # Accumulate contributions (zeros will be added for inactive blocks)
+        acc += inter_vals
     
-    tl.store(out_ptrs, acc.to(out_dtype), 
-             mask=mask_bs[:, None] & mask_h[None, :])
+    # ------------------------------------------------------------------
+    # Store final results for this BS row
+    # ------------------------------------------------------------------
+    out_ptrs = output_ptr + bs_idx * stride_out_bs + offs_h * stride_out_h
+    
+    tl.store(out_ptrs, acc.to(out_dtype), mask=mask_h)
 
 
 # =============================================================================
@@ -375,15 +370,16 @@ def fused_down_proj_sparse_triton_stream_compact(
 
     # Extract mappings
     nb_maxrows_to_bs = mappings['nb_maxrows_to_bs']           # (NB, max_rows)
-    nb_maxrows_to_actidx = mappings['nb_maxrows_to_actidx']   # (NB, max_rows)  
+    nb_maxrows_to_local_idx = mappings['nb_maxrows_to_local_idx'] # (NB, max_rows)  
+    block_offsets = mappings['block_offsets']                 # (NB,)
     nb_maxrows_gate_vals = mappings['nb_maxrows_gate_vals']   # (NB, max_rows)
     max_rows = mappings['max_rows']
     max_rows_per_block = mappings['max_rows_per_block']       # (NB,)
-    bs_nb_to_actidx = mappings['bs_nb_to_actidx']             # (BS, NB)
+    bs_nb_to_local_idx = mappings['bs_nb_to_local_idx']       # (BS, NB)
     bs_nb_to_gate_vals = mappings['bs_nb_to_gate_vals']       # (BS, NB)
     
-    # Get batch_seq_size from bs_nb_to_actidx shape
-    batch_seq_size = bs_nb_to_actidx.shape[0]
+    # Get batch_seq_size from bs_nb_to_local_idx shape
+    batch_seq_size = bs_nb_to_local_idx.shape[0]
     
     # Early exit if no active elements
     if max_rows == 0 or total_act_idx == 0:
@@ -431,7 +427,8 @@ def fused_down_proj_sparse_triton_stream_compact(
         
         # Index mappings
         nb_maxrows_to_bs,
-        nb_maxrows_to_actidx,
+        nb_maxrows_to_local_idx,
+        block_offsets,
         nb_maxrows_gate_vals,
         max_rows_per_block,
         
@@ -455,20 +452,18 @@ def fused_down_proj_sparse_triton_stream_compact(
         # Stage 2: Sum intermediate results to final (BS, H) output
         final_output = torch.empty((batch_seq_size, hidden_size), device=x.device, dtype=out_dtype)
         
-        # Grid for summation kernel
+        # Grid for 1D summation kernel
         def summation_grid(meta):
-            BLK_BS = meta["BLOCK_SIZE_BS"]
             BLK_H = meta["BLOCK_SIZE_H"]
-            
-            num_bs_chunks = triton.cdiv(batch_seq_size, BLK_BS)
             num_h_chunks = triton.cdiv(hidden_size, BLK_H)
-            return (num_bs_chunks * num_h_chunks,)
+            return (batch_seq_size * num_h_chunks,)
         
         # Launch summation kernel
         stream_compact_summation_kernel[summation_grid](
             # Input tensors
             output_tensor,       # (act_idx, H) intermediate results
-            bs_nb_to_actidx,     # (BS, NB) -> act_idx mapping
+            bs_nb_to_local_idx,  # (BS, NB) -> local row index mapping
+            block_offsets,       # (NB,) -> block start offsets
             bs_nb_to_gate_vals,  # (BS, NB) -> gate values
             
             # Output tensor
@@ -479,7 +474,7 @@ def fused_down_proj_sparse_triton_stream_compact(
             
             # Strides
             output_tensor.stride(0), output_tensor.stride(1),        # intermediate strides
-            bs_nb_to_actidx.stride(0), bs_nb_to_actidx.stride(1),   # mapping strides
+            bs_nb_to_local_idx.stride(0), bs_nb_to_local_idx.stride(1), # mapping strides
             bs_nb_to_gate_vals.stride(0), bs_nb_to_gate_vals.stride(1), # gate strides
             final_output.stride(0), final_output.stride(1),         # output strides
             

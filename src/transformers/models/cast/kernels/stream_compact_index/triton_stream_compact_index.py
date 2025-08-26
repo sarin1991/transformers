@@ -42,9 +42,9 @@ def stream_compact_index_kernel(
     
     # Outputs
     nb_maxrows_to_bs_ptr,    # (NB, max_rows) -> BS index
-    nb_maxrows_to_actidx_ptr,# (NB, max_rows) -> act_idx
+    nb_maxrows_to_local_idx_ptr,# (NB, max_rows) -> local row index
     nb_maxrows_gate_vals_ptr,# (NB, max_rows) -> gate values
-    bs_nb_to_actidx_ptr,     # (BS, NB) -> act_idx (-1 for inactive)
+    bs_nb_to_local_idx_ptr,  # (BS, NB) -> local row index (-1 for inactive)
     
     # Dimensions
     BS: tl.constexpr, 
@@ -103,15 +103,15 @@ def stream_compact_index_kernel(
     # Store (NB, max_rows) -> BS mapping
     tl.store(nb_maxrows_to_bs_ptr + nb_maxrows_offsets, bs_indices, mask=active_mask)
     
-    # Store (NB, max_rows) -> act_idx mapping  
-    tl.store(nb_maxrows_to_actidx_ptr + nb_maxrows_offsets, act_indices, mask=active_mask)
+    # Store (NB, max_rows) -> local row index mapping  
+    tl.store(nb_maxrows_to_local_idx_ptr + nb_maxrows_offsets, local_row_indices, mask=active_mask)
     
     # Store (NB, max_rows) -> gate values mapping
     tl.store(nb_maxrows_gate_vals_ptr + nb_maxrows_offsets, gate_vals, mask=active_mask)
     
-    # Store (BS, NB) -> act_idx mapping (with -1 for inactive)
-    result_act_indices = tl.where(is_active, act_indices, -1)
-    tl.store(bs_nb_to_actidx_ptr + offsets, result_act_indices, mask=mask)
+    # Store (BS, NB) -> local row index mapping (with -1 for inactive)
+    result_local_indices = tl.where(is_active, local_row_indices, -1)
+    tl.store(bs_nb_to_local_idx_ptr + offsets, result_local_indices, mask=mask)
 
 
 def create_stream_compact_index(gate: torch.Tensor):
@@ -169,10 +169,10 @@ def create_stream_compact_index(gate: torch.Tensor):
     # ===== Allocate Output Tensors =====
     # Use empty for speed, will be filled by kernel
     nb_maxrows_to_bs = torch.empty((NB, max_rows), dtype=torch.int32, device=gate.device)
-    nb_maxrows_to_actidx = torch.empty((NB, max_rows), dtype=torch.int32, device=gate.device)
+    nb_maxrows_to_local_idx = torch.empty((NB, max_rows), dtype=torch.uint16, device=gate.device)
     # Gate values need zeros initialization since kernel doesn't write to all positions
     nb_maxrows_gate_vals = torch.zeros((NB, max_rows), dtype=torch.float32, device=gate.device)
-    bs_nb_to_actidx = torch.empty((BS, NB), dtype=torch.int32, device=gate.device)
+    bs_nb_to_local_idx = torch.empty((BS, NB), dtype=torch.uint16, device=gate.device)
     
     # ===== Launch Autotune Kernel =====
     total_elements = BS * NB
@@ -184,9 +184,9 @@ def create_stream_compact_index(gate: torch.Tensor):
         cumsum,                  # cumsum_ptr  
         block_offsets,           # block_offsets_ptr
         nb_maxrows_to_bs,        # nb_maxrows_to_bs_ptr
-        nb_maxrows_to_actidx,    # nb_maxrows_to_actidx_ptr
+        nb_maxrows_to_local_idx, # nb_maxrows_to_local_idx_ptr
         nb_maxrows_gate_vals,    # nb_maxrows_gate_vals_ptr
-        bs_nb_to_actidx,         # bs_nb_to_actidx_ptr
+        bs_nb_to_local_idx,      # bs_nb_to_local_idx_ptr
         BS=BS,
         NB=NB, 
         max_rows=max_rows,
@@ -194,9 +194,9 @@ def create_stream_compact_index(gate: torch.Tensor):
     
     return {
         'nb_maxrows_to_bs': nb_maxrows_to_bs,
-        'nb_maxrows_to_actidx': nb_maxrows_to_actidx,
+        'nb_maxrows_to_local_idx': nb_maxrows_to_local_idx,
         'nb_maxrows_gate_vals': nb_maxrows_gate_vals,
-        'bs_nb_to_actidx': bs_nb_to_actidx,
+        'bs_nb_to_local_idx': bs_nb_to_local_idx,
         'bs_nb_to_gate_vals': gate,  # Original (BS, NB) gate tensor
         'max_rows': max_rows,
         'total_act_idx': total_act_idx,
