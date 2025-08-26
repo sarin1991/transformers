@@ -299,8 +299,8 @@ def stream_compact_summation_kernel(
     # Load all block offsets
     block_offsets = tl.load(block_offsets_ptr + offs_nb)
     
-    # Compute active flags for all blocks at once
-    is_active = (gate_vals > 0) & (local_indices >= 0)
+    # Compute active flags for all blocks at once  
+    is_active = (gate_vals > 0) & (local_indices != 65535)
     
     # ------------------------------------------------------------------
     # Pipelined loop over NB dimension with vectorized access pattern
