@@ -222,7 +222,7 @@ def convert_dense_to_stream_compact(intermediate_dense, mappings, num_blocks, li
                                     dtype=intermediate_dense.dtype)
     
     # Fill sparse tensor using mappings
-    active_mask = bs_nb_to_local_idx >= 0
+    active_mask = bs_nb_to_local_idx != 65535
     if active_mask.sum() > 0:
         active_bs, active_nb = torch.where(active_mask)
         # Reconstruct act_indices from local indices + block offsets

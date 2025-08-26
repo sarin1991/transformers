@@ -387,7 +387,7 @@ def stream_compact_to_dense_blocks(stream_compact_output, mappings, batch_seq_si
                               dtype=stream_compact_output.dtype)
     
     # Vectorized approach using advanced indexing
-    active_mask = bs_nb_to_local_idx >= 0  # (BS, NB)
+    active_mask = bs_nb_to_local_idx != 65535  # (BS, NB)
     
     # Get active positions and their corresponding act_idx values
     bs_indices, nb_indices = torch.nonzero(active_mask, as_tuple=True)

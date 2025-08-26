@@ -45,11 +45,14 @@ def verify_mappings(gate: torch.Tensor, mappings: dict):
                 print(f"ERROR: Invalid reconstructed act_idx {act_idx} for active position ({bs_item}, {nb_item})")
                 errors += 1
     
-    # Verify that all inactive (bs, nb) pairs have local_idx = -1
+    # Verify that all inactive (bs, nb) pairs have local_idx = 65535 
     inactive_mask = ~mask
-    inactive_local_indices = bs_nb_to_local_idx[inactive_mask]
-    if (inactive_local_indices != -1).any():
-        print(f"ERROR: Found non-(-1) local_idx for inactive positions")
+    # Convert to int32 for indexing, then back for comparison
+    bs_nb_to_local_idx_int32 = bs_nb_to_local_idx.to(torch.int32)
+    inactive_local_indices = bs_nb_to_local_idx_int32[inactive_mask]
+    # Check for uint16 max value (65535) which represents invalid
+    if (inactive_local_indices != 65535).any():
+        print(f"ERROR: Found non-65535 local_idx for inactive positions")
         errors += 1
     
     # Verify nb_maxrows mappings consistency
