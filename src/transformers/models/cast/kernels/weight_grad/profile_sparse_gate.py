@@ -62,8 +62,9 @@ def convert_dense_to_stream_compact(intermediate_dense, mappings, num_blocks, li
     # Reshape to block format: (BS, I) → (BS, NB, LS)
     intermediate_reshaped = intermediate_dense.view(BS, num_blocks, line_size)
     
-    # Extract stream compact mappings
-    bs_nb_to_actidx = mappings['bs_nb_to_actidx']  # (BS, NB) → act_idx
+    # Extract stream compact mappings (new format with local indices + block offsets)
+    bs_nb_to_local_idx = mappings['bs_nb_to_local_idx']  # (BS, NB) → local row index
+    block_offsets = mappings['block_offsets']             # (NB,) → block start offsets
     total_act_idx = mappings['total_act_idx']
     
     # Build sparse tensor: (act_idx, LS)
@@ -72,10 +73,12 @@ def convert_dense_to_stream_compact(intermediate_dense, mappings, num_blocks, li
                                     dtype=intermediate_dense.dtype)
     
     # Fill sparse tensor using mappings
-    active_mask = bs_nb_to_actidx >= 0
+    active_mask = bs_nb_to_local_idx >= 0
     if active_mask.sum() > 0:
         active_bs, active_nb = torch.where(active_mask)
-        act_indices = bs_nb_to_actidx[active_bs, active_nb]
+        # Reconstruct act_indices from local indices + block offsets
+        local_indices = bs_nb_to_local_idx[active_bs, active_nb]
+        act_indices = block_offsets[active_nb] + local_indices
         intermediate_sparse[act_indices] = intermediate_reshaped[active_bs, active_nb]
     
     return intermediate_sparse

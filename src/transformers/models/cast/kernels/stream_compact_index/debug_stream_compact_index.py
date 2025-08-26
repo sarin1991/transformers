@@ -14,9 +14,10 @@ def verify_mappings(gate: torch.Tensor, mappings: dict):
     mask = gate > 0
     
     nb_maxrows_to_bs = mappings['nb_maxrows_to_bs']
-    nb_maxrows_to_actidx = mappings['nb_maxrows_to_actidx']
+    nb_maxrows_to_local_idx = mappings['nb_maxrows_to_local_idx'] 
     nb_maxrows_gate_vals = mappings['nb_maxrows_gate_vals']
-    bs_nb_to_actidx = mappings['bs_nb_to_actidx']
+    bs_nb_to_local_idx = mappings['bs_nb_to_local_idx']
+    block_offsets = mappings['block_offsets']
     max_rows = mappings['max_rows']
     total_act_idx = mappings['total_act_idx']
     
@@ -33,17 +34,22 @@ def verify_mappings(gate: torch.Tensor, mappings: dict):
     for i, (bs, nb) in enumerate(active_positions):
         bs_item, nb_item = bs.item(), nb.item()
         
-        # Check bs_nb_to_actidx mapping
-        act_idx = bs_nb_to_actidx[bs_item, nb_item].item()
-        if act_idx < 0 or act_idx >= total_act_idx:
-            print(f"ERROR: Invalid act_idx {act_idx} for active position ({bs_item}, {nb_item})")
+        # Check bs_nb_to_local_idx mapping and reconstruct act_idx
+        local_idx = bs_nb_to_local_idx[bs_item, nb_item].item()
+        if local_idx < 0:
+            print(f"ERROR: Invalid local_idx {local_idx} for active position ({bs_item}, {nb_item})")
             errors += 1
+        else:
+            act_idx = block_offsets[nb_item].item() + local_idx
+            if act_idx < 0 or act_idx >= total_act_idx:
+                print(f"ERROR: Invalid reconstructed act_idx {act_idx} for active position ({bs_item}, {nb_item})")
+                errors += 1
     
-    # Verify that all inactive (bs, nb) pairs have act_idx = -1
+    # Verify that all inactive (bs, nb) pairs have local_idx = -1
     inactive_mask = ~mask
-    inactive_act_indices = bs_nb_to_actidx[inactive_mask]
-    if (inactive_act_indices != -1).any():
-        print(f"ERROR: Found non-(-1) act_idx for inactive positions")
+    inactive_local_indices = bs_nb_to_local_idx[inactive_mask]
+    if (inactive_local_indices != -1).any():
+        print(f"ERROR: Found non-(-1) local_idx for inactive positions")
         errors += 1
     
     # Verify nb_maxrows mappings consistency
@@ -51,7 +57,8 @@ def verify_mappings(gate: torch.Tensor, mappings: dict):
         for local_row in range(max_rows):
             gate_val = nb_maxrows_gate_vals[nb, local_row].item()
             bs_mapped = nb_maxrows_to_bs[nb, local_row].item()
-            act_idx_mapped = nb_maxrows_to_actidx[nb, local_row].item()
+            local_idx_mapped = nb_maxrows_to_local_idx[nb, local_row].item()
+            act_idx_mapped = block_offsets[nb].item() + local_idx_mapped
             
             # Only validate positions with positive gate values (active entries)
             if gate_val > 0:  # Valid/active entry
@@ -65,8 +72,9 @@ def verify_mappings(gate: torch.Tensor, mappings: dict):
                     errors += 1
                     continue
                 
-                # Check consistency with bs_nb_to_actidx
-                expected_act_idx = bs_nb_to_actidx[bs_mapped, nb].item()
+                # Check consistency with bs_nb_to_local_idx + block_offsets  
+                expected_local_idx = bs_nb_to_local_idx[bs_mapped, nb].item()
+                expected_act_idx = block_offsets[nb].item() + expected_local_idx
                 if act_idx_mapped != expected_act_idx:
                     print(f"ERROR: Inconsistent act_idx mapping at ({nb}, {local_row}): "
                           f"nb_maxrows says {act_idx_mapped}, bs_nb says {expected_act_idx}")
@@ -100,8 +108,9 @@ def test_simple_case():
     
     print(f"\nGenerated mappings:")
     print(f"nb_maxrows_to_bs:\n{mappings['nb_maxrows_to_bs']}")
-    print(f"nb_maxrows_to_actidx:\n{mappings['nb_maxrows_to_actidx']}")
-    print(f"bs_nb_to_actidx:\n{mappings['bs_nb_to_actidx']}")
+    print(f"nb_maxrows_to_local_idx:\n{mappings['nb_maxrows_to_local_idx']}")
+    print(f"bs_nb_to_local_idx:\n{mappings['bs_nb_to_local_idx']}")
+    print(f"block_offsets:\n{mappings['block_offsets']}")
     
     # Verify correctness
     verify_mappings(gate, mappings)
