@@ -111,8 +111,7 @@ def fused_up_proj_stream_compact_kernel(
     
     # Index mappings from stream compact preprocessing
     nb_maxrows_to_bs_ptr,           # (NB, max_rows) -> BS index
-    nb_maxrows_to_local_idx_ptr,    # (NB, max_rows) -> local row index
-    block_offsets_ptr,              # (NB,) -> block start offsets
+    nb_maxrows_to_actidx_ptr,       # (NB, max_rows) -> sequential act_idx
     nb_maxrows_gate_vals_ptr,       # (NB, max_rows) -> gate values
     
     # Output tensor
@@ -208,10 +207,8 @@ def fused_up_proj_stream_compact_kernel(
     # Load global row indices (BS dimension)
     global_rows = tl.load(nb_maxrows_to_bs_ptr + base_ptr + rows_in_block, mask=mask_bs, other=0)
     
-    # Load local row indices and reconstruct act_idx values (output storage indices)
-    local_indices = tl.load(nb_maxrows_to_local_idx_ptr + base_ptr + rows_in_block, mask=mask_bs, other=0)
-    block_offset = tl.load(block_offsets_ptr + block_idx)
-    act_indices = block_offset + local_indices.to(tl.int64)
+    # Load sequential act_idx values directly (no reconstruction needed)
+    act_indices = tl.load(nb_maxrows_to_actidx_ptr + base_ptr + rows_in_block, mask=mask_bs, other=0)
     
     # Load gate values and ensure they are non-negative (safety check)
     gate_vals_raw = tl.load(nb_maxrows_gate_vals_ptr + base_ptr + rows_in_block, mask=mask_bs, other=0.0)
@@ -314,7 +311,7 @@ def fused_up_proj_gate_activation_sparse_triton_stream_compact(
         line_size: size per block
         mappings: dict from create_stream_compact_index() containing:
             - nb_maxrows_to_bs: (NB, max_rows) -> BS mapping
-            - nb_maxrows_to_actidx: (NB, max_rows) -> act_idx mapping
+            - nb_maxrows_to_actidx: (NB, max_rows) -> sequential act_idx mapping
             - nb_maxrows_gate_vals: (NB, max_rows) -> gate values
             - max_rows: maximum active rows per block
             - total_act_idx: total number of active elements
@@ -343,9 +340,8 @@ def fused_up_proj_gate_activation_sparse_triton_stream_compact(
     
     # Extract mappings
     nb_maxrows_to_bs = mappings['nb_maxrows_to_bs']           # (NB, max_rows)
-    nb_maxrows_to_local_idx = mappings['nb_maxrows_to_local_idx'] # (NB, max_rows)  
+    nb_maxrows_to_actidx = mappings['nb_maxrows_to_actidx']   # (NB, max_rows) -> sequential act_idx
     nb_maxrows_gate_vals = mappings['nb_maxrows_gate_vals']   # (NB, max_rows)
-    block_offsets = mappings['block_offsets']                 # (NB,)
     max_rows = mappings['max_rows']
     total_act_idx = mappings['total_act_idx']
     
@@ -423,8 +419,7 @@ def fused_up_proj_gate_activation_sparse_triton_stream_compact(
         
         # Index mappings
         nb_maxrows_to_bs,
-        nb_maxrows_to_local_idx,
-        block_offsets,
+        nb_maxrows_to_actidx,
         nb_maxrows_gate_vals,
         
         # Output
