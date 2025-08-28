@@ -378,26 +378,24 @@ def stream_compact_to_dense_blocks(stream_compact_output, mappings, batch_seq_si
     Returns:
         dense_blocks: (BS, NB, LS) tensor with zeros for inactive blocks
     """
-    bs_nb_to_local_idx = mappings['bs_nb_to_local_idx']  # (BS, NB) → local row index
-    block_offsets = mappings['block_offsets']             # (NB,) → block start offsets
+    nb_maxrows_to_bs = mappings['nb_maxrows_to_bs']       # (NB, max_rows) → BS mapping
+    nb_maxrows_to_actidx = mappings['nb_maxrows_to_actidx'] # (NB, max_rows) → sequential act_idx
+    max_rows = mappings['max_rows']
     
     # Create output tensor (zeros for inactive blocks)
     dense_blocks = torch.zeros((batch_seq_size, num_blocks, line_size), 
                               device=stream_compact_output.device, 
                               dtype=stream_compact_output.dtype)
     
-    # Vectorized approach using advanced indexing
-    active_mask = bs_nb_to_local_idx != 65535  # (BS, NB)
-    
-    # Get active positions and their corresponding act_idx values
-    bs_indices, nb_indices = torch.nonzero(active_mask, as_tuple=True)
-    # Reconstruct act_indices from local indices + block offsets
-    bs_nb_to_local_idx_int32 = bs_nb_to_local_idx.to(torch.int32)
-    local_indices = bs_nb_to_local_idx_int32[active_mask]  # Only active local indices
-    act_indices = block_offsets[nb_indices] + local_indices
-    
-    # Vectorized assignment
-    dense_blocks[bs_indices, nb_indices, :] = stream_compact_output[act_indices, :]
+    # Use sequential mappings to fill dense tensor
+    for nb in range(num_blocks):
+        for local_row in range(max_rows):
+            bs_idx = nb_maxrows_to_bs[nb, local_row].item()
+            act_idx = nb_maxrows_to_actidx[nb, local_row].item()
+            
+            # Check if this is a valid entry
+            if act_idx >= 0 and act_idx < stream_compact_output.shape[0] and bs_idx >= 0 and bs_idx < batch_seq_size:
+                dense_blocks[bs_idx, nb, :] = stream_compact_output[act_idx, :]
     
     return dense_blocks
 

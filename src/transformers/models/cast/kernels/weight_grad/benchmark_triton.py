@@ -32,9 +32,10 @@ def convert_dense_to_stream_compact(intermediate_dense, mappings, num_blocks, li
     # Reshape to block format: (BS, I) → (BS, NB, LS)
     intermediate_reshaped = intermediate_dense.view(BS, num_blocks, line_size)
     
-    # Extract stream compact mappings (new format with local indices + block offsets)
-    bs_nb_to_local_idx = mappings['bs_nb_to_local_idx']  # (BS, NB) → local row index
-    block_offsets = mappings['block_offsets']             # (NB,) → block start offsets
+    # Extract stream compact mappings (sequential format)
+    nb_maxrows_to_bs = mappings['nb_maxrows_to_bs']       # (NB, max_rows) → BS mapping
+    nb_maxrows_to_actidx = mappings['nb_maxrows_to_actidx'] # (NB, max_rows) → sequential act_idx
+    max_rows = mappings['max_rows']
     total_act_idx = mappings['total_act_idx']
     
     # Build sparse tensor: (act_idx, LS)
@@ -42,15 +43,15 @@ def convert_dense_to_stream_compact(intermediate_dense, mappings, num_blocks, li
                                     device=intermediate_dense.device, 
                                     dtype=intermediate_dense.dtype)
     
-    # Fill sparse tensor using mappings
-    active_mask = bs_nb_to_local_idx != 65535
-    if active_mask.sum() > 0:
-        active_bs, active_nb = torch.where(active_mask)
-        # Convert to int32 for indexing, then reconstruct act_indices
-        bs_nb_to_local_idx_int32 = bs_nb_to_local_idx.to(torch.int32)
-        local_indices = bs_nb_to_local_idx_int32[active_bs, active_nb]
-        act_indices = block_offsets[active_nb] + local_indices
-        intermediate_sparse[act_indices] = intermediate_reshaped[active_bs, active_nb]
+    # Fill sparse tensor using sequential mappings
+    for nb in range(num_blocks):
+        for local_row in range(max_rows):
+            bs_idx = nb_maxrows_to_bs[nb, local_row].item()
+            act_idx = nb_maxrows_to_actidx[nb, local_row].item()
+            
+            # Check if this is a valid entry (act_idx should be >= 0 for sequential layout)
+            if act_idx >= 0 and act_idx < total_act_idx and bs_idx >= 0 and bs_idx < BS:
+                intermediate_sparse[act_idx] = intermediate_reshaped[bs_idx, nb]
     
     return intermediate_sparse
 

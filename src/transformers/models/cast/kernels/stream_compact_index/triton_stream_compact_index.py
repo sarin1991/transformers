@@ -38,13 +38,15 @@ def stream_compact_index_kernel(
     gate_ptr,                # (BS, NB) float32 - original gate values
     gate_mask_ptr,           # (BS, NB) bool - where gate > 0
     cumsum_ptr,              # (BS, NB) int32 - cumulative sum along dim=0
-    block_offsets_ptr,       # (NB,) int32 - prefix sum of max_rows_per_block
     
     # Outputs
     nb_maxrows_to_bs_ptr,    # (NB, max_rows) -> BS index
-    nb_maxrows_to_local_idx_ptr,# (NB, max_rows) -> local row index
+    nb_maxrows_to_actidx_ptr,# (NB, max_rows) -> sequential act_idx
     nb_maxrows_gate_vals_ptr,# (NB, max_rows) -> gate values
-    bs_nb_to_local_idx_ptr,  # (BS, NB) -> local row index (-1 for inactive)
+    
+    # Sequential indexing inputs
+    cumsum_nb_ptr,           # (BS, NB) int32 - cumulative sum along dim=1  
+    bs_start_indices_ptr,    # (BS,) int32 - start act_idx for each BS row
     
     # Dimensions
     BS: tl.constexpr, 
@@ -81,18 +83,18 @@ def stream_compact_index_kernel(
     # Load gate mask values for this batch
     is_active = tl.load(gate_mask_ptr + offsets, mask=mask, other=False)
     
-    # Load cumsum values for active elements
+    # Load cumsum values for active elements (local row indices within block)
     cumsum_vals = tl.load(cumsum_ptr + offsets, mask=mask & is_active, other=0)
     local_row_indices = cumsum_vals - 1  # Convert to 0-indexed
     
     # Load original gate values for active elements
     gate_vals_raw = tl.load(gate_ptr + offsets, mask=mask & is_active, other=0.0)
-    # Clamp negative gate values to 0 (only positive values are "active")
     gate_vals = tl.where(gate_vals_raw > 0, gate_vals_raw, 0.0)
     
-    # Load block offsets for act_idx calculation
-    block_offsets = tl.load(block_offsets_ptr + nb_indices, mask=mask & is_active, other=0)
-    act_indices = block_offsets + local_row_indices
+    # Load sequential cumsum values for act_idx assignment
+    cumsum_nb_vals = tl.load(cumsum_nb_ptr + offsets, mask=mask & is_active, other=0)
+    bs_start_offsets = tl.load(bs_start_indices_ptr + bs_indices, mask=mask & is_active, other=0)
+    sequential_act_indices = bs_start_offsets + (cumsum_nb_vals - 1)
     
     # Calculate offsets into (NB, max_rows) tensors
     nb_maxrows_offsets = nb_indices * max_rows + local_row_indices
@@ -103,15 +105,11 @@ def stream_compact_index_kernel(
     # Store (NB, max_rows) -> BS mapping
     tl.store(nb_maxrows_to_bs_ptr + nb_maxrows_offsets, bs_indices, mask=active_mask)
     
-    # Store (NB, max_rows) -> local row index mapping  
-    tl.store(nb_maxrows_to_local_idx_ptr + nb_maxrows_offsets, local_row_indices, mask=active_mask)
+    # Store (NB, max_rows) -> sequential act_idx mapping
+    tl.store(nb_maxrows_to_actidx_ptr + nb_maxrows_offsets, sequential_act_indices, mask=active_mask)
     
     # Store (NB, max_rows) -> gate values mapping
     tl.store(nb_maxrows_gate_vals_ptr + nb_maxrows_offsets, gate_vals, mask=active_mask)
-    
-    # Store (BS, NB) -> local row index mapping (with 65535 for inactive)
-    result_local_indices = tl.where(is_active, local_row_indices, 65535)
-    tl.store(bs_nb_to_local_idx_ptr + offsets, result_local_indices, mask=mask)
 
 
 def create_stream_compact_index(gate: torch.Tensor):
@@ -124,13 +122,13 @@ def create_stream_compact_index(gate: torch.Tensor):
     Returns:
         dict containing:
         - nb_maxrows_to_bs: (NB, max_rows) -> global row index mapping
-        - nb_maxrows_to_actidx: (NB, max_rows) -> act_idx mapping  
+        - nb_maxrows_to_actidx: (NB, max_rows) -> sequential act_idx mapping  
         - nb_maxrows_gate_vals: (NB, max_rows) -> gate values mapping
-        - bs_nb_to_actidx: (BS, NB) -> act_idx mapping (-1 for inactive)
         - max_rows: maximum active rows across all blocks
         - total_act_idx: total number of active elements
-        - block_offsets: (NB,) prefix sum for act_idx calculation
         - max_rows_per_block: (NB,) active rows per block
+        - bs_start_indices: (BS,) start act_idx for each BS row
+        - bs_counts: (BS,) count of active elements per BS row
     """
     
     BS, NB = gate.shape
@@ -139,41 +137,42 @@ def create_stream_compact_index(gate: torch.Tensor):
     # Create boolean mask for active positions
     mask = gate > 0  # (BS, NB)
     
-    # Cumulative sum along batch dimension to get local row indices
-    cumsum = torch.cumsum(mask.int(), dim=0)  # (BS, NB)
+    # Dual cumulative sums
+    cumsum_bs = torch.cumsum(mask.int(), dim=0)  # (BS, NB) - for NB-based kernels
+    cumsum_nb = torch.cumsum(mask.int(), dim=1)  # (BS, NB) - for sequential act_idx
     
-    # Count active rows per block
-    max_rows_per_block = cumsum[-1, :]  # (NB,) - final cumsum values
+    # Count active rows per block and totals
+    max_rows_per_block = cumsum_bs[-1, :]  # (NB,) - final cumsum values
     max_rows = max_rows_per_block.max().item()
     total_act_idx = max_rows_per_block.sum().item()
+    
+    # Sequential indexing support
+    bs_counts = cumsum_nb[:, -1]  # (BS,) - active count per BS row
+    bs_start_indices = torch.cat([
+        torch.zeros(1, dtype=torch.int32, device=gate.device),
+        torch.cumsum(bs_counts[:-1], dim=0)
+    ])  # (BS,) - start index for each BS row
     
     # Early exit if no active elements
     if max_rows == 0:
         return {
             'nb_maxrows_to_bs': torch.empty((NB, 0), dtype=torch.int32, device=gate.device),
-            'nb_maxrows_to_local_idx': torch.empty((NB, 0), dtype=torch.uint16, device=gate.device),
+            'nb_maxrows_to_actidx': torch.empty((NB, 0), dtype=torch.int32, device=gate.device),
             'nb_maxrows_gate_vals': torch.empty((NB, 0), dtype=torch.float32, device=gate.device),
-            'bs_nb_to_local_idx': torch.full((BS, NB), 65535, dtype=torch.uint16, device=gate.device),
             'bs_nb_to_gate_vals': gate,
             'max_rows': 0,
             'total_act_idx': 0,
-            'block_offsets': torch.zeros(NB, dtype=torch.int32, device=gate.device),
             'max_rows_per_block': max_rows_per_block,
+            'bs_start_indices': bs_start_indices,
+            'bs_counts': bs_counts,
         }
-    
-    # Create block offsets for act_idx calculation (prefix sum)
-    block_offsets = torch.cat([
-        torch.zeros(1, dtype=torch.int32, device=gate.device),
-        torch.cumsum(max_rows_per_block[:-1], dim=0)
-    ])
     
     # ===== Allocate Output Tensors =====
     # Use empty for speed, will be filled by kernel
     nb_maxrows_to_bs = torch.empty((NB, max_rows), dtype=torch.int32, device=gate.device)
-    nb_maxrows_to_local_idx = torch.empty((NB, max_rows), dtype=torch.uint16, device=gate.device)
+    nb_maxrows_to_actidx = torch.empty((NB, max_rows), dtype=torch.int32, device=gate.device)
     # Gate values need zeros initialization since kernel doesn't write to all positions
     nb_maxrows_gate_vals = torch.zeros((NB, max_rows), dtype=torch.float32, device=gate.device)
-    bs_nb_to_local_idx = torch.empty((BS, NB), dtype=torch.uint16, device=gate.device)
     
     # ===== Launch Autotune Kernel =====
     total_elements = BS * NB
@@ -182,12 +181,12 @@ def create_stream_compact_index(gate: torch.Tensor):
     stream_compact_index_kernel[grid](
         gate,                    # gate_ptr
         mask,                    # gate_mask_ptr
-        cumsum,                  # cumsum_ptr  
-        block_offsets,           # block_offsets_ptr
+        cumsum_bs,               # cumsum_ptr  
         nb_maxrows_to_bs,        # nb_maxrows_to_bs_ptr
-        nb_maxrows_to_local_idx, # nb_maxrows_to_local_idx_ptr
+        nb_maxrows_to_actidx,    # nb_maxrows_to_actidx_ptr
         nb_maxrows_gate_vals,    # nb_maxrows_gate_vals_ptr
-        bs_nb_to_local_idx,      # bs_nb_to_local_idx_ptr
+        cumsum_nb,               # cumsum_nb_ptr
+        bs_start_indices,        # bs_start_indices_ptr
         BS=BS,
         NB=NB, 
         max_rows=max_rows,
@@ -195,14 +194,14 @@ def create_stream_compact_index(gate: torch.Tensor):
     
     return {
         'nb_maxrows_to_bs': nb_maxrows_to_bs,
-        'nb_maxrows_to_local_idx': nb_maxrows_to_local_idx,
+        'nb_maxrows_to_actidx': nb_maxrows_to_actidx,
         'nb_maxrows_gate_vals': nb_maxrows_gate_vals,
-        'bs_nb_to_local_idx': bs_nb_to_local_idx,
-        'bs_nb_to_gate_vals': gate,  # Original (BS, NB) gate tensor
+        'bs_nb_to_gate_vals': gate,
         'max_rows': max_rows,
         'total_act_idx': total_act_idx,
-        'block_offsets': block_offsets,
         'max_rows_per_block': max_rows_per_block,
+        'bs_start_indices': bs_start_indices,
+        'bs_counts': bs_counts,
     }
 
 

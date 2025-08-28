@@ -66,8 +66,7 @@ def fused_weight_grad_stream_compact_kernel(
     
     # Index mappings from stream compact preprocessing  
     nb_maxrows_to_bs_ptr,           # (NB, max_rows) -> BS index
-    nb_maxrows_to_local_idx_ptr,    # (NB, max_rows) -> local row index
-    block_offsets_ptr,              # (NB,) -> block start offsets
+    nb_maxrows_to_actidx_ptr,       # (NB, max_rows) -> sequential act_idx
     max_rows_per_block_ptr,         # (NB,) number of active rows per block
     
     # Output tensor
@@ -127,9 +126,8 @@ def fused_weight_grad_stream_compact_kernel(
         return
 
     # ------------------------------------------------------------------
-    # Load block offset once (constant for entire kernel)
+    # Sequential act_idx layout - no block offset needed
     # ------------------------------------------------------------------
-    block_offset = tl.load(block_offsets_ptr + block_idx)
     
     # ------------------------------------------------------------------
     # Coordinate helpers
@@ -174,10 +172,9 @@ def fused_weight_grad_stream_compact_kernel(
         # Mask rows using **per-block** active count instead of global max_rows
         mask_rows  = row_offs < blk_rows
 
-        # Load local row indices and reconstruct act_indices from stream compact mappings  
-        local_indices = tl.load(nb_maxrows_to_local_idx_ptr + base_ptr + row_offs,
-                               mask=mask_rows, other=0)
-        act_indices = block_offset + local_indices.to(tl.int64)
+        # Load sequential act_indices directly (no reconstruction needed)
+        act_indices = tl.load(nb_maxrows_to_actidx_ptr + base_ptr + row_offs,
+                             mask=mask_rows, other=0)
         bs_indices = tl.load(nb_maxrows_to_bs_ptr + base_ptr + row_offs,
                             mask=mask_rows, other=0)
 
@@ -235,7 +232,7 @@ def fused_weight_grad_sparse_triton_stream_compact(
         other        : (BS, H)        – fp16/bf16/fp32
         mappings     : dict from create_stream_compact_index() containing:
             - nb_maxrows_to_bs: (NB, max_rows) -> BS mapping
-            - nb_maxrows_to_actidx: (NB, max_rows) -> act_idx mapping
+            - nb_maxrows_to_actidx: (NB, max_rows) -> sequential act_idx mapping
             - max_rows: maximum active rows per block
             - max_rows_per_block: (NB,) active rows per block
 
@@ -257,8 +254,7 @@ def fused_weight_grad_sparse_triton_stream_compact(
 
     # Extract mappings
     nb_maxrows_to_bs = mappings['nb_maxrows_to_bs']           # (NB, max_rows)
-    nb_maxrows_to_local_idx = mappings['nb_maxrows_to_local_idx'] # (NB, max_rows)  
-    block_offsets = mappings['block_offsets']                 # (NB,)
+    nb_maxrows_to_actidx = mappings['nb_maxrows_to_actidx']   # (NB, max_rows) -> sequential act_idx
     max_rows = mappings['max_rows']
     max_rows_per_block = mappings['max_rows_per_block']       # (NB,)
     
@@ -303,8 +299,7 @@ def fused_weight_grad_sparse_triton_stream_compact(
         
         # Index mappings
         nb_maxrows_to_bs,
-        nb_maxrows_to_local_idx,
-        block_offsets,
+        nb_maxrows_to_actidx,
         max_rows_per_block,
         
         # Output

@@ -4,7 +4,7 @@ from kernels.stream_compact_index.triton_stream_compact_index import create_stre
 
 def verify_mappings(gate: torch.Tensor, mappings: dict):
     """
-    Verify that the generated mappings are correct.
+    Verify that the generated sequential mappings are correct.
     
     Args:
         gate: Original gate tensor (BS, NB)
@@ -14,80 +14,115 @@ def verify_mappings(gate: torch.Tensor, mappings: dict):
     mask = gate > 0
     
     nb_maxrows_to_bs = mappings['nb_maxrows_to_bs']
-    nb_maxrows_to_local_idx = mappings['nb_maxrows_to_local_idx'] 
+    nb_maxrows_to_actidx = mappings['nb_maxrows_to_actidx'] 
     nb_maxrows_gate_vals = mappings['nb_maxrows_gate_vals']
-    bs_nb_to_local_idx = mappings['bs_nb_to_local_idx']
-    block_offsets = mappings['block_offsets']
     max_rows = mappings['max_rows']
     total_act_idx = mappings['total_act_idx']
+    bs_start_indices = mappings['bs_start_indices']
+    bs_counts = mappings['bs_counts']
     
-    print(f"=== Stream Compact Index Mappings Verification ===")
+    print(f"=== Stream Compact Sequential Mappings Verification ===")
     print(f"Gate shape: {gate.shape}")
     print(f"Active elements: {mask.sum().item()} / {BS * NB}")
     print(f"Max rows per block: {max_rows}")
     print(f"Total act_idx: {total_act_idx}")
-    
-    # Verify that all active (bs, nb) pairs have valid act_idx
-    active_positions = torch.nonzero(mask, as_tuple=False)  # (num_active, 2)
+    print(f"Sequential layout: bs_start_indices shape {bs_start_indices.shape}, bs_counts shape {bs_counts.shape}")
     
     errors = 0
-    # Convert to int32 for indexing
-    bs_nb_to_local_idx_int32 = bs_nb_to_local_idx.to(torch.int32)
-    for i, (bs, nb) in enumerate(active_positions):
-        bs_item, nb_item = bs.item(), nb.item()
-        
-        # Check bs_nb_to_local_idx mapping and reconstruct act_idx
-        local_idx = bs_nb_to_local_idx_int32[bs_item, nb_item].item()
-        if local_idx == 65535:
-            print(f"ERROR: Invalid local_idx {local_idx} for active position ({bs_item}, {nb_item})")
-            errors += 1
-        else:
-            act_idx = block_offsets[nb_item].item() + local_idx
-            if act_idx < 0 or act_idx >= total_act_idx:
-                print(f"ERROR: Invalid reconstructed act_idx {act_idx} for active position ({bs_item}, {nb_item})")
-                errors += 1
     
-    # Verify that all inactive (bs, nb) pairs have local_idx = 65535 
-    inactive_mask = ~mask
-    # Convert to int32 for indexing, then back for comparison
-    bs_nb_to_local_idx_int32 = bs_nb_to_local_idx.to(torch.int32)
-    inactive_local_indices = bs_nb_to_local_idx_int32[inactive_mask]
-    # Check for uint16 max value (65535) which represents invalid
-    if (inactive_local_indices != 65535).any():
-        print(f"ERROR: Found non-65535 local_idx for inactive positions")
+    # Verify sequential layout consistency
+    expected_total = bs_counts.sum().item()
+    if expected_total != total_act_idx:
+        print(f"ERROR: bs_counts sum ({expected_total}) != total_act_idx ({total_act_idx})")
         errors += 1
     
-    # Verify nb_maxrows mappings consistency
+    # Verify bs_start_indices are sequential
+    for bs in range(BS - 1):
+        expected_next_start = bs_start_indices[bs].item() + bs_counts[bs].item()
+        actual_next_start = bs_start_indices[bs + 1].item()
+        if expected_next_start != actual_next_start:
+            print(f"ERROR: Non-sequential start indices at BS {bs}: expected {expected_next_start}, got {actual_next_start}")
+            errors += 1
+    
+    # Build reverse mapping from act_idx to (bs, nb) for verification
+    act_idx_to_bs_nb = {}
     for nb in range(NB):
         for local_row in range(max_rows):
             gate_val = nb_maxrows_gate_vals[nb, local_row].item()
-            bs_mapped = nb_maxrows_to_bs[nb, local_row].item()
-            local_idx_mapped = nb_maxrows_to_local_idx[nb, local_row].item()
-            act_idx_mapped = block_offsets[nb].item() + local_idx_mapped
-            
-            # Only validate positions with positive gate values (active entries)
             if gate_val > 0:  # Valid/active entry
+                bs_mapped = nb_maxrows_to_bs[nb, local_row].item()
+                act_idx = nb_maxrows_to_actidx[nb, local_row].item()
+                
+                # Validate ranges
                 if bs_mapped < 0 or bs_mapped >= BS:
                     print(f"ERROR: Invalid bs_mapped {bs_mapped} for active entry at ({nb}, {local_row})")
                     errors += 1
                     continue
                     
-                if act_idx_mapped < 0 or act_idx_mapped >= total_act_idx:
-                    print(f"ERROR: Invalid act_idx_mapped {act_idx_mapped} for active entry at ({nb}, {local_row})")
+                if act_idx < 0 or act_idx >= total_act_idx:
+                    print(f"ERROR: Invalid act_idx {act_idx} for active entry at ({nb}, {local_row})")
                     errors += 1
                     continue
                 
-                # Check consistency with bs_nb_to_local_idx + block_offsets  
-                expected_local_idx = bs_nb_to_local_idx_int32[bs_mapped, nb].item()
-                expected_act_idx = block_offsets[nb].item() + expected_local_idx
-                if act_idx_mapped != expected_act_idx:
-                    print(f"ERROR: Inconsistent act_idx mapping at ({nb}, {local_row}): "
-                          f"nb_maxrows says {act_idx_mapped}, bs_nb says {expected_act_idx}")
+                # Check for duplicates
+                if act_idx in act_idx_to_bs_nb:
+                    prev_bs, prev_nb = act_idx_to_bs_nb[act_idx]
+                    print(f"ERROR: Duplicate act_idx {act_idx} found at ({nb}, {local_row}) and ({prev_nb}, prev_row)")
                     errors += 1
-            # Note: For gate_val <= 0 (padding entries), bs_mapped and act_idx_mapped values are undefined/uninitialized
+                else:
+                    act_idx_to_bs_nb[act_idx] = (bs_mapped, nb)
+                
+                # Verify gate value consistency
+                original_gate_val = gate[bs_mapped, nb].item()
+                if abs(gate_val - original_gate_val) > 1e-6:
+                    print(f"ERROR: Gate value mismatch at ({nb}, {local_row}): stored {gate_val}, original {original_gate_val}")
+                    errors += 1
+    
+    # Verify that act_idx values within each BS range are sequential
+    for bs in range(BS):
+        start_idx = bs_start_indices[bs].item()
+        count = bs_counts[bs].item()
+        
+        if count == 0:
+            continue
+            
+        # Find all act_idx values for this BS
+        bs_act_indices = []
+        for act_idx in range(start_idx, start_idx + count):
+            if act_idx in act_idx_to_bs_nb:
+                mapped_bs, mapped_nb = act_idx_to_bs_nb[act_idx]
+                if mapped_bs == bs:
+                    bs_act_indices.append(act_idx)
+        
+        # Check that we found the expected count
+        if len(bs_act_indices) != count:
+            print(f"ERROR: BS {bs} expected {count} act_indices, found {len(bs_act_indices)}")
+            errors += 1
+        
+        # Check that they are sequential
+        expected_indices = list(range(start_idx, start_idx + count))
+        if sorted(bs_act_indices) != expected_indices:
+            print(f"ERROR: BS {bs} act_indices are not sequential: expected {expected_indices}, got {sorted(bs_act_indices)}")
+            errors += 1
+    
+    # Verify that every active (bs, nb) position has a corresponding act_idx
+    active_positions = torch.nonzero(mask, as_tuple=False)  # (num_active, 2)
+    for bs, nb in active_positions:
+        bs_item, nb_item = bs.item(), nb.item()
+        found = False
+        
+        # Search for this (bs, nb) in the mappings
+        for act_idx, (mapped_bs, mapped_nb) in act_idx_to_bs_nb.items():
+            if mapped_bs == bs_item and mapped_nb == nb_item:
+                found = True
+                break
+        
+        if not found:
+            print(f"ERROR: Active position ({bs_item}, {nb_item}) not found in act_idx mappings")
+            errors += 1
     
     if errors == 0:
-        print("✅ All mappings verified successfully!")
+        print("✅ All sequential mappings verified successfully!")
     else:
         print(f"❌ Found {errors} mapping errors")
     
@@ -111,11 +146,11 @@ def test_simple_case():
     # Create mappings
     mappings = create_stream_compact_index(gate)
     
-    print(f"\nGenerated mappings:")
+    print(f"\nGenerated sequential mappings:")
     print(f"nb_maxrows_to_bs:\n{mappings['nb_maxrows_to_bs']}")
-    print(f"nb_maxrows_to_local_idx:\n{mappings['nb_maxrows_to_local_idx']}")
-    print(f"bs_nb_to_local_idx:\n{mappings['bs_nb_to_local_idx']}")
-    print(f"block_offsets:\n{mappings['block_offsets']}")
+    print(f"nb_maxrows_to_actidx:\n{mappings['nb_maxrows_to_actidx']}")
+    print(f"bs_start_indices:\n{mappings['bs_start_indices']}")
+    print(f"bs_counts:\n{mappings['bs_counts']}")
     
     # Verify correctness
     verify_mappings(gate, mappings)
