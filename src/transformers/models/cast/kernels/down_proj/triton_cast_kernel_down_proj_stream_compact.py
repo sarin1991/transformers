@@ -378,11 +378,9 @@ def fused_down_proj_sparse_triton_stream_compact(
     if two_stage_reduction:
         # Stage 1: Generate intermediate (act_idx, H) results without atomic adds
         output_tensor = torch.empty((total_act_idx, hidden_size), device=x.device, dtype=out_dtype)
-        stride_out_dim0 = output_tensor.stride(0)
     else:
         # Original single-stage approach with atomic adds
         output_tensor = torch.zeros((batch_seq_size, hidden_size), device=x.device, dtype=out_dtype)
-        stride_out_dim0 = output_tensor.stride(0)
 
     # Grid helper
     def grid(meta):
@@ -426,7 +424,7 @@ def fused_down_proj_sparse_triton_stream_compact(
         # Strides
         x.stride(0), x.stride(1),
         down_weight.stride(0), down_weight.stride(1),
-        stride_out_dim0, output_tensor.stride(1),
+        output_tensor.stride(0), output_tensor.stride(1),
         
         # Meta-params
         out_dtype=triton_out_dtype,
