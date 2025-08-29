@@ -138,8 +138,8 @@ def create_stream_compact_index(gate: torch.Tensor):
     mask = gate > 0  # (BS, NB)
     
     # Dual cumulative sums
-    cumsum_bs = torch.cumsum(mask.int(), dim=0)  # (BS, NB) - for NB-based kernels
-    cumsum_nb = torch.cumsum(mask.int(), dim=1)  # (BS, NB) - for sequential act_idx
+    cumsum_bs = torch.cumsum(mask, dim=0, dtype=torch.int32)  # (BS, NB) - for NB-based kernels
+    cumsum_nb = torch.cumsum(mask, dim=1, dtype=torch.int32)  # (BS, NB) - for sequential act_idx
     
     # Count active rows per block and totals
     max_rows_per_block = cumsum_bs[-1, :]  # (NB,) - final cumsum values
