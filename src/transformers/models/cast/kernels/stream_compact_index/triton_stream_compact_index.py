@@ -147,7 +147,7 @@ def create_stream_compact_index(gate: torch.Tensor):
     total_act_idx = max_rows_per_block.sum().item()
     
     # Sequential indexing support
-    bs_counts = cumsum_nb[:, -1]  # (BS,) - active count per BS row
+    bs_counts = cumsum_nb[:, -1].contiguous()  # (BS,) - active count per BS row
     bs_start_indices = torch.cat([
         torch.zeros(1, dtype=torch.int32, device=gate.device),
         torch.cumsum(bs_counts[:-1], dim=0)
