@@ -235,6 +235,7 @@ def stream_compact_summation_kernel(
     # Strides
     stride_inter_actidx, stride_inter_h,
     stride_out_bs, stride_out_h,
+    stride_bs_start_indices, stride_bs_counts,
     
     # Meta-params
     out_dtype: tl.constexpr,
@@ -272,8 +273,8 @@ def stream_compact_summation_kernel(
     # ------------------------------------------------------------------
     # Load sequential range for this BS row
     # ------------------------------------------------------------------
-    start_idx = tl.load(bs_start_indices_ptr + bs_idx)
-    count = tl.load(bs_counts_ptr + bs_idx)
+    start_idx = tl.load(bs_start_indices_ptr + bs_idx * stride_bs_start_indices)
+    count = tl.load(bs_counts_ptr + bs_idx * stride_bs_counts)
     
     # ------------------------------------------------------------------
     # Early exit if no active elements for this BS row
@@ -457,6 +458,8 @@ def fused_down_proj_sparse_triton_stream_compact(
             # Strides
             output_tensor.stride(0), output_tensor.stride(1),        # intermediate strides
             final_output.stride(0), final_output.stride(1),         # output strides
+            bs_start_indices.stride(0),
+            bs_counts.stride(0),
             
             # Meta-params
             out_dtype=triton_out_dtype,
