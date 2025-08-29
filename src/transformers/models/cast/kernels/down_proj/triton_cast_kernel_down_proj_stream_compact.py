@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+import os
 
 # =============================================================================
 # Stream compact sparse down-proj kernel
@@ -375,6 +376,14 @@ def fused_down_proj_sparse_triton_stream_compact(
     # Assert that input tensors have efficient memory layout (at least one stride ≤ 1)
     assert min(x.stride()) <= 1, f"x has inefficient stride pattern: {x.stride()}"
     assert min(down_weight.stride()) <= 1, f"down_weight has inefficient stride pattern: {down_weight.stride()}"
+
+    # Override two_stage_reduction if memory cost is too high
+    memory_threshold = int(os.getenv("CAST_TWO_STAGE_MEMORY_THRESHOLD", "10"))
+    if two_stage_reduction and total_act_idx > memory_threshold * batch_seq_size:
+        print(f"⚠️  WARNING: Disabling two_stage_reduction due to high memory cost: "
+              f"total_act_idx ({total_act_idx}) > {memory_threshold} * batch_seq_size ({batch_seq_size}). "
+              f"Set CAST_TWO_STAGE_MEMORY_THRESHOLD to override.")
+        two_stage_reduction = False
 
     if two_stage_reduction:
         # Stage 1: Generate intermediate (act_idx, H) results without atomic adds
