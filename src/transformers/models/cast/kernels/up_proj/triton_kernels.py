@@ -392,9 +392,10 @@ def stream_compact_to_dense_blocks(stream_compact_output, mappings, batch_seq_si
         for local_row in range(max_rows):
             bs_idx = nb_maxrows_to_bs[nb, local_row].item()
             act_idx = nb_maxrows_to_actidx[nb, local_row].item()
+            gate_val = mappings['nb_maxrows_gate_vals'][nb, local_row].item()
             
-            # Check if this is a valid entry
-            if act_idx >= 0 and act_idx < stream_compact_output.shape[0] and bs_idx >= 0 and bs_idx < batch_seq_size:
+            # Check if this is a valid entry (gate_val > 0 indicates active position)
+            if gate_val > 0 and act_idx >= 0 and act_idx < stream_compact_output.shape[0] and bs_idx >= 0 and bs_idx < batch_seq_size:
                 dense_blocks[bs_idx, nb, :] = stream_compact_output[act_idx, :]
     
     return dense_blocks
