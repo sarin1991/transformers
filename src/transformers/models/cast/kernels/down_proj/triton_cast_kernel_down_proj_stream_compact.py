@@ -212,6 +212,8 @@ def get_summation_autotune_config():
         triton.Config({'BLOCK_SIZE_H': 512}),
         triton.Config({'BLOCK_SIZE_H': 4096}),
         triton.Config({'BLOCK_SIZE_H': 256}),
+        triton.Config({'BLOCK_SIZE_H': 64}),
+        triton.Config({'BLOCK_SIZE_H': 32}),
     ]
 
 
