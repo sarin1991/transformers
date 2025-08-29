@@ -276,14 +276,24 @@ def stream_compact_summation_kernel(
     count = tl.load(bs_counts_ptr + bs_idx)
     
     # ------------------------------------------------------------------
+    # Early exit if no active elements for this BS row
+    # ------------------------------------------------------------------
+    if count == 0:
+        # Store zeros for this BS row
+        acc = tl.zeros((BLOCK_SIZE_H,), dtype=tl.float32)
+        out_ptrs = output_ptr + bs_idx * stride_out_bs + offs_h * stride_out_h
+        tl.store(out_ptrs, acc.to(out_dtype), mask=mask_h)
+        return
+    
+    # ------------------------------------------------------------------
     # Initialize 1D accumulator for this H chunk
     # ------------------------------------------------------------------
     acc = tl.zeros((BLOCK_SIZE_H,), dtype=tl.float32)
     
     # ------------------------------------------------------------------
-    # Simple sequential loop - perfect memory coalescing!
+    # Simple sequential loop using tl.range
     # ------------------------------------------------------------------
-    for i in range(count):
+    for i in tl.range(count):
         act_idx = start_idx + i
         
         # Load intermediate values - sequential access pattern

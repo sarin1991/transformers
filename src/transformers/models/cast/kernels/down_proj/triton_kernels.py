@@ -234,9 +234,10 @@ def convert_dense_to_stream_compact(x_dense, mappings, num_blocks, line_size):
         for local_row in range(max_rows):
             bs_idx = nb_maxrows_to_bs[nb, local_row].item()
             act_idx = nb_maxrows_to_actidx[nb, local_row].item()
+            gate_val = mappings['nb_maxrows_gate_vals'][nb, local_row].item()
             
-            # Check if this is a valid entry (act_idx should be >= 0 for sequential layout)
-            if act_idx >= 0 and act_idx < total_act_idx and bs_idx >= 0 and bs_idx < BS:
+            # Check if this is a valid entry (gate_val > 0 indicates active position)
+            if gate_val > 0 and act_idx >= 0 and act_idx < total_act_idx and bs_idx >= 0 and bs_idx < BS:
                 x_sparse[act_idx] = x_reshaped[bs_idx, nb]
     
     return x_sparse
