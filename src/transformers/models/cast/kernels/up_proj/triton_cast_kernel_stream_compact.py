@@ -101,7 +101,8 @@ def get_triton_autotune_config():
 
 @triton.autotune(
     configs=get_triton_autotune_config(),
-    key=['hidden_size', 'line_size', 'max_rows'],
+    key=['hidden_size', 'line_size', 'save_up_proj', 'calculate_grad_gate_up_proj'],
+    reset_to_zero=['grad_gate_ptr'],
 )
 @triton.jit
 def fused_up_proj_stream_compact_kernel(
