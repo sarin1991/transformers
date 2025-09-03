@@ -8,6 +8,7 @@ from torch.profiler import ProfilerActivity, profile, record_function
 #   cd src/transformers/models/cast/
 #   python -m ops.profile_cast_mlp
 from .cast_mlp_fused import cast_mlp_fused, _CastMLPFusedFunction
+from .cast_mlp_fused_stream_compact import cast_mlp_fused_stream_compact, _CastMLPFusedStreamCompactFunction
 from .debug_cast_mlp_fused import reference_cast_mlp_pytorch, _make_sparse_gate
 
 
@@ -62,6 +63,13 @@ def _run_fused_no_grad(x, g, up_w, down_w):
     with torch.no_grad():
         return cast_mlp_fused(x, g, up_w, down_w)
 
+def _run_fused_stream_compact(x, g, up_w, down_w):
+    return cast_mlp_fused_stream_compact(x, g, up_w, down_w)
+
+def _run_fused_stream_compact_no_grad(x, g, up_w, down_w):
+    with torch.no_grad():
+        return cast_mlp_fused_stream_compact(x, g, up_w, down_w)
+
 def _run_pytorch(x, g, up_w, down_w, compute_dtype=torch.float32):
     return reference_cast_mlp_pytorch(x, g, up_w, down_w, compute_dtype=compute_dtype)
 
@@ -78,7 +86,7 @@ def _run_pytorch_backward(loss):
     loss.backward(retain_graph=True)
 
 
-def _setup_direct_backward_context(x, gate, up_w, down_w):
+def _setup_direct_backward_context(x, gate, up_w, down_w, use_stream_compact=False):
     """Setup context for direct kernel backward profiling."""
     # Create mock context
     class MockContext:
@@ -91,7 +99,10 @@ def _setup_direct_backward_context(x, gate, up_w, down_w):
     ctx = MockContext()
     
     # Run actual forward pass to populate context with real intermediate tensors
-    fused_output = _CastMLPFusedFunction.forward(ctx, x, gate, up_w, down_w)
+    if use_stream_compact:
+        fused_output = _CastMLPFusedStreamCompactFunction.forward(ctx, x, gate, up_w, down_w)
+    else:
+        fused_output = _CastMLPFusedFunction.forward(ctx, x, gate, up_w, down_w)
     
     # Create gradient output identical to fused_loss.sum() case
     grad_out = torch.tensor(1.0, device=fused_output.device, dtype=fused_output.dtype).expand_as(fused_output)
@@ -99,9 +110,12 @@ def _setup_direct_backward_context(x, gate, up_w, down_w):
     return ctx, grad_out
 
 
-def _run_direct_kernel_backward(ctx, grad_out):
+def _run_direct_kernel_backward(ctx, grad_out, use_stream_compact=False):
     """Direct kernel backward call for profiling."""
-    _CastMLPFusedFunction.backward(ctx, grad_out)
+    if use_stream_compact:
+        _CastMLPFusedStreamCompactFunction.backward(ctx, grad_out)
+    else:
+        _CastMLPFusedFunction.backward(ctx, grad_out)
 
 
 # -----------------------------------------------------------------------------
@@ -125,6 +139,7 @@ def main():
     )
     parser.add_argument("--steps", type=int, default=50, help="Profiler steps")
     parser.add_argument("--profile-fused", action="store_true", help="Profile Triton fused kernel")
+    parser.add_argument("--profile-fused-stream-compact", action="store_true", help="Profile Triton fused stream compact kernel")
     parser.add_argument("--profile-pytorch", action="store_true", help="Profile PyTorch reference")
     parser.add_argument("--forward-grad", action="store_true", help="Profile forward pass with gradient computation")
     parser.add_argument("--profile-backward", action="store_true", help="Profile backward pass instead of forward")
@@ -142,7 +157,7 @@ def main():
     args = parser.parse_args()
 
     # Ensure at least one target selected
-    if not (args.profile_fused or args.profile_pytorch):
+    if not (args.profile_fused or args.profile_fused_stream_compact or args.profile_pytorch):
         args.profile_fused = True  # default
 
     if not torch.cuda.is_available():
@@ -205,6 +220,17 @@ def main():
                 ctx, grad_out = _setup_direct_backward_context(x, gate, up_w, down_w)
                 _profile("cast_mlp_fused_backward_kernel", lambda: _run_direct_kernel_backward(ctx, grad_out))
 
+        if args.profile_fused_stream_compact:
+            if args.measure_total_backward:
+                # Total autograd path (includes PyTorch overhead)
+                fused_sc_output_template = _run_fused_stream_compact(x, gate, up_w, down_w)
+                fused_sc_loss = fused_sc_output_template.sum()
+                _profile("cast_mlp_fused_stream_compact_backward_total", lambda: _run_fused_backward(fused_sc_loss))
+            else:
+                # Direct kernel backward (no PyTorch autograd overhead)
+                ctx_sc, grad_out_sc = _setup_direct_backward_context(x, gate, up_w, down_w, use_stream_compact=True)
+                _profile("cast_mlp_fused_stream_compact_backward_kernel", lambda: _run_direct_kernel_backward(ctx_sc, grad_out_sc, use_stream_compact=True))
+
         if args.profile_pytorch:
             # PyTorch reference always uses total autograd path
             pytorch_output_template = _run_pytorch(x, gate, up_w, down_w, compute_dtype=dtype)
@@ -215,12 +241,18 @@ def main():
         if args.profile_fused:
             _profile("cast_mlp_fused_forward_grad", lambda: _run_fused(x, gate, up_w, down_w))
 
+        if args.profile_fused_stream_compact:
+            _profile("cast_mlp_fused_stream_compact_forward_grad", lambda: _run_fused_stream_compact(x, gate, up_w, down_w))
+
         if args.profile_pytorch:
             _profile("cast_mlp_pytorch_forward_grad", lambda: _run_pytorch(x, gate, up_w, down_w, compute_dtype=dtype))
     else:
         # Default: Forward pass with no gradient computation (fastest)
         if args.profile_fused:
             _profile("cast_mlp_fused_forward", lambda: _run_fused_no_grad(x, gate, up_w, down_w))
+
+        if args.profile_fused_stream_compact:
+            _profile("cast_mlp_fused_stream_compact_forward", lambda: _run_fused_stream_compact_no_grad(x, gate, up_w, down_w))
 
         if args.profile_pytorch:
             _profile("cast_mlp_pytorch_forward", lambda: _run_pytorch_no_grad(x, gate, up_w, down_w, compute_dtype=dtype))

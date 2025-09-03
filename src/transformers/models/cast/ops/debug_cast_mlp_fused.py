@@ -7,6 +7,7 @@ from typing import Tuple
 # cd src/transformers/models/cast/
 # python -m ops.debug_cast_mlp_fused
 from ops.cast_mlp_fused import cast_mlp_fused
+from ops.cast_mlp_fused_stream_compact import cast_mlp_fused_stream_compact
 
 
 def _make_sparse_gate(batch_seq_size: int, num_blocks: int, sparsity: float = 0.9) -> torch.Tensor:
@@ -111,25 +112,57 @@ def run_accuracy_test(
     down_weight_fused = down_weight.detach().clone()
     gate_fused = gate.detach().clone()
 
-    # Fused implementation
+    # Fused SortPack implementation
     fused_output = cast_mlp_fused(x_fused, gate_fused, up_weight_fused, down_weight_fused)
+    
+    # Fused Stream Compact implementation
+    x_fused_sc = x.detach().clone()
+    up_weight_fused_sc = up_weight.detach().clone()
+    down_weight_fused_sc = down_weight.detach().clone()
+    gate_fused_sc = gate.detach().clone()
+    
+    fused_sc_output = cast_mlp_fused_stream_compact(x_fused_sc, gate_fused_sc, up_weight_fused_sc, down_weight_fused_sc)
     
     # Compare outputs (convert fused to float32 for comparison)
     fused_output_f32 = fused_output.float()
+    fused_sc_output_f32 = fused_sc_output.float()
     
-    diff = torch.abs(ref_output - fused_output_f32)
-    abs_max_diff = torch.max(diff).item()
-    abs_mean_diff = torch.mean(diff).item()
-    # Compute relative errors (avoid division by zero)
+    # Compare SortPack vs Reference
+    diff_sp = torch.abs(ref_output - fused_output_f32)
+    abs_max_diff_sp = torch.max(diff_sp).item()
+    abs_mean_diff_sp = torch.mean(diff_sp).item()
     abs_ref_max = torch.max(torch.abs(ref_output)).item()
     abs_ref_mean = torch.mean(torch.abs(ref_output)).item()
-    rel_max_diff = abs_max_diff / (abs_ref_max + 1e-6)
-    rel_mean_diff = abs_mean_diff / (abs_ref_mean + 1e-6)
+    rel_max_diff_sp = abs_max_diff_sp / (abs_ref_max + 1e-6)
+    rel_mean_diff_sp = abs_mean_diff_sp / (abs_ref_mean + 1e-6)
     
-    print(f"  Abs Max diff: {abs_max_diff:.6e} | Abs Mean diff: {abs_mean_diff:.6e}")
-    print(f"  Rel Max diff: {rel_max_diff:.6e} | Rel Mean diff: {rel_mean_diff:.6e}")
+    print(f"  SortPack vs Reference:")
+    print(f"    Abs Max diff: {abs_max_diff_sp:.6e} | Abs Mean diff: {abs_mean_diff_sp:.6e}")
+    print(f"    Rel Max diff: {rel_max_diff_sp:.6e} | Rel Mean diff: {rel_mean_diff_sp:.6e}")
     
-    return rel_max_diff, rel_mean_diff, abs_max_diff, abs_mean_diff
+    # Compare StreamCompact vs Reference
+    diff_sc = torch.abs(ref_output - fused_sc_output_f32)
+    abs_max_diff_sc = torch.max(diff_sc).item()
+    abs_mean_diff_sc = torch.mean(diff_sc).item()
+    rel_max_diff_sc = abs_max_diff_sc / (abs_ref_max + 1e-6)
+    rel_mean_diff_sc = abs_mean_diff_sc / (abs_ref_mean + 1e-6)
+    
+    print(f"  StreamCompact vs Reference:")
+    print(f"    Abs Max diff: {abs_max_diff_sc:.6e} | Abs Mean diff: {abs_mean_diff_sc:.6e}")
+    print(f"    Rel Max diff: {rel_max_diff_sc:.6e} | Rel Mean diff: {rel_mean_diff_sc:.6e}")
+    
+    # Compare SortPack vs StreamCompact
+    diff_sp_sc = torch.abs(fused_output_f32 - fused_sc_output_f32)
+    abs_max_diff_sp_sc = torch.max(diff_sp_sc).item()
+    abs_mean_diff_sp_sc = torch.mean(diff_sp_sc).item()
+    rel_max_diff_sp_sc = abs_max_diff_sp_sc / (abs_ref_max + 1e-6)
+    rel_mean_diff_sp_sc = abs_mean_diff_sp_sc / (abs_ref_mean + 1e-6)
+    
+    print(f"  SortPack vs StreamCompact:")
+    print(f"    Abs Max diff: {abs_max_diff_sp_sc:.6e} | Abs Mean diff: {abs_mean_diff_sp_sc:.6e}")
+    print(f"    Rel Max diff: {rel_max_diff_sp_sc:.6e} | Rel Mean diff: {rel_mean_diff_sp_sc:.6e}")
+    
+    return rel_max_diff_sp, rel_mean_diff_sp, abs_max_diff_sp, abs_mean_diff_sp
 
 
 
@@ -173,45 +206,56 @@ def test_gradient_accuracy(
         'down_weight': down_weight_ref.grad.detach().clone(),
     }
     
-    # Test 2: Fused implementation with PyTorch gradients (CAST_USE_FUSED_GRAD_KERNEL=0)
-    print("  Testing fused forward + PyTorch gradients...")
-    os.environ["CAST_USE_FUSED_GRAD_KERNEL"] = "0"
+    # Test 2: Fused SortPack implementation gradients
+    print("  Testing fused SortPack gradients...")
+    x_fused_grad = x_base.detach().clone().requires_grad_(True)
+    gate_fused_grad = gate_base.detach().clone().requires_grad_(True)
+    up_weight_fused_grad = up_weight_base.detach().clone().requires_grad_(True)
+    down_weight_fused_grad = down_weight_base.detach().clone().requires_grad_(True)
     
-    # Ensure complete isolation - deep clone and explicitly zero gradients
-    x_pytorch_grad = x_base.detach().clone().requires_grad_(True)
-    gate_pytorch_grad = gate_base.detach().clone().requires_grad_(True)
-    up_weight_pytorch_grad = up_weight_base.detach().clone().requires_grad_(True)
-    down_weight_pytorch_grad = down_weight_base.detach().clone().requires_grad_(True)
+    fused_grad_output = cast_mlp_fused(x_fused_grad, gate_fused_grad, up_weight_fused_grad, down_weight_fused_grad)
+    fused_grad_loss = fused_grad_output.sum()
+    fused_grad_loss.backward()
     
-    # Explicitly zero gradients (though they should be None for new tensors)
-    if x_pytorch_grad.grad is not None:
-        x_pytorch_grad.grad.zero_()
-    if gate_pytorch_grad.grad is not None:
-        gate_pytorch_grad.grad.zero_()
-    if up_weight_pytorch_grad.grad is not None:
-        up_weight_pytorch_grad.grad.zero_()
-    if down_weight_pytorch_grad.grad is not None:
-        down_weight_pytorch_grad.grad.zero_()
-    
-    pytorch_grad_output = cast_mlp_fused(x_pytorch_grad, gate_pytorch_grad, up_weight_pytorch_grad, down_weight_pytorch_grad)
-    pytorch_grad_loss = pytorch_grad_output.sum()
-    pytorch_grad_loss.backward()
-    
-    # Store gradients immediately after backward to avoid contamination
-    pytorch_grads = {
-        'x': x_pytorch_grad.grad.detach().clone(),
-        'gate': gate_pytorch_grad.grad.detach().clone(), 
-        'up_weight': up_weight_pytorch_grad.grad.detach().clone(),
-        'down_weight': down_weight_pytorch_grad.grad.detach().clone(),
+    fused_grads = {
+        'x': x_fused_grad.grad.detach().clone(),
+        'gate': gate_fused_grad.grad.detach().clone(),
+        'up_weight': up_weight_fused_grad.grad.detach().clone(),
+        'down_weight': down_weight_fused_grad.grad.detach().clone(),
     }
     
-    # Clear computation graph and gradients before next test
-    del pytorch_grad_output, pytorch_grad_loss
-    x_pytorch_grad.grad = None
-    gate_pytorch_grad.grad = None  
-    up_weight_pytorch_grad.grad = None
-    down_weight_pytorch_grad.grad = None
-    torch.cuda.empty_cache()  # Clear CUDA memory
+    # Test 3: Fused Stream Compact implementation gradients  
+    print("  Testing fused Stream Compact gradients...")
+    x_sc_grad = x_base.detach().clone().requires_grad_(True)
+    gate_sc_grad = gate_base.detach().clone().requires_grad_(True)
+    up_weight_sc_grad = up_weight_base.detach().clone().requires_grad_(True)
+    down_weight_sc_grad = down_weight_base.detach().clone().requires_grad_(True)
+    
+    sc_grad_output = cast_mlp_fused_stream_compact(x_sc_grad, gate_sc_grad, up_weight_sc_grad, down_weight_sc_grad)
+    sc_grad_loss = sc_grad_output.sum()
+    sc_grad_loss.backward()
+    
+    sc_grads = {
+        'x': x_sc_grad.grad.detach().clone(),
+        'gate': gate_sc_grad.grad.detach().clone(),
+        'up_weight': up_weight_sc_grad.grad.detach().clone(),
+        'down_weight': down_weight_sc_grad.grad.detach().clone(),
+    }
+    
+    # Compare gradients
+    def compare_grads(name1, grads1, name2, grads2):
+        print(f"  {name1} vs {name2} gradients:")
+        for key in ['x', 'gate', 'up_weight', 'down_weight']:
+            diff = torch.abs(grads1[key] - grads2[key])
+            max_diff = torch.max(diff).item()
+            mean_diff = torch.mean(diff).item()
+            ref_max = torch.max(torch.abs(grads1[key])).item()
+            rel_max = max_diff / (ref_max + 1e-6)
+            print(f"    {key}: Max diff: {max_diff:.6e} | Rel Max: {rel_max:.6e}")
+    
+    compare_grads("Reference", ref_grads, "SortPack", fused_grads)
+    compare_grads("Reference", ref_grads, "StreamCompact", sc_grads)
+    compare_grads("SortPack", fused_grads, "StreamCompact", sc_grads)
     
     # Test 3: Fused implementation with fused gradients (CAST_USE_FUSED_GRAD_KERNEL=1)  
     print("  Testing fused forward + fused gradients...")

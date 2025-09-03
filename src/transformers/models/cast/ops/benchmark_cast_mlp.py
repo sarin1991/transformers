@@ -5,6 +5,7 @@ import torch
 #   cd src/transformers/models/cast/
 #   python -m ops.benchmark_cast_mlp
 from .cast_mlp_fused import cast_mlp_fused, _CastMLPFusedFunction
+from .cast_mlp_fused_stream_compact import cast_mlp_fused_stream_compact, _CastMLPFusedStreamCompactFunction
 from .debug_cast_mlp_fused import reference_cast_mlp_pytorch, _make_sparse_gate
 
 
@@ -84,7 +85,7 @@ def benchmark_cast_mlp(num_iters: int = 100, sparsity = "dynamic", dtype: torch.
         print(f"PyTorch reference: {ref_ms:.3f} ms")
 
         # ------------------------------------------------------------------
-        # Fused kernel timing
+        # Fused SortPack kernel timing
         # ------------------------------------------------------------------
         with torch.no_grad():
             for _ in range(5):
@@ -101,7 +102,28 @@ def benchmark_cast_mlp(num_iters: int = 100, sparsity = "dynamic", dtype: torch.
             fused_ms = t_start_fused.elapsed_time(t_end_fused) / num_iters
 
         speedup = ref_ms / fused_ms if fused_ms > 0.0 else float('inf')
-        print(f"Triton fused:     {fused_ms:.3f} ms | Speed-up: {speedup:.2f}×")
+        print(f"Triton fused (SortPack): {fused_ms:.3f} ms | Speed-up: {speedup:.2f}×")
+
+        # ------------------------------------------------------------------
+        # Fused Stream Compact kernel timing
+        # ------------------------------------------------------------------
+        with torch.no_grad():
+            for _ in range(5):
+                cast_mlp_fused_stream_compact(x, gate, up_weight, down_weight)
+            torch.cuda.synchronize()
+
+            t_start_fused_sc = torch.cuda.Event(enable_timing=True)
+            t_end_fused_sc = torch.cuda.Event(enable_timing=True)
+            t_start_fused_sc.record()
+            for _ in range(num_iters):
+                cast_mlp_fused_stream_compact(x, gate, up_weight, down_weight)
+            t_end_fused_sc.record()
+            torch.cuda.synchronize()
+            fused_sc_ms = t_start_fused_sc.elapsed_time(t_end_fused_sc) / num_iters
+
+        speedup_sc = ref_ms / fused_sc_ms if fused_sc_ms > 0.0 else float('inf')
+        sortpack_vs_sc = fused_ms / fused_sc_ms if fused_sc_ms > 0.0 else float('inf')
+        print(f"Triton fused (StreamCmpt): {fused_sc_ms:.3f} ms | Speed-up vs PyTorch: {speedup_sc:.2f}× | vs SortPack: {sortpack_vs_sc:.2f}×")
 
         # ------------------------------------------------------------------
         # Backward pass timing
@@ -132,6 +154,7 @@ def benchmark_cast_mlp(num_iters: int = 100, sparsity = "dynamic", dtype: torch.
 
         print(f"PyTorch reference: {ref_bwd_ms:.3f} ms")
 
+        # SortPack backward timing
         if measure_total_backward:
             # Triton fused backward - total autograd path (includes PyTorch overhead)
             fused_output = cast_mlp_fused(x_grad, gate_grad, up_weight_grad, down_weight_grad)
@@ -149,35 +172,17 @@ def benchmark_cast_mlp(num_iters: int = 100, sparsity = "dynamic", dtype: torch.
             torch.cuda.synchronize()
             fused_bwd_ms = t_start_fused_bwd.elapsed_time(t_end_fused_bwd) / num_iters
         else:
-            # Triton fused backward - direct kernel call (no PyTorch autograd overhead)
-            # Setup tensors and run forward pass to populate context
-            x_fused = x.clone().requires_grad_(True)
-            gate_fused = gate.clone().requires_grad_(True) 
-            up_weight_fused = up_weight.clone().requires_grad_(True)
-            down_weight_fused = down_weight.clone().requires_grad_(True)
-            
-            # Create mock context that mimics the real Function context
+            # Direct kernel backward
             class MockContext:
                 def __init__(self):
                     pass
-                    
                 def save_for_backward(self, *tensors):
                     self.saved_tensors = tensors
             
             ctx = MockContext()
-            
-            # Run actual forward pass to populate context with real intermediate tensors
-            fused_output = _CastMLPFusedFunction.forward(ctx, x_fused, gate_fused, up_weight_fused, down_weight_fused)
-            
-            # Context now contains:
-            # - saved_tensors: (x_flat, gate_flat, inter_flat, up_weight, down_weight, gate_vals, row_idx, block_counts, up_proj_flat)
-            # - ctx.NB, ctx.LS, ctx.max_rows (set by forward)
-            
-            # Create gradient output identical to fused_loss.sum() case
-            # fused_loss.sum().backward() creates a gradient with stride 0 (broadcasted)
+            fused_output = _CastMLPFusedFunction.forward(ctx, x_grad, gate_grad, up_weight_grad, down_weight_grad)
             grad_out = torch.tensor(1.0, device=fused_output.device, dtype=fused_output.dtype).expand_as(fused_output)
             
-            # Warm-up direct backward calls
             for _ in range(5):
                 _CastMLPFusedFunction.backward(ctx, grad_out)
             torch.cuda.synchronize()
@@ -193,15 +198,59 @@ def benchmark_cast_mlp(num_iters: int = 100, sparsity = "dynamic", dtype: torch.
 
         speedup_bwd = ref_bwd_ms / fused_bwd_ms if fused_bwd_ms > 0.0 else float('inf')
         kernel_type = "Total (autograd)" if measure_total_backward else "Direct kernel"
-        print(f"Triton fused ({kernel_type}): {fused_bwd_ms:.3f} ms | Speed-up: {speedup_bwd:.2f}×")
+        print(f"Triton fused SortPack ({kernel_type}): {fused_bwd_ms:.3f} ms | Speed-up: {speedup_bwd:.2f}×")
+
+        # Stream Compact backward timing
+        if measure_total_backward:
+            # Stream compact total autograd path
+            fused_sc_output = cast_mlp_fused_stream_compact(x_grad, gate_grad, up_weight_grad, down_weight_grad)
+            fused_sc_loss = fused_sc_output.sum()
+            for _ in range(5):
+                fused_sc_loss.backward(retain_graph=True)
+            torch.cuda.synchronize()
+
+            t_start_fused_sc_bwd = torch.cuda.Event(enable_timing=True)
+            t_end_fused_sc_bwd = torch.cuda.Event(enable_timing=True)
+            t_start_fused_sc_bwd.record()
+            for _ in range(num_iters):
+                fused_sc_loss.backward(retain_graph=True)
+            t_end_fused_sc_bwd.record()
+            torch.cuda.synchronize()
+            fused_sc_bwd_ms = t_start_fused_sc_bwd.elapsed_time(t_end_fused_sc_bwd) / num_iters
+        else:
+            # Direct kernel backward
+            ctx_sc = MockContext()
+            fused_sc_output = _CastMLPFusedStreamCompactFunction.forward(ctx_sc, x_grad, gate_grad, up_weight_grad, down_weight_grad)
+            grad_out_sc = torch.tensor(1.0, device=fused_sc_output.device, dtype=fused_sc_output.dtype).expand_as(fused_sc_output)
+            
+            for _ in range(5):
+                _CastMLPFusedStreamCompactFunction.backward(ctx_sc, grad_out_sc)
+            torch.cuda.synchronize()
+
+            t_start_fused_sc_bwd = torch.cuda.Event(enable_timing=True)
+            t_end_fused_sc_bwd = torch.cuda.Event(enable_timing=True)
+            t_start_fused_sc_bwd.record()
+            for _ in range(num_iters):
+                _CastMLPFusedStreamCompactFunction.backward(ctx_sc, grad_out_sc)
+            t_end_fused_sc_bwd.record()
+            torch.cuda.synchronize()
+            fused_sc_bwd_ms = t_start_fused_sc_bwd.elapsed_time(t_end_fused_sc_bwd) / num_iters
+
+        speedup_sc_bwd = ref_bwd_ms / fused_sc_bwd_ms if fused_sc_bwd_ms > 0.0 else float('inf')
+        sortpack_vs_sc_bwd = fused_bwd_ms / fused_sc_bwd_ms if fused_sc_bwd_ms > 0.0 else float('inf')
+        print(f"Triton fused StreamCmpt ({kernel_type}): {fused_sc_bwd_ms:.3f} ms | Speed-up vs PyTorch: {speedup_sc_bwd:.2f}× | vs SortPack: {sortpack_vs_sc_bwd:.2f}×")
 
         # Combined forward + backward
         total_ref = ref_ms + ref_bwd_ms
-        total_fused = fused_ms + fused_bwd_ms
-        total_speedup = total_ref / total_fused if total_fused > 0.0 else float('inf')
+        total_fused_sp = fused_ms + fused_bwd_ms
+        total_fused_sc = fused_sc_ms + fused_sc_bwd_ms
+        total_speedup_sp = total_ref / total_fused_sp if total_fused_sp > 0.0 else float('inf')
+        total_speedup_sc = total_ref / total_fused_sc if total_fused_sc > 0.0 else float('inf')
+        total_sp_vs_sc = total_fused_sp / total_fused_sc if total_fused_sc > 0.0 else float('inf')
         print(f"\nTotal (fwd + bwd):")
         print(f"PyTorch reference: {total_ref:.3f} ms")
-        print(f"Triton fused:     {total_fused:.3f} ms | Speed-up: {total_speedup:.2f}×")
+        print(f"Triton SortPack:   {total_fused_sp:.3f} ms | Speed-up: {total_speedup_sp:.2f}×")
+        print(f"Triton StreamCmpt: {total_fused_sc:.3f} ms | Speed-up vs PyTorch: {total_speedup_sc:.2f}× | vs SortPack: {total_sp_vs_sc:.2f}×")
 
 
 if __name__ == "__main__":
