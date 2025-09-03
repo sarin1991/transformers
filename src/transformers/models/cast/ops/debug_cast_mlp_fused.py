@@ -299,24 +299,24 @@ def test_gradient_accuracy(
     
     grad_diffs = {}
     
-    print("  PyTorch gradients vs Reference:")
+    print("  SortPack gradients vs Reference:")
     names = ['x', 'gate', 'up_weight', 'down_weight']
     
-    pytorch_diffs = {}
-    for name in names:
-        pytorch_diffs[name] = compare_grads(name, ref_grads[name], pytorch_grads[name])
-    grad_diffs['pytorch'] = pytorch_diffs
-    
-    print("  Fused gradients vs Reference:")
     fused_diffs = {}
     for name in names:
         fused_diffs[name] = compare_grads(name, ref_grads[name], fused_grads[name])
     grad_diffs['fused'] = fused_diffs
     
-    print("  Fused gradients vs PyTorch gradients:")
+    print("  StreamCompact gradients vs Reference:")
+    sc_diffs = {}
+    for name in names:
+        sc_diffs[name] = compare_grads(name, ref_grads[name], sc_grads[name])
+    grad_diffs['stream_compact'] = sc_diffs
+    
+    print("  SortPack vs StreamCompact gradients:")
     comparison_diffs = {}
     for name in names:
-        comparison_diffs[name] = compare_grads(name, pytorch_grads[name], fused_grads[name])
+        comparison_diffs[name] = compare_grads(name, fused_grads[name], sc_grads[name])
     grad_diffs['fused_vs_pytorch'] = comparison_diffs
     
     return grad_diffs
