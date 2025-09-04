@@ -39,7 +39,13 @@ def should_use_fused_kernel(BS, NB, device):
     usable_mem = int(shared_mem * 0.25)  # Very conservative for multiple copies
     max_elements = usable_mem // 20  # ~20 bytes per element in Stage 2
     
-    return total_elements <= max_elements
+    use_fused = total_elements <= max_elements
+    
+    print(f"  Threshold check: {BS}×{NB}={total_elements} elements vs {max_elements} limit")
+    print(f"  GPU mem: {shared_mem//1024}KB total, {usable_mem//1024}KB usable")
+    print(f"  Decision: {'✅ FUSED' if use_fused else '❌ FALLBACK'}")
+    
+    return use_fused
 
 @triton.jit
 def fused_stream_compact_index_kernel_stage1(
@@ -177,6 +183,8 @@ def create_stream_compact_index_fused(gate: torch.Tensor):
         max_rows_per_block,
         max_rows_ptr,
         total_act_idx_ptr,
+        BS=BS,
+        NB=NB,
     )
 
     max_rows = max_rows_ptr.item()
@@ -209,6 +217,9 @@ def create_stream_compact_index_fused(gate: torch.Tensor):
         nb_maxrows_to_bs,
         nb_maxrows_to_actidx,
         nb_maxrows_gate_vals,
+        BS=BS,
+        NB=NB,
+        max_rows=max_rows,
     )
     
     return {
