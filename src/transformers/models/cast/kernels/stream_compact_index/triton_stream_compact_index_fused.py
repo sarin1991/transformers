@@ -10,7 +10,13 @@ _gpu_shared_memory_cache = {}
 def get_gpu_shared_memory_size(device):
     """Query actual GPU shared memory size using CUDA driver"""
     # Convert to device index if tensor device passed
-    device_idx = device.index if hasattr(device, 'index') else device
+    if hasattr(device, 'index') and device.index is not None:
+        device_idx = device.index
+    elif isinstance(device, int):
+        device_idx = device
+    else:
+        # Default to current device
+        device_idx = torch.cuda.current_device()
     
     # Check cache first
     if device_idx in _gpu_shared_memory_cache:
