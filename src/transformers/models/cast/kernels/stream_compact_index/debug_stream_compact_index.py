@@ -1,5 +1,10 @@
 import torch
 from kernels.stream_compact_index.triton_stream_compact_index import create_stream_compact_index
+from kernels.stream_compact_index.triton_stream_compact_index_fused import (
+    create_stream_compact_index_fused, 
+    create_stream_compact_index_adaptive,
+    should_use_fused_kernel
+)
 
 
 def verify_mappings(gate: torch.Tensor, mappings: dict):
@@ -222,6 +227,167 @@ def test_edge_cases():
     verify_mappings(gate_single, mappings_single)
 
 
+def test_fused_correctness():
+    """Test that fused kernel produces same results as original"""
+    print("\n=== Fused Kernel Correctness Tests ===")
+    
+    test_cases = [
+        (1, 64),    # 1bs 1seq decoding case
+        (8, 32),    # Small batch
+        (16, 128),  # Medium case
+        (64, 64),   # Square case
+        (256, 256), # Large case (should fallback)
+    ]
+    
+    for BS, NB in test_cases:
+        print(f"\nTesting BS={BS}, NB={NB}")
+        
+        # Create test data
+        gate = torch.rand(BS, NB, device="cuda", dtype=torch.float32)
+        mask = torch.rand_like(gate) < 0.7  # 70% sparsity
+        gate[mask] = 0.0
+        
+        # Get results from different methods
+        results_orig = create_stream_compact_index(gate)
+        results_adaptive = create_stream_compact_index_adaptive(gate)
+        
+        # Check if this case should use fused kernel
+        uses_fused = should_use_fused_kernel(BS, NB, gate.device)
+        print(f"Uses fused kernel: {uses_fused}")
+        
+        if uses_fused:
+            # For small cases, test fused directly against original
+            results_fused = create_stream_compact_index_fused(gate)
+            
+            # Compare scalar values
+            for key in ['max_rows', 'total_act_idx']:
+                assert results_orig[key] == results_fused[key], f"FUSED {key} mismatch: orig={results_orig[key]}, fused={results_fused[key]}"
+            
+            # Compare mapping tensor shapes first
+            for key in ['nb_maxrows_to_bs', 'nb_maxrows_to_actidx', 'nb_maxrows_gate_vals']:
+                assert results_orig[key].shape == results_fused[key].shape, f"FUSED {key} shape mismatch: orig={results_orig[key].shape}, fused={results_fused[key].shape}"
+            
+            # Compare mapping tensor values (these should be identical)
+            for key in ['nb_maxrows_to_bs', 'nb_maxrows_to_actidx', 'nb_maxrows_gate_vals']:
+                if not torch.equal(results_orig[key], results_fused[key]):
+                    # Show some details for debugging
+                    diff_mask = results_orig[key] != results_fused[key]
+                    if diff_mask.any():
+                        print(f"  Differences found at {diff_mask.sum().item()} positions")
+                        # Show first few differences
+                        diff_indices = torch.nonzero(diff_mask)[:5]
+                        for idx in diff_indices:
+                            pos = tuple(idx.tolist())
+                            print(f"  At {pos}: orig={results_orig[key][pos].item()}, fused={results_fused[key][pos].item()}")
+                    assert False, f"FUSED {key} values mismatch"
+            
+            # Compare other tensor values
+            for key in ['max_rows_per_block', 'bs_counts', 'bs_start_indices']:
+                if not torch.equal(results_orig[key], results_fused[key]):
+                    print(f"  Original: {results_orig[key]}")
+                    print(f"  Fused: {results_fused[key]}")
+                    assert False, f"FUSED {key} values mismatch"
+            
+            print(f"✅ Fused kernel matches original")
+        
+        # Test adaptive (should match original regardless of which path it takes)
+        # Compare scalar values
+        for key in ['max_rows', 'total_act_idx']:
+            assert results_orig[key] == results_adaptive[key], f"ADAPTIVE {key} mismatch: orig={results_orig[key]}, adaptive={results_adaptive[key]}"
+        
+        # Compare mapping tensor shapes
+        for key in ['nb_maxrows_to_bs', 'nb_maxrows_to_actidx', 'nb_maxrows_gate_vals']:
+            assert results_orig[key].shape == results_adaptive[key].shape, f"ADAPTIVE {key} shape mismatch: orig={results_orig[key].shape}, adaptive={results_adaptive[key].shape}"
+        
+        # Compare mapping tensor values
+        for key in ['nb_maxrows_to_bs', 'nb_maxrows_to_actidx', 'nb_maxrows_gate_vals']:
+            if not torch.equal(results_orig[key], results_adaptive[key]):
+                # Show some details for debugging
+                diff_mask = results_orig[key] != results_adaptive[key]
+                if diff_mask.any():
+                    print(f"  Differences found at {diff_mask.sum().item()} positions")
+                    # Show first few differences
+                    diff_indices = torch.nonzero(diff_mask)[:5]
+                    for idx in diff_indices:
+                        pos = tuple(idx.tolist())
+                        print(f"  At {pos}: orig={results_orig[key][pos].item()}, adaptive={results_adaptive[key][pos].item()}")
+                assert False, f"ADAPTIVE {key} values mismatch"
+        
+        # Compare other tensor values
+        for key in ['max_rows_per_block', 'bs_counts', 'bs_start_indices']:
+            if not torch.equal(results_orig[key], results_adaptive[key]):
+                print(f"  Original: {results_orig[key]}")
+                print(f"  Adaptive: {results_adaptive[key]}")
+                assert False, f"ADAPTIVE {key} values mismatch"
+        
+        print(f"✅ Adaptive matches original (BS={BS}, NB={NB})")
+
+
+def test_fused_threshold_logic():
+    """Test that threshold logic works correctly"""
+    print("\n=== Fused Kernel Threshold Logic Tests ===")
+    
+    device = torch.device("cuda")
+    
+    # Print GPU info
+    from kernels.stream_compact_index.triton_stream_compact_index_fused import get_gpu_shared_memory_size
+    shared_mem = get_gpu_shared_memory_size(device)
+    usable_mem = int(shared_mem * 0.25)
+    max_elements = usable_mem // 20
+    print(f"GPU shared memory: {shared_mem//1024}KB")
+    print(f"Usable memory (25%): {usable_mem//1024}KB") 
+    print(f"Max elements for fused: {max_elements}")
+    
+    # Test cases that should use fused kernel
+    small_cases = [(1, 64), (8, 32), (16, 16), (32, 32)]
+    print(f"\nSmall cases (should use fused):")
+    for BS, NB in small_cases:
+        uses_fused = should_use_fused_kernel(BS, NB, device)
+        elements = BS * NB
+        print(f"  {BS}×{NB} ({elements} elements): {'✅ fused' if uses_fused else '❌ fallback'}")
+    
+    # Test cases that should fallback
+    large_cases = [(128, 128), (256, 256), (512, 64)]
+    print(f"\nLarge cases (should fallback):")
+    for BS, NB in large_cases:
+        uses_fused = should_use_fused_kernel(BS, NB, device)
+        elements = BS * NB
+        print(f"  {BS}×{NB} ({elements} elements): {'⚠️ fused' if uses_fused else '✅ fallback'}")
+
+
+def test_fused_edge_cases():
+    """Test edge cases for fused kernel"""
+    print("\n=== Fused Kernel Edge Case Tests ===")
+    
+    # Create edge cases
+    all_zeros = torch.zeros(4, 8, device="cuda", dtype=torch.float32)
+    all_ones = torch.ones(4, 8, device="cuda", dtype=torch.float32)
+    
+    single_element = torch.zeros(4, 8, device="cuda", dtype=torch.float32)
+    single_element[2, 3] = 1.0
+    
+    very_sparse = torch.rand(8, 16, device="cuda", dtype=torch.float32)
+    sparse_mask = torch.rand_like(very_sparse) < 0.95  # 95% zeros
+    very_sparse[sparse_mask] = 0.0
+    
+    edge_cases = [
+        ("All zeros", all_zeros),
+        ("All ones", all_ones),
+        ("Single element", single_element),
+        ("Very sparse", very_sparse),
+    ]
+    
+    for name, gate in edge_cases:
+        print(f"\n{name}: shape={gate.shape}, active={torch.sum(gate > 0).item()}")
+        
+        results_orig = create_stream_compact_index(gate)
+        results_adaptive = create_stream_compact_index_adaptive(gate)
+        
+        # Basic consistency check
+        assert results_orig['max_rows'] == results_adaptive['max_rows'], f"{name} - max_rows mismatch: orig={results_orig['max_rows']}, adaptive={results_adaptive['max_rows']}"
+        print(f"✅ {name} - max_rows consistent ({results_orig['max_rows']})")
+
+
 if __name__ == "__main__":
     """Run all debug tests"""
     
@@ -244,3 +410,10 @@ if __name__ == "__main__":
     test_edge_cases()
     
     print("\n✅ Stream compact index debug tests completed!")
+    
+    # Run fused kernel tests
+    test_fused_threshold_logic()
+    test_fused_correctness()
+    test_fused_edge_cases()
+    
+    print("\n🎉 All tests passed!")
