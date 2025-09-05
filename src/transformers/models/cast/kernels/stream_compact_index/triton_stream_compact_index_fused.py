@@ -52,12 +52,6 @@ def should_use_fused_kernel(BS, NB, device):
     
     use_fused = estimated_usage <= usable_mem
     
-    print(f"  Threshold check: {BS}×{NB} kernel")
-    print(f"  Estimated usage: {estimated_usage} bytes ({estimated_usage//1024}KB)")  
-    print(f"  GPU shared mem: {shared_mem} bytes ({shared_mem//1024}KB)")
-    print(f"  Usable (80%): {usable_mem} bytes ({usable_mem//1024}KB)")
-    print(f"  Decision: {'✅ FUSED' if use_fused else '❌ FALLBACK'}")
-    
     return use_fused
 
 @triton.jit
@@ -154,12 +148,13 @@ def fused_stream_compact_index_kernel_stage2(
     # Create mask for active elements
     is_active = gate_vals > 0  # (BS, NB)
     gate_vals = tl.where(gate_vals > 0, gate_vals, 0.0)
+    mask_int = is_active.to(tl.int32)
     
     # Cumsum along BS dimension (dim=0) for each NB column
-    cumsum_bs = tl.cumsum(is_active, axis=0)  # (BS, NB)
+    cumsum_bs = tl.cumsum(mask_int, axis=0)  # (BS, NB)
     
     # Cumsum along NB dimension (dim=1) for each BS row  
-    cumsum_nb = tl.cumsum(is_active, axis=1)  # (BS, NB)
+    cumsum_nb = tl.cumsum(mask_int, axis=1)  # (BS, NB)
 
     # Output offsets for (NB, max_rows) layout
     nb_max_row_output_offsets = nb_range[None, :] * max_rows + cumsum_bs - 1
@@ -170,7 +165,7 @@ def fused_stream_compact_index_kernel_stage2(
     # Store mappings only for active elements using mask
     tl.store(nb_maxrows_to_bs_ptr + nb_max_row_output_offsets, bs_range[:, None], mask=is_active)
     tl.store(nb_maxrows_to_actidx_ptr + nb_max_row_output_offsets, sequential_act_indices, mask=is_active)
-    tl.store(nb_maxrows_gate_vals_ptr + nb_max_row_output_offsets, gate_vals)
+    tl.store(nb_maxrows_gate_vals_ptr + nb_max_row_output_offsets, gate_vals, mask=is_active)
 
 def create_stream_compact_index_fused(gate: torch.Tensor):
     """

@@ -312,19 +312,32 @@ def test_fused_correctness():
         for key in ['nb_maxrows_to_bs', 'nb_maxrows_to_actidx', 'nb_maxrows_gate_vals']:
             assert results_orig[key].shape == results_adaptive[key].shape, f"ADAPTIVE {key} shape mismatch: orig={results_orig[key].shape}, adaptive={results_adaptive[key].shape}"
         
-        # Compare mapping tensor values
+        # Create mask for active positions only (where gate_vals > 0)
+        active_mask_adaptive = results_orig['nb_maxrows_gate_vals'] > 0
+        
+        # Compare mapping tensor values only for active positions
         for key in ['nb_maxrows_to_bs', 'nb_maxrows_to_actidx', 'nb_maxrows_gate_vals']:
-            if not torch.equal(results_orig[key], results_adaptive[key]):
+            orig_masked_adaptive = results_orig[key] * active_mask_adaptive.int()
+            adaptive_masked = results_adaptive[key] * active_mask_adaptive.int()
+            
+            if not torch.equal(orig_masked_adaptive, adaptive_masked):
                 # Show some details for debugging
-                diff_mask = results_orig[key] != results_adaptive[key]
+                diff_mask = orig_masked_adaptive != adaptive_masked
                 if diff_mask.any():
                     print(f"  Differences found at {diff_mask.sum().item()} positions")
-                    # Show first few differences
-                    diff_indices = torch.nonzero(diff_mask)[:5]
-                    for idx in diff_indices:
-                        pos = tuple(idx.tolist())
-                        print(f"  At {pos}: orig={results_orig[key][pos].item()}, adaptive={results_adaptive[key][pos].item()}")
-                assert False, f"ADAPTIVE {key} values mismatch"
+                    print(f"  Active elements: {active_mask_adaptive.sum().item()} out of {results_orig[key].numel()}")
+                    
+                    # For small tensors, print the whole thing
+                    if results_orig[key].numel() <= 100:
+                        print(f"  Original {key}:\n{orig_masked_adaptive}")
+                        print(f"  Adaptive {key}:\n{adaptive_masked}")
+                    else:
+                        # Show first few differences
+                        diff_indices = torch.nonzero(diff_mask)[:10]
+                        for idx in diff_indices:
+                            pos = tuple(idx.tolist())
+                            print(f"  At {pos}: orig={orig_masked_adaptive[pos].item()}, adaptive={adaptive_masked[pos].item()}")
+                assert False, f"ADAPTIVE {key} active values mismatch"
         
         # Compare other tensor values
         for key in ['max_rows_per_block', 'bs_counts', 'bs_start_indices']:
