@@ -114,6 +114,7 @@ def fused_up_proj_stream_compact_kernel(
     nb_maxrows_to_bs_ptr,           # (NB, max_rows) -> BS index
     nb_maxrows_to_actidx_ptr,       # (NB, max_rows) -> sequential act_idx
     nb_maxrows_gate_vals_ptr,       # (NB, max_rows) -> gate values
+    max_rows_per_block_ptr,         # (NB,) number of active rows per block
     
     # Output tensor
     output_ptr,                     # (act_idx, LS) dense output
@@ -199,6 +200,13 @@ def fused_up_proj_stream_compact_kernel(
     mask_ls   = offs_ls < line_size
     col_offset = block_idx * line_size
     global_cols = col_offset + offs_ls
+
+    # ------------------------------------------------------------------
+    # Early exit optimization - check if block has any active rows
+    # ------------------------------------------------------------------
+    blk_rows = tl.load(max_rows_per_block_ptr + block_idx)
+    if blk_rows == 0:
+        return
 
     # ------------------------------------------------------------------
     # Load index mappings for this tile
@@ -343,6 +351,7 @@ def fused_up_proj_gate_activation_sparse_triton_stream_compact(
     nb_maxrows_to_bs = mappings['nb_maxrows_to_bs']           # (NB, max_rows)
     nb_maxrows_to_actidx = mappings['nb_maxrows_to_actidx']   # (NB, max_rows) -> sequential act_idx
     nb_maxrows_gate_vals = mappings['nb_maxrows_gate_vals']   # (NB, max_rows)
+    max_rows_per_block = mappings['max_rows_per_block']       # (NB,) active rows per block
     max_rows = mappings['max_rows']
     total_act_idx = mappings['total_act_idx']
     
@@ -422,6 +431,7 @@ def fused_up_proj_gate_activation_sparse_triton_stream_compact(
         nb_maxrows_to_bs,
         nb_maxrows_to_actidx,
         nb_maxrows_gate_vals,
+        max_rows_per_block,
         
         # Output
         output,
