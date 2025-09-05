@@ -273,12 +273,19 @@ def test_fused_correctness():
                     # Show some details for debugging
                     diff_mask = results_orig[key] != results_fused[key]
                     if diff_mask.any():
-                        print(f"  Differences found at {diff_mask.sum().item()} positions")
-                        # Show first few differences
-                        diff_indices = torch.nonzero(diff_mask)[:5]
-                        for idx in diff_indices:
-                            pos = tuple(idx.tolist())
-                            print(f"  At {pos}: orig={results_orig[key][pos].item()}, fused={results_fused[key][pos].item()}")
+                        print(f"  Differences found at {diff_mask.sum().item()} positions in {key}")
+                        print(f"  Tensor shape: {results_orig[key].shape}")
+                        
+                        # For small tensors, print the whole thing
+                        if results_orig[key].numel() <= 100:
+                            print(f"  Original {key}:\n{results_orig[key]}")
+                            print(f"  Fused {key}:\n{results_fused[key]}")
+                        else:
+                            # Show first few differences
+                            diff_indices = torch.nonzero(diff_mask)[:10]
+                            for idx in diff_indices:
+                                pos = tuple(idx.tolist())
+                                print(f"  At {pos}: orig={results_orig[key][pos].item()}, fused={results_fused[key][pos].item()}")
                     assert False, f"FUSED {key} values mismatch"
             
             # Compare other tensor values
