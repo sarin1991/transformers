@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+from triton.runtime import driver
 from .triton_stream_compact_index import create_stream_compact_index
 
 
@@ -8,31 +9,25 @@ from .triton_stream_compact_index import create_stream_compact_index
 _gpu_shared_memory_cache = {}
 
 def get_gpu_shared_memory_size(device):
-    """Query actual GPU shared memory size using CUDA driver"""
-    # Convert to device index if tensor device passed
+    """Query actual GPU shared memory size using Triton driver"""
     if hasattr(device, 'index') and device.index is not None:
         device_idx = device.index
     elif isinstance(device, int):
         device_idx = device
     else:
-        # Default to current device
-        device_idx = torch.cuda.current_device()
+        # Fallback to Triton's active device
+        DEVICE = driver.active.get_active_torch_device()
+        device_idx = DEVICE.index
     
     # Check cache first
     if device_idx in _gpu_shared_memory_cache:
         return _gpu_shared_memory_cache[device_idx]
     
-    # Use Triton's CUDA driver to get actual device properties
-    import triton.runtime.driver as driver
-    if not (hasattr(driver, 'active') and hasattr(driver.active, 'utils')):
-        raise RuntimeError("Triton CUDA driver not available - cannot query actual shared memory size")
+    # Get device properties using Triton's standard approach
+    properties = driver.active.utils.get_device_properties(device_idx)
+    shared_mem = properties["max_shared_mem"]
     
-    # Get device properties from CUDA driver directly
-    props_dict = driver.active.utils.get_device_properties(device_idx)
-    if 'max_shared_memory_per_block' not in props_dict:
-        raise RuntimeError(f"Could not get max_shared_memory_per_block for device {device_idx}")
-    
-    shared_mem = props_dict['max_shared_memory_per_block']
+    # Cache the result
     _gpu_shared_memory_cache[device_idx] = shared_mem
     return shared_mem
 
@@ -41,26 +36,26 @@ def should_use_fused_kernel(BS, NB, device):
     Dynamic threshold check based on actual GPU shared memory and kernel requirements.
     
     Kernel memory usage analysis:
-    - bs_range: BS * 4 bytes (int32)  
-    - nb_range: NB * 4 bytes (int32)
-    - gate_vals: BS * NB * 4 bytes (float32, worst case all active)
-    - bs_start_indices: BS * 4 bytes (int32)
-    - Total: ~(BS * NB * 4) + (BS + NB) * 8 bytes
+    - gate_vals: BS * NB * 4 bytes (float32)
+    - cumsum_bs: BS * NB * 4 bytes (int32) 
+    - cumsum_nb: BS * NB * 4 bytes (int32)
+    - sequential_act_indices: BS * NB * 4 bytes (int32)
+    - Total: ~BS * NB * 20 bytes (with safety margin)
     
-    Uses 25% of available shared memory for safety margin.
+    Uses 80% of available shared memory for realistic usage.
     """
     shared_mem = get_gpu_shared_memory_size(device)
-    usable_mem = int(shared_mem * 0.25)  # 25% threshold, standard practice
+    usable_mem = int(shared_mem * 0.80)  # 80% threshold, realistic for Triton
     
     # Calculate actual memory requirements for this kernel
-    estimated_usage = (BS * NB * 4) + ((BS + NB) * 8)  # Main arrays + indexing
+    estimated_usage = BS * NB * 20  # 20 bytes per element with safety margin
     
     use_fused = estimated_usage <= usable_mem
     
     print(f"  Threshold check: {BS}×{NB} kernel")
     print(f"  Estimated usage: {estimated_usage} bytes ({estimated_usage//1024}KB)")  
     print(f"  GPU shared mem: {shared_mem} bytes ({shared_mem//1024}KB)")
-    print(f"  Usable (25%): {usable_mem} bytes ({usable_mem//1024}KB)")
+    print(f"  Usable (80%): {usable_mem} bytes ({usable_mem//1024}KB)")
     print(f"  Decision: {'✅ FUSED' if use_fused else '❌ FALLBACK'}")
     
     return use_fused
