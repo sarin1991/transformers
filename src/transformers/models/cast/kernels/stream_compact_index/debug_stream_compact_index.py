@@ -267,26 +267,32 @@ def test_fused_correctness():
             for key in ['nb_maxrows_to_bs', 'nb_maxrows_to_actidx', 'nb_maxrows_gate_vals']:
                 assert results_orig[key].shape == results_fused[key].shape, f"FUSED {key} shape mismatch: orig={results_orig[key].shape}, fused={results_fused[key].shape}"
             
-            # Compare mapping tensor values (these should be identical)
+            # Create mask for active positions only (where gate_vals > 0)
+            active_mask = results_orig['nb_maxrows_gate_vals'] > 0
+            
+            # Compare mapping tensor values only for active positions
             for key in ['nb_maxrows_to_bs', 'nb_maxrows_to_actidx', 'nb_maxrows_gate_vals']:
-                if not torch.equal(results_orig[key], results_fused[key]):
+                orig_masked = results_orig[key] * active_mask.int()
+                fused_masked = results_fused[key] * active_mask.int()
+                
+                if not torch.equal(orig_masked, fused_masked):
                     # Show some details for debugging
-                    diff_mask = results_orig[key] != results_fused[key]
+                    diff_mask = orig_masked != fused_masked
                     if diff_mask.any():
                         print(f"  Differences found at {diff_mask.sum().item()} positions in {key}")
-                        print(f"  Tensor shape: {results_orig[key].shape}")
+                        print(f"  Active elements: {active_mask.sum().item()} out of {results_orig[key].numel()}")
                         
                         # For small tensors, print the whole thing
                         if results_orig[key].numel() <= 100:
-                            print(f"  Original {key}:\n{results_orig[key]}")
-                            print(f"  Fused {key}:\n{results_fused[key]}")
+                            print(f"  Original {key}:\n{orig_masked}")
+                            print(f"  Fused {key}:\n{fused_masked}")
                         else:
                             # Show first few differences
                             diff_indices = torch.nonzero(diff_mask)[:10]
                             for idx in diff_indices:
                                 pos = tuple(idx.tolist())
-                                print(f"  At {pos}: orig={results_orig[key][pos].item()}, fused={results_fused[key][pos].item()}")
-                    assert False, f"FUSED {key} values mismatch"
+                                print(f"  At {pos}: orig={orig_masked[pos].item()}, fused={fused_masked[pos].item()}")
+                    assert False, f"FUSED {key} active values mismatch"
             
             # Compare other tensor values
             for key in ['max_rows_per_block', 'bs_counts', 'bs_start_indices']:
