@@ -14,7 +14,7 @@ from kernels.weight_grad.triton_cast_kernel_weight_grad_stream_compact import (
 )
 
 # Import stream compact index creation utility
-from kernels.stream_compact_index import create_stream_compact_index
+from kernels.stream_compact_index import create_stream_compact_index_adaptive
 
 
 __all__ = ["cast_mlp_fused_stream_compact"]
@@ -60,7 +60,7 @@ class _CastMLPFusedStreamCompactFunction(Function):
         gate_flat = gate.view(B * S, NB)
         
         # Create stream compact index mappings
-        mappings = create_stream_compact_index(gate_flat)
+        mappings = create_stream_compact_index_adaptive(gate_flat)
         max_rows = mappings['max_rows']
         
         # Short-circuit if all gate values are zero/negative (max_rows == 0)
