@@ -56,7 +56,9 @@ class CastMLP(nn.Module):
         l2_gate = F.relu(self.l2_gate_proj(x))
         intermediate = self.gate_activation(up_proj,l2_gate,self.l2_num_blocks,self.l2_line_size)
         down_proj = self.down_proj(intermediate)
-        return down_proj, l2_gate
+        l2_act_ratio = (l2_gate>0).mean(dtype = torch.float32)
+        l2_reg_loss = l2_gate.sum()
+        return down_proj, l2_gate, l2_act_ratio, l2_reg_loss
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
@@ -260,10 +262,10 @@ class CastDecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states, l2_gate = self.mlp(hidden_states)
+        hidden_states, l2_gate, l2_act_ratio, l2_reg_loss = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states, l2_gate)
+        outputs = (hidden_states, l2_gate, l2_act_ratio, l2_reg_loss)
         if output_attentions:
             outputs += (self_attn_weights,)
 
@@ -454,10 +456,8 @@ class CastModel(CastPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
 
-        l1_act_ratio = torch.zeros(inputs_embeds.shape[0], device=inputs_embeds.device)
-        l1_reg_loss = torch.zeros(inputs_embeds.shape[0], device=inputs_embeds.device)
-        l2_act_ratio = torch.zeros(inputs_embeds.shape[0], device=inputs_embeds.device)
-        l2_reg_loss = torch.zeros(inputs_embeds.shape[0], device=inputs_embeds.device)
+        l2_act_ratio = torch.tensor(0.0, device=inputs_embeds.device)
+        l2_reg_loss = torch.tensor(0.0, device=inputs_embeds.device)
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -489,8 +489,8 @@ class CastModel(CastPreTrainedModel):
 
             hidden_states = layer_outputs[0]
             l2_gate = layer_outputs[1]
-            l2_act_ratio += (1.0/self.config.num_hidden_layers)*(l2_gate>0).float().mean(dim = tuple(torch.arange(1,len(l2_gate.shape))))
-            l2_reg_loss +=  l2_gate.sum(dim = tuple(torch.arange(1,len(l2_gate.shape))))
+            l2_act_ratio += (1.0/self.config.num_hidden_layers) * layer_outputs[2]
+            l2_reg_loss += layer_outputs[3]
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
@@ -674,8 +674,6 @@ class CastCausalLMOutputWithPast(ModelOutput):
     past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
     attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
-    l1_act_ratio: torch.FloatTensor = None
-    l1_reg_loss: Optional[torch.FloatTensor] = None
     l2_act_ratio: torch.FloatTensor = None
     l2_reg_loss: Optional[torch.FloatTensor] = None
 
@@ -750,8 +748,6 @@ class CastForCausalLM(CastPreTrainedModel, GenerationMixin):
         )
 
         hidden_states = outputs.last_hidden_state
-        l1_act_ratio=outputs.l1_act_ratio
-        l1_reg_loss=outputs.l1_reg_loss
         l2_act_ratio=outputs.l2_act_ratio
         l2_reg_loss=outputs.l2_reg_loss
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
@@ -772,8 +768,6 @@ class CastForCausalLM(CastPreTrainedModel, GenerationMixin):
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            l1_act_ratio=l1_act_ratio,
-            l1_reg_loss=l1_reg_loss,
             l2_act_ratio=l2_act_ratio,
             l2_reg_loss=l2_reg_loss,
         )
