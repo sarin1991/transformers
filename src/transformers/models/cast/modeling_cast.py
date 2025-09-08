@@ -44,21 +44,28 @@ class CastMLP(nn.Module):
         self.l2_gate_proj = nn.Linear(self.hidden_size, self.l2_num_blocks, bias=True)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-
-    def gate_activation(self,x,g,num_blocks,line_size):
-            x = rearrange(x, 'b l (nb ls) -> b l nb ls',nb=num_blocks,ls=line_size)
-            x = einsum(x, g,'b l nb ls, b l nb -> b l nb ls')
-            x = rearrange(x, 'b l nb ls -> b l (nb ls)')
-            return x
+        
+        # Get the operation function based on configuration
+        from .mlp_ops import get_mlp_op
+        self._mlp_op = get_mlp_op(config.mlp_implementation)
 
     def forward(self, x):
-        up_proj = F.relu(self.up_proj(x))
-        l2_gate = F.relu(self.l2_gate_proj(x))
-        intermediate = self.gate_activation(up_proj,l2_gate,self.l2_num_blocks,self.l2_line_size)
-        down_proj = self.down_proj(intermediate)
-        l2_act_ratio = (l2_gate>0).mean(dtype = torch.float32)
-        l2_reg_loss = l2_gate.sum()
-        return down_proj, l2_gate, l2_act_ratio, l2_reg_loss
+        return self._mlp_op(
+            x,
+            self.l2_gate_proj,
+            self.up_proj, 
+            self.down_proj,
+            self.l2_num_blocks,
+            self.l2_line_size,
+        )
+    
+    def gate_activation(self, x, g, num_blocks, line_size):
+        """Keep for backward compatibility"""
+        from einops import rearrange, einsum
+        x = rearrange(x, 'b l (nb ls) -> b l nb ls', nb=num_blocks, ls=line_size)
+        x = einsum(x, g, 'b l nb ls, b l nb -> b l nb ls')
+        x = rearrange(x, 'b l nb ls -> b l (nb ls)')
+        return x
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
