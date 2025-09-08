@@ -47,6 +47,7 @@ class CastConfig(PretrainedConfig):
         rope_theta=10000.0,
         sliding_window=4096,
         attention_dropout=0.0,
+        mlp_implementation="pytorch",
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -71,6 +72,7 @@ class CastConfig(PretrainedConfig):
         self.use_cache = use_cache
         self.rope_theta = rope_theta
         self.attention_dropout = attention_dropout
+        self.mlp_implementation = mlp_implementation
 
         super().__init__(
             pad_token_id=pad_token_id,
