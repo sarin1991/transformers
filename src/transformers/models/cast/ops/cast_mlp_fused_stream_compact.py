@@ -20,6 +20,16 @@ from kernels.stream_compact_index import create_stream_compact_index_adaptive
 __all__ = ["cast_mlp_fused_stream_compact"]
 
 
+def _maybe_autocast(x, up_weight, down_weight):
+    """Cast x and weights if autocast is enabled with fp16/bf16"""
+    device_type = x.device.type
+    if torch.is_autocast_enabled(device_type):
+        target_dtype = torch.get_autocast_dtype(device_type)
+        if target_dtype in (torch.float16, torch.bfloat16):
+            return x.to(target_dtype), up_weight.to(target_dtype), down_weight.to(target_dtype), target_dtype
+    return x, up_weight, down_weight, None
+
+
 class _CastMLPFusedStreamCompactFunction(Function):
     """Fuses sparse up-projection → gate → sparse down-projection using stream compact kernels.
 
@@ -32,6 +42,10 @@ class _CastMLPFusedStreamCompactFunction(Function):
 
     @staticmethod
     def forward(ctx, x: torch.Tensor, gate: torch.Tensor, up_weight: torch.Tensor, down_weight: torch.Tensor):
+        # Handle autocast
+        x, up_weight, down_weight, autocast_dtype = _maybe_autocast(x, up_weight, down_weight)
+        ctx.autocast_dtype = autocast_dtype
+        
         # ----- basic shapes -----
         assert x.ndim == 3 and gate.ndim == 3, "x and gate must be 3-D (B,S,...) tensors"
         B, S, H = x.shape
@@ -126,6 +140,11 @@ class _CastMLPFusedStreamCompactFunction(Function):
         x_flat, gate_flat, inter_sparse, up_weight, down_weight, up_proj_sparse = ctx.saved_tensors
         NB, LS, max_rows = ctx.NB, ctx.LS, ctx.max_rows
         mappings = ctx.mappings
+        autocast_dtype = ctx.autocast_dtype
+        
+        # Cast grad_out if autocast was used
+        if autocast_dtype is not None:
+            grad_out = grad_out.to(autocast_dtype)
         
         # Short-circuit if max_rows == 0 (all gate values were zero/negative)
         if max_rows == 0:
@@ -158,6 +177,7 @@ class _CastMLPFusedStreamCompactFunction(Function):
             NB,
             LS,
             mappings=mappings,
+            out_dtype=torch.float32,
         )  # (I, H)
 
         # ---------------- grad_inter_sparse = grad_out · W_downᵀ + grad w.r.t. gate/up_proj ----------------
@@ -193,6 +213,7 @@ class _CastMLPFusedStreamCompactFunction(Function):
             NB,
             LS,
             mappings=mappings,
+            out_dtype=torch.float32,
         )
         grad_up_w = grad_up_w_T.t()
 

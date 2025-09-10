@@ -19,6 +19,16 @@ from kernels.weight_grad.triton_cast_kernel_gate_sortpack import (
 __all__ = ["cast_mlp_fused"]
 
 
+def _maybe_autocast(x, up_weight, down_weight):
+    """Cast x and weights if autocast is enabled with fp16/bf16"""
+    device_type = x.device.type
+    if torch.is_autocast_enabled(device_type):
+        target_dtype = torch.get_autocast_dtype(device_type)
+        if target_dtype in (torch.float16, torch.bfloat16):
+            return x.to(target_dtype), up_weight.to(target_dtype), down_weight.to(target_dtype), target_dtype
+    return x, up_weight, down_weight, None
+
+
 def _preprocess_gate_data(gate: torch.Tensor):
     """Preprocess gate data once to avoid redundant sorting in multiple kernel calls.
     
@@ -59,6 +69,10 @@ class _CastMLPFusedFunction(Function):
 
     @staticmethod
     def forward(ctx, x: torch.Tensor, gate: torch.Tensor, up_weight: torch.Tensor, down_weight: torch.Tensor, kernel: str = "sortpack"):
+        # Handle autocast
+        x, up_weight, down_weight, autocast_dtype = _maybe_autocast(x, up_weight, down_weight)
+        ctx.autocast_dtype = autocast_dtype
+        
         # ----- basic shapes -----
         assert x.ndim == 3 and gate.ndim == 3, "x and gate must be 3-D (B,S,...) tensors"
         B, S, H = x.shape
@@ -160,6 +174,11 @@ class _CastMLPFusedFunction(Function):
     def backward(ctx, grad_out: torch.Tensor):
         x_flat, gate_flat, inter_flat, up_weight, down_weight, gate_vals, row_idx, block_counts, up_proj_flat = ctx.saved_tensors
         NB, LS, max_rows = ctx.NB, ctx.LS, ctx.max_rows
+        autocast_dtype = ctx.autocast_dtype
+        
+        # Cast grad_out if autocast was used
+        if autocast_dtype is not None:
+            grad_out = grad_out.to(autocast_dtype)
         
         # Short-circuit if max_rows == 0 (all gate values were zero/negative)
         if max_rows == 0:
@@ -194,6 +213,7 @@ class _CastMLPFusedFunction(Function):
             gate_flat,
             NB,
             LS,
+            out_dtype=torch.float32,
             gate_vals=gate_vals,
             row_idx=row_idx,
             block_counts=block_counts,
@@ -267,6 +287,7 @@ class _CastMLPFusedFunction(Function):
             gate_flat,
             NB,
             LS,
+            out_dtype=torch.float32,
             gate_vals=gate_vals,
             row_idx=row_idx,
             block_counts=block_counts,
