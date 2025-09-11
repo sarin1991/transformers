@@ -37,9 +37,9 @@ def triton_sortpack_mlp_op(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Triton sort-pack optimized MLP implementation"""
     try:
-        from .ops.cast_mlp_fused import cast_mlp_fused
+        from cast_kernels import cast_mlp_fused
     except ImportError:
-        raise ImportError("Triton sort-pack kernels not available. Install triton or use pytorch implementation.")
+        raise ImportError("cast-kernels package not available. Install with: pip install cast-kernels")
     
     l2_gate = F.relu(l2_gate_proj(x))  # Apply ReLU for auxiliary losses
     
@@ -66,9 +66,9 @@ def triton_stream_compact_mlp_op(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Triton stream compact optimized MLP implementation"""
     try:
-        from .ops.cast_mlp_fused_stream_compact import cast_mlp_fused_stream_compact
+        from cast_kernels import cast_mlp_fused_stream_compact
     except ImportError:
-        raise ImportError("Triton stream compact kernels not available. Install triton or use pytorch implementation.")
+        raise ImportError("cast-kernels package not available. Install with: pip install cast-kernels")
     
     l2_gate = F.relu(l2_gate_proj(x))  # Apply ReLU for auxiliary losses
     
