@@ -41,7 +41,7 @@ def triton_sortpack_mlp_op(
     except ImportError:
         raise ImportError("cast-kernels package not available. Install with: pip install cast-kernels")
     
-    l2_gate = F.relu(l2_gate_proj(x))  # Apply ReLU for auxiliary losses
+    l2_gate = F.relu(l2_gate_proj(x)).to(torch.float32)  # Apply ReLU for auxiliary losses
     
     # Use optimized fused kernel with TRANSPOSED weights from Linear layers
     # nn.Linear weights are (out_features, in_features), but kernels expect (in_features, out_features)
@@ -70,7 +70,7 @@ def triton_stream_compact_mlp_op(
     except ImportError:
         raise ImportError("cast-kernels package not available. Install with: pip install cast-kernels")
     
-    l2_gate = F.relu(l2_gate_proj(x))  # Apply ReLU for auxiliary losses
+    l2_gate = F.relu(l2_gate_proj(x)).to(torch.float32)  # Apply ReLU for auxiliary losses
     
     # Use optimized stream compact kernel with TRANSPOSED weights from Linear layers
     # nn.Linear weights are (out_features, in_features), but kernels expect (in_features, out_features)
