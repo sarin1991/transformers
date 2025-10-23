@@ -41,27 +41,40 @@ class CastMLP(nn.Module):
         self.intermediate_size = config.intermediate_size
         self.l2_line_size = config.l2_line_size
         self.l2_num_blocks = self.intermediate_size//self.l2_line_size
-        self.l2_gate_proj = nn.Linear(self.hidden_size, self.l2_num_blocks, bias=True)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+
+        # First layer projections
+        self.l2_gate_proj1 = nn.Linear(self.hidden_size, self.l2_num_blocks, bias=True)
+        self.h1_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+
+        # Second layer projections
+        self.l2_gate_proj2 = nn.Linear(self.intermediate_size, self.l2_num_blocks, bias=True)
+        self.h2_proj = nn.Linear(self.intermediate_size, self.intermediate_size, bias=False)
+
+        # Final projection
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        
-        # Get the operation function based on configuration
-        from .mlp_ops import get_mlp_op
-        self._mlp_op = get_mlp_op(config.mlp_implementation)
 
     def forward(self, x):
-        return self._mlp_op(
-            x,
-            self.l2_gate_proj,
-            self.up_proj, 
-            self.down_proj,
-            self.l2_num_blocks,
-            self.l2_line_size,
-        )
-    
+        # First layer: x -> h1_proj -> ReLU -> gate with g1 -> h1
+        intermediate = F.relu(self.h1_proj(x))
+        g1 = F.relu(self.l2_gate_proj1(x))
+        h1 = self.gate_activation(intermediate, g1, self.l2_num_blocks, self.l2_line_size)
+
+        # Second layer: h1 -> h2_proj -> ReLU -> gate with g2 -> h2
+        intermediate = F.relu(self.h2_proj(h1))
+        g2 = F.relu(self.l2_gate_proj2(h1))
+        h2 = self.gate_activation(intermediate, g2, self.l2_num_blocks, self.l2_line_size)
+
+        # Final layer: h2 -> down_proj -> output
+        output = self.down_proj(h2)
+
+        # Compute auxiliary losses
+        l2_act_ratio = ((g1 > 0).mean(dtype=torch.float32) + (g2 > 0).mean(dtype=torch.float32)) / 2
+        l2_reg_loss = g1.sum() + g2.sum()
+
+        return output, l2_act_ratio, l2_reg_loss
+
     def gate_activation(self, x, g, num_blocks, line_size):
-        """Keep for backward compatibility"""
-        from einops import rearrange, einsum
+        """Gate activation using einops for block-wise gating"""
         x = rearrange(x, 'b l (nb ls) -> b l nb ls', nb=num_blocks, ls=line_size)
         x = einsum(x, g, 'b l nb ls, b l nb -> b l nb ls')
         x = rearrange(x, 'b l nb ls -> b l (nb ls)')
@@ -269,10 +282,10 @@ class CastDecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states, l2_gate, l2_act_ratio, l2_reg_loss = self.mlp(hidden_states)
+        hidden_states, l2_act_ratio, l2_reg_loss = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states, l2_gate, l2_act_ratio, l2_reg_loss)
+        outputs = (hidden_states, l2_act_ratio, l2_reg_loss)
         if output_attentions:
             outputs += (self_attn_weights,)
 
@@ -495,12 +508,11 @@ class CastModel(CastPreTrainedModel):
                 )
 
             hidden_states = layer_outputs[0]
-            l2_gate = layer_outputs[1]
-            l2_act_ratio += (1.0/self.config.num_hidden_layers) * layer_outputs[2]
-            l2_reg_loss += layer_outputs[3]
+            l2_act_ratio += (1.0/self.config.num_hidden_layers) * layer_outputs[1]
+            l2_reg_loss += layer_outputs[2]
 
             if output_attentions:
-                all_self_attns += (layer_outputs[1],)
+                all_self_attns += (layer_outputs[3],)
 
         hidden_states = self.norm(hidden_states)
 
