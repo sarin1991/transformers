@@ -57,7 +57,7 @@ class CastMLP(nn.Module):
         # First layer: x -> h1_proj -> ReLU -> gate with g1 -> h1
         intermediate = F.relu(self.h1_proj(x))
         g1_proj = self.l2_gate_proj1(x)
-        g1 = F.relu(g1_proj - g1_proj.mean(dim=2))
+        g1 = F.relu(g1_proj - g1_proj.mean(dim=2,keepdim=True))
         h1 = self.gate_activation(intermediate, g1, self.l2_num_blocks, self.l2_line_size)
 
         # Second layer: h1 -> h2_proj -> ReLU -> gate with g2 -> h2
