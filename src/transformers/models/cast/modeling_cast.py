@@ -11,8 +11,6 @@ from ...generation import GenerationMixin
 from ...modeling_attn_mask_utils import AttentionMaskConverter
 from ...modeling_flash_attention_utils import FlashAttentionKwargs
 from ...modeling_outputs import (
-    BaseModelOutputWithPast,
-    CausalLMOutputWithPast,
     QuestionAnsweringModelOutput,
     SequenceClassifierOutputWithPast,
     TokenClassifierOutput,
@@ -27,45 +25,11 @@ from ...utils import (
 )
 from ...utils.deprecation import deprecate_kwarg
 from .configuration_cast import CastConfig
-from einops import rearrange, einsum
+from .cast_mlp import get_mlp_class
 
 
 logger = logging.get_logger(__name__)
 
-
-class CastMLP(nn.Module):
-    def __init__(self, config: CastConfig):
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.l2_line_size = config.l2_line_size
-        self.l2_num_blocks = self.intermediate_size//self.l2_line_size
-        self.l2_gate_proj = nn.Linear(self.hidden_size, self.l2_num_blocks, bias=True)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        
-        # Get the operation function based on configuration
-        from .mlp_ops import get_mlp_op
-        self._mlp_op = get_mlp_op(config.mlp_implementation)
-
-    def forward(self, x):
-        return self._mlp_op(
-            x,
-            self.l2_gate_proj,
-            self.up_proj, 
-            self.down_proj,
-            self.l2_num_blocks,
-            self.l2_line_size,
-        )
-    
-    def gate_activation(self, x, g, num_blocks, line_size):
-        """Keep for backward compatibility"""
-        from einops import rearrange, einsum
-        x = rearrange(x, 'b l (nb ls) -> b l nb ls', nb=num_blocks, ls=line_size)
-        x = einsum(x, g, 'b l nb ls, b l nb -> b l nb ls')
-        x = rearrange(x, 'b l nb ls -> b l (nb ls)')
-        return x
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
@@ -232,7 +196,8 @@ class CastDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = CastAttention(config=config, layer_idx=layer_idx)
-        self.mlp = CastMLP(config)
+        mlp_class = get_mlp_class(config)
+        self.mlp = mlp_class(config)
         self.input_layernorm = CastRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = CastRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
