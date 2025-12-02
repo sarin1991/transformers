@@ -105,10 +105,11 @@ class CastMLPTritonStreamCompact(nn.Module):
         num_samples = math.ceil(l2_act_ratio * batch_seq_size * num_blocks)
         num_chunks = math.ceil(num_samples / MAX_NUM_SAMPLES)
         chunk_size = math.ceil(batch_size / num_chunks)
+        num_chunks_bs = math.ceil(batch_size / chunk_size)
 
         if num_chunks > 1:
             down_proj_out_list = []
-            for i in range(num_chunks):
+            for i in range(num_chunks_bs):
                 start_idx = i * chunk_size
                 end_idx = min(start_idx + chunk_size, batch_size)
                 x_chunk = x[start_idx:end_idx]
