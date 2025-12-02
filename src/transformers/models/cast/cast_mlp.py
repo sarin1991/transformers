@@ -2,9 +2,12 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from einops import rearrange, einsum
-
+import os
+import math
 from .configuration_cast import CastConfig
 
+
+MAX_NUM_SAMPLES = int(os.getenv("CAST_MLP_MAX_NUMBER_SAMPLES", 32768))
 
 class CastMLPPyTorch(nn.Module):
     """Standard PyTorch MLP implementation with einops-based gate activation"""
@@ -94,17 +97,33 @@ class CastMLPTritonStreamCompact(nn.Module):
             raise ImportError("cast-kernels package not available. Install with: pip install cast-kernels")
         
         l2_gate = F.relu(self.l2_gate_proj(x)).to(torch.float32)  # Apply ReLU for auxiliary losses
-        
-        # Use optimized stream compact kernel with TRANSPOSED weights from Linear layers
-        # nn.Linear weights are (out_features, in_features), but kernels expect (in_features, out_features)
-        down_proj_out = cast_mlp_fused_stream_compact(
-            x, l2_gate, 
-            self.up_proj.weight.t(),    # Transpose: (intermediate, hidden) -> (hidden, intermediate)
-            self.down_proj.weight.t()   # Transpose: (hidden, intermediate) -> (intermediate, hidden)
-        )
-        
         l2_act_ratio = (l2_gate > 0).mean(dtype=torch.float32)
         l2_reg_loss = l2_gate.sum()
+        batch_seq_size = math.product(l2_gate.shape[:-1])
+        num_samples = math.ceil(l2_act_ratio * batch_seq_size)
+        num_chunks = math.ceil(num_samples / MAX_NUM_SAMPLES)
+        chunk_size = math.ceil(batch_seq_size / num_chunks)
+
+        if num_chunks > 1:
+            down_proj_out_list = []
+            for i in range(num_chunks):
+                start_idx = i * chunk_size
+                end_idx = min(start_idx + chunk_size, batch_seq_size)
+                x_chunk = x[start_idx:end_idx]
+                l2_gate_chunk = l2_gate[start_idx:end_idx]
+                down_proj_out_chunk = cast_mlp_fused_stream_compact(
+                    x_chunk, l2_gate_chunk, 
+                    self.up_proj.weight.t(),    # Transpose: (intermediate, hidden) -> (hidden, intermediate)
+                    self.down_proj.weight.t()   # Transpose: (hidden, intermediate) -> (intermediate, hidden)
+                )
+                down_proj_out_list.append(down_proj_out_chunk)
+            down_proj_out = torch.cat(down_proj_out_list, dim=0)
+        else:
+            down_proj_out = cast_mlp_fused_stream_compact(
+                x, l2_gate, 
+                self.up_proj.weight.t(),    # Transpose: (intermediate, hidden) -> (hidden, intermediate)
+                self.down_proj.weight.t()   # Transpose: (hidden, intermediate) -> (intermediate, hidden)
+            )
         return down_proj_out, l2_gate, l2_act_ratio, l2_reg_loss
 
 
