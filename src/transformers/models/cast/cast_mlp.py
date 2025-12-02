@@ -99,7 +99,7 @@ class CastMLPTritonStreamCompact(nn.Module):
         l2_gate = F.relu(self.l2_gate_proj(x)).to(torch.float32)  # Apply ReLU for auxiliary losses
         l2_act_ratio = (l2_gate > 0).mean(dtype=torch.float32)
         l2_reg_loss = l2_gate.sum()
-        batch_seq_size = math.product(l2_gate.shape[:-1])
+        batch_seq_size = math.prod(l2_gate.shape[:-1])
         num_samples = math.ceil(l2_act_ratio * batch_seq_size)
         num_chunks = math.ceil(num_samples / MAX_NUM_SAMPLES)
         chunk_size = math.ceil(batch_seq_size / num_chunks)
