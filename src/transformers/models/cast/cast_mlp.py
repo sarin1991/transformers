@@ -100,16 +100,17 @@ class CastMLPTritonStreamCompact(nn.Module):
         l2_act_ratio = (l2_gate > 0).mean(dtype=torch.float32)
         l2_reg_loss = l2_gate.sum()
         batch_seq_size = math.prod(l2_gate.shape[:-1])
+        batch_size = l2_gate.shape[0]
         num_blocks = l2_gate.shape[-1]
         num_samples = math.ceil(l2_act_ratio * batch_seq_size * num_blocks)
         num_chunks = math.ceil(num_samples / MAX_NUM_SAMPLES)
-        chunk_size = math.ceil(batch_seq_size / num_chunks)
+        chunk_size = math.ceil(batch_size / num_chunks)
 
         if num_chunks > 1:
             down_proj_out_list = []
             for i in range(num_chunks):
                 start_idx = i * chunk_size
-                end_idx = min(start_idx + chunk_size, batch_seq_size)
+                end_idx = min(start_idx + chunk_size, batch_size)
                 x_chunk = x[start_idx:end_idx]
                 l2_gate_chunk = l2_gate[start_idx:end_idx]
                 down_proj_out_chunk = cast_mlp_fused_stream_compact(
