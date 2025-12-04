@@ -126,18 +126,16 @@ class CastMLPTritonStreamCompact(nn.Module):
         batch_size = l2_gate.shape[0]
         num_blocks = l2_gate.shape[-1]
         max_intermediate_rows = math.ceil(l2_act_ratio * batch_seq_size * num_blocks)
-        num_chunks = math.ceil(max_intermediate_rows / MAX_NUM_SAMPLES)
-        chunk_size_bs = math.ceil(batch_seq_size / num_chunks)
-        num_chunks_bs = math.ceil(batch_seq_size / chunk_size_bs)
-
-        if num_chunks_bs > 1:
-            rows_to_allocate = calc_rows_to_allocate(MAX_NUM_SAMPLES)
+        if max_intermediate_rows > MAX_NUM_SAMPLES:
+            chunk_size = math.ceil(MAX_NUM_SAMPLES / num_blocks)
+            rows_to_allocate = calc_rows_to_allocate(chunk_size * num_blocks)
+            num_chunks = math.ceil(batch_seq_size / chunk_size)
             down_proj_out_list = []
             l2_gate_flat = l2_gate.view(batch_seq_size,1, -1)
             x_flat = x.view(batch_seq_size,1, -1)
-            for i in range(num_chunks_bs):
-                start_idx = i * chunk_size_bs
-                end_idx = min(start_idx + chunk_size_bs, batch_seq_size)
+            for i in range(num_chunks):
+                start_idx = i * chunk_size
+                end_idx = min(start_idx + chunk_size, batch_seq_size)
                 x_chunk = x_flat[start_idx:end_idx]
                 l2_gate_chunk = l2_gate_flat[start_idx:end_idx]
                 down_proj_out_chunk = cast_mlp_fused_stream_compact(
