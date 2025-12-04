@@ -10,7 +10,7 @@ import threading
 GLOBAL_LOCK = threading.Lock()
 
 
-MAX_NUM_SAMPLES = int(os.getenv("CAST_MLP_MAX_NUMBER_SAMPLES", 32768))
+MAX_NUM_SAMPLES = int(os.getenv("CAST_MLP_MAX_NUMBER_SAMPLES", 262144))
 
 SHRINK_WINDOW = 1000  # Number of steps to look back for usage
 SHRINK_FACTOR = 0.7  # When to consider shrinking, e.g., consistently using less than 70% of alloc'd
