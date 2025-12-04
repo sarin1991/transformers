@@ -4,7 +4,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from dataclasses import dataclass
-from liger_kernel.transformers import LigerRMSNorm, liger_rotary_pos_emb
+from liger_kernel.transformers import LigerRMSNorm, liger_rotary_pos_emb, LigerCrossEntropyLoss, LigerFusedLinearCrossEntropyLoss
 
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache, SlidingWindowCache, StaticCache
@@ -665,6 +665,10 @@ class CastForCausalLM(CastPreTrainedModel, GenerationMixin):
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+        # Loss options
+        self.ce_loss = LigerCrossEntropyLoss()               # logits-based (for fallback)
+        self.fused_ce_loss = LigerFusedLinearCrossEntropyLoss()  # linear+CE fused
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -727,13 +731,22 @@ class CastForCausalLM(CastPreTrainedModel, GenerationMixin):
         hidden_states = outputs.last_hidden_state
         l2_act_ratio=outputs.l2_act_ratio
         l2_reg_loss=outputs.l2_reg_loss
-        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
-
+        
         loss = None
+        logits = None
         if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            B, S, H = hidden_states.shape
+            hidden_flat = hidden_states.reshape(B * S, H)
+            labels_flat = labels.reshape(B * S)
+            loss = self.fused_ce_loss(
+                hidden_flat,
+                self.lm_head.weight,   # [V, H]; transpose if Liger expects [H, V]
+                labels_flat,
+            )
+        else:
+            # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         if not return_dict:
             output = (logits,) + outputs.to_tuple()[1:]

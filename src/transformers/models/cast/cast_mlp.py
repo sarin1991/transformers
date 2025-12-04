@@ -5,9 +5,33 @@ from einops import rearrange, einsum
 import os
 import math
 from .configuration_cast import CastConfig
+import threading
+
+GLOBAL_LOCK = threading.Lock()
 
 
 MAX_NUM_SAMPLES = int(os.getenv("CAST_MLP_MAX_NUMBER_SAMPLES", 32768))
+
+SHRINK_WINDOW = 1000  # Number of steps to look back for usage
+SHRINK_FACTOR = 0.7  # When to consider shrinking, e.g., consistently using less than 70% of alloc'd
+shrink_history = []
+
+MAX_ALLOCATED_ROWS = MAX_NUM_SAMPLES
+
+def calc_rows_to_allocate(max_rows):
+    global MAX_ALLOCATED_ROWS
+    with GLOBAL_LOCK:
+        if max_rows>MAX_ALLOCATED_ROWS:
+            MAX_ALLOCATED_ROWS = max_rows
+            shrink_history.clear()
+        else:
+            shrink_history.append(max_rows)
+        if len(shrink_history)>=SHRINK_WINDOW:
+            max_rows_shrink_window = max(shrink_history)
+            if max_rows_shrink_window < SHRINK_FACTOR*MAX_ALLOCATED_ROWS:
+                MAX_ALLOCATED_ROWS = max_rows_shrink_window
+            shrink_history.clear()
+    return MAX_ALLOCATED_ROWS
 
 class CastMLPPyTorch(nn.Module):
     """Standard PyTorch MLP implementation with einops-based gate activation"""
@@ -95,37 +119,43 @@ class CastMLPTritonStreamCompact(nn.Module):
             from cast_kernels import cast_mlp_fused_stream_compact
         except ImportError:
             raise ImportError("cast-kernels package not available. Install with: pip install cast-kernels")
-        
         l2_gate = F.relu(self.l2_gate_proj(x)).to(torch.float32)  # Apply ReLU for auxiliary losses
         l2_act_ratio = (l2_gate > 0).mean(dtype=torch.float32)
         l2_reg_loss = l2_gate.sum()
         batch_seq_size = math.prod(l2_gate.shape[:-1])
         batch_size = l2_gate.shape[0]
         num_blocks = l2_gate.shape[-1]
-        num_samples = math.ceil(l2_act_ratio * batch_seq_size * num_blocks)
-        num_chunks = math.ceil(num_samples / MAX_NUM_SAMPLES)
-        chunk_size = math.ceil(batch_size / num_chunks)
-        num_chunks_bs = math.ceil(batch_size / chunk_size)
+        max_intermediate_rows = math.ceil(l2_act_ratio * batch_seq_size * num_blocks)
+        num_chunks = math.ceil(max_intermediate_rows / MAX_NUM_SAMPLES)
+        chunk_size_bs = math.ceil(batch_seq_size / num_chunks)
+        num_chunks_bs = math.ceil(batch_seq_size / chunk_size_bs)
 
-        if num_chunks > 1:
+        if num_chunks_bs > 1:
+            rows_to_allocate = calc_rows_to_allocate(MAX_NUM_SAMPLES)
             down_proj_out_list = []
+            l2_gate_flat = l2_gate.view(batch_seq_size,1, -1)
+            x_flat = x.view(batch_seq_size,1, -1)
             for i in range(num_chunks_bs):
-                start_idx = i * chunk_size
-                end_idx = min(start_idx + chunk_size, batch_size)
-                x_chunk = x[start_idx:end_idx]
-                l2_gate_chunk = l2_gate[start_idx:end_idx]
+                start_idx = i * chunk_size_bs
+                end_idx = min(start_idx + chunk_size_bs, batch_seq_size)
+                x_chunk = x_flat[start_idx:end_idx]
+                l2_gate_chunk = l2_gate_flat[start_idx:end_idx]
                 down_proj_out_chunk = cast_mlp_fused_stream_compact(
                     x_chunk, l2_gate_chunk, 
                     self.up_proj.weight.t(),    # Transpose: (intermediate, hidden) -> (hidden, intermediate)
-                    self.down_proj.weight.t()   # Transpose: (hidden, intermediate) -> (intermediate, hidden)
+                    self.down_proj.weight.t(),   # Transpose: (hidden, intermediate) -> (intermediate, hidden)
+                    rows_to_allocate
                 )
                 down_proj_out_list.append(down_proj_out_chunk)
-            down_proj_out = torch.cat(down_proj_out_list, dim=0)
+            down_proj_out_flat = torch.cat(down_proj_out_list, dim=0)
+            down_proj_out = down_proj_out_flat.view(batch_size, -1, self.hidden_size)
         else:
+            rows_to_allocate = calc_rows_to_allocate(max_intermediate_rows)
             down_proj_out = cast_mlp_fused_stream_compact(
                 x, l2_gate, 
                 self.up_proj.weight.t(),    # Transpose: (intermediate, hidden) -> (hidden, intermediate)
-                self.down_proj.weight.t()   # Transpose: (hidden, intermediate) -> (intermediate, hidden)
+                self.down_proj.weight.t(),   # Transpose: (hidden, intermediate) -> (intermediate, hidden)
+                rows_to_allocate
             )
         return down_proj_out, l2_gate, l2_act_ratio, l2_reg_loss
 
