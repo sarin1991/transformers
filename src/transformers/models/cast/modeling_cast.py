@@ -731,22 +731,34 @@ class CastForCausalLM(CastPreTrainedModel, GenerationMixin):
         hidden_states = outputs.last_hidden_state
         l2_act_ratio=outputs.l2_act_ratio
         l2_reg_loss=outputs.l2_reg_loss
-        
         loss = None
         logits = None
+
         if labels is not None:
-            B, S, H = hidden_states.shape
-            hidden_flat = hidden_states.reshape(B * S, H)
-            labels_flat = labels.reshape(B * S)
+            # Training: Use fused CE loss, skip logits computation
+            # Causal shift: predict token at t+1 from hidden state at t
+            hidden_for_loss = hidden_states[:, :-1, :].contiguous()  # (B, T-1, D)
+            labels_for_loss = labels[:, 1:].contiguous()  # (B, T-1)
+
+            # Flatten to 2D for the fused kernel
+            B, T, D = hidden_for_loss.shape
+            hidden_flat = hidden_for_loss.view(-1, D)  # (B*T, D)
+            labels_flat = labels_for_loss.view(-1)     # (B*T,)
+
+            # Call fused CE: (weight, hidden_states, labels)
+            # weight should be (vocab_size, hidden_size)
             loss = self.fused_ce_loss(
-                hidden_flat,
-                self.lm_head.weight,   # [V, H]; transpose if Liger expects [H, V]
-                labels_flat,
+                self.lm_head.weight,  # (vocab_size, D)
+                hidden_flat,          # (B*T, D)
+                labels_flat,          # (B*T,)
             )
         else:
-            # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            logits = self.lm_head(hidden_states[:, slice_indices, :])
+            # Inference: Compute logits normally
+            slice_indices = (
+                slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            )
+            hidden_for_logits = hidden_states[:, slice_indices, :]
+            logits = self.lm_head(hidden_for_logits)  # (B, T', vocab_size)
 
         if not return_dict:
             output = (logits,) + outputs.to_tuple()[1:]
