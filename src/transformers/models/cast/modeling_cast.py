@@ -261,11 +261,37 @@ class CastRotaryEmbedding(nn.Module):
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
-        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+        if self.rope_type == "default":
+            inv_freq, self.attention_scaling = self.compute_default_rope_parameters(self.config, device=device)
+        else:
+            self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+            inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = self.inv_freq
+
+    @staticmethod
+    def compute_default_rope_parameters(
+        config: CastConfig,
+        device: Optional[torch.device] = None,
+        seq_len: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, float]:
+        """
+        Default RoPE parameters, matching the original implementation.
+
+        This is equivalent to the old ROPE_INIT_FUNCTIONS["default"] behavior:
+        uses config.rope_theta if present, otherwise falls back to 10000.0.
+        """
+        base = getattr(config, "rope_theta", 10000.0)
+        dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+
+        attention_factor = 1.0  # No extra scaling in the default case
+
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
+        )
+        return inv_freq, attention_factor
 
     def _dynamic_frequency_update(self, position_ids, device):
         """
@@ -308,7 +334,6 @@ class CastRotaryEmbedding(nn.Module):
         sin = sin * self.attention_scaling
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
-
 
 class CastPreTrainedModel(PreTrainedModel):
     config_class = CastConfig
