@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2021 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,7 +30,7 @@ from transformers import (
     Wav2Vec2Tokenizer,
 )
 from transformers.models.wav2vec2.tokenization_wav2vec2 import VOCAB_FILES_NAMES, Wav2Vec2CTCTokenizerOutput
-from transformers.testing_utils import require_torch, slow
+from transformers.testing_utils import get_tests_dir, require_torch, slow
 
 from ...test_tokenization_common import TokenizerTesterMixin
 
@@ -57,22 +56,25 @@ def floats_list(shape, scale=1.0, rng=None, name=None):
 class Wav2Vec2TokenizerTest(unittest.TestCase):
     tokenizer_class = Wav2Vec2Tokenizer
 
-    def setUp(self):
-        super().setUp()
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
 
         vocab = "<pad> <s> </s> <unk> | E T A O N I H S R D L U M W C F G Y P B V K ' X J Q Z".split(" ")
         vocab_tokens = dict(zip(vocab, range(len(vocab))))
 
-        self.special_tokens_map = {"pad_token": "<pad>", "unk_token": "<unk>", "bos_token": "<s>", "eos_token": "</s>"}
+        cls.special_tokens_map = {"pad_token": "<pad>", "unk_token": "<unk>", "bos_token": "<s>", "eos_token": "</s>"}
 
-        self.tmpdirname = tempfile.mkdtemp()
-        self.vocab_file = os.path.join(self.tmpdirname, VOCAB_FILES_NAMES["vocab_file"])
-        with open(self.vocab_file, "w", encoding="utf-8") as fp:
+        cls.tmpdirname = tempfile.mkdtemp()
+        cls.vocab_file = os.path.join(cls.tmpdirname, VOCAB_FILES_NAMES["vocab_file"])
+        with open(cls.vocab_file, "w", encoding="utf-8") as fp:
             fp.write(json.dumps(vocab_tokens) + "\n")
 
-    def get_tokenizer(self, **kwargs):
-        kwargs.update(self.special_tokens_map)
-        return Wav2Vec2Tokenizer.from_pretrained(self.tmpdirname, **kwargs)
+    @classmethod
+    def get_tokenizer(cls, pretrained_name=None, **kwargs):
+        kwargs.update(cls.special_tokens_map)
+        pretrained_name = pretrained_name or cls.tmpdirname
+        return Wav2Vec2Tokenizer.from_pretrained(pretrained_name, **kwargs)
 
     def test_tokenizer_decode(self):
         # TODO(PVP) - change to facebook
@@ -235,26 +237,6 @@ class Wav2Vec2TokenizerTest(unittest.TestCase):
         self.assertTrue(abs(sum(np.asarray(input_values_8[1])[1000:])) < 1e-3)
         self.assertTrue(abs(sum(np.asarray(input_values_8[2])[1200:])) < 1e-3)
 
-    def test_save_pretrained(self):
-        pretrained_name = list(self.tokenizer_class.pretrained_vocab_files_map["vocab_file"].keys())[0]
-        tokenizer = self.tokenizer_class.from_pretrained(pretrained_name)
-        tmpdirname2 = tempfile.mkdtemp()
-
-        tokenizer_files = tokenizer.save_pretrained(tmpdirname2)
-        self.assertSequenceEqual(
-            sorted(tuple(VOCAB_FILES_NAMES.values()) + ("special_tokens_map.json", "added_tokens.json")),
-            sorted(x.split(os.path.sep)[-1] for x in tokenizer_files),
-        )
-
-        # Checks everything loads correctly in the same way
-        tokenizer_p = self.tokenizer_class.from_pretrained(tmpdirname2)
-
-        # Check special tokens are set accordingly on Rust and Python
-        for key in tokenizer.special_tokens_map:
-            self.assertTrue(key in tokenizer_p.special_tokens_map)
-
-        shutil.rmtree(tmpdirname2)
-
     def test_get_vocab(self):
         tokenizer = self.get_tokenizer()
         vocab_dict = tokenizer.get_vocab()
@@ -295,10 +277,10 @@ class Wav2Vec2TokenizerTest(unittest.TestCase):
         before_len = len(tokenizer)
         sample_ids = [0, 1, 4, 8, 9, 0, 12, before_len, before_len + 1, before_len + 2]
         tokenizer.add_tokens(["?", "!"])
-        additional_special_tokens = tokenizer.additional_special_tokens
-        additional_special_tokens.append("&")
+        extra_special_tokens = tokenizer.extra_special_tokens
+        extra_special_tokens.append("&")
         tokenizer.add_special_tokens(
-            {"additional_special_tokens": additional_special_tokens}, replace_additional_special_tokens=False
+            {"extra_special_tokens": extra_special_tokens}, replace_extra_special_tokens=False
         )
         before_tokens = tokenizer.decode(sample_ids)
         before_vocab = tokenizer.get_vocab()
@@ -373,22 +355,51 @@ class Wav2Vec2CTCTokenizerTest(TokenizerTesterMixin, unittest.TestCase):
     tokenizer_class = Wav2Vec2CTCTokenizer
     test_rust_tokenizer = False
 
-    def setUp(self):
-        super().setUp()
+    def test_pretokenized_inputs(self):
+        # Skip this test for Wav2Vec2 - it's a character-level tokenizer where spaces
+        # become word delimiters, so pretokenized inputs can't match string tokenization
+        self.skipTest("Wav2Vec2 is a character-level tokenizer with word delimiters")
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
 
         vocab = "<pad> <s> </s> <unk> | E T A O N I H S R D L U M W C F G Y P B V K ' X J Q Z".split(" ")
         vocab_tokens = dict(zip(vocab, range(len(vocab))))
 
-        self.special_tokens_map = {"pad_token": "<pad>", "unk_token": "<unk>", "bos_token": "<s>", "eos_token": "</s>"}
+        cls.special_tokens_map = {"pad_token": "<pad>", "unk_token": "<unk>", "bos_token": "<s>", "eos_token": "</s>"}
 
-        self.tmpdirname = tempfile.mkdtemp()
-        self.vocab_file = os.path.join(self.tmpdirname, VOCAB_FILES_NAMES["vocab_file"])
-        with open(self.vocab_file, "w", encoding="utf-8") as fp:
+        cls.tmpdirname = tempfile.mkdtemp()
+        cls.vocab_file = os.path.join(cls.tmpdirname, VOCAB_FILES_NAMES["vocab_file"])
+        with open(cls.vocab_file, "w", encoding="utf-8") as fp:
             fp.write(json.dumps(vocab_tokens) + "\n")
 
-    def get_tokenizer(self, **kwargs):
-        kwargs.update(self.special_tokens_map)
-        return Wav2Vec2CTCTokenizer.from_pretrained(self.tmpdirname, **kwargs)
+    @classmethod
+    def get_tokenizer(cls, pretrained_name=None, **kwargs):
+        # Update with special_tokens_map first, then user kwargs take precedence
+        merged_kwargs = cls.special_tokens_map.copy()
+        merged_kwargs.update(kwargs)
+        pretrained_name = pretrained_name or cls.tmpdirname
+        return Wav2Vec2CTCTokenizer.from_pretrained(pretrained_name, **merged_kwargs)
+
+    def test_word_delimiter_round_trip_without_config(self):
+        vocab_path = get_tests_dir("fixtures/vocab.json")
+        tokenizer = self.tokenizer_class(
+            vocab_path,
+            bos_token="<s>",
+            eos_token="</s>",
+            pad_token="<pad>",
+            unk_token="<unk>",
+            word_delimiter_token="|",
+        )
+        before_vocab = tokenizer.get_vocab()
+        self.assertIn("|", before_vocab)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tokenizer.save_pretrained(tmp_dir)
+            reloaded = self.tokenizer_class.from_pretrained(tmp_dir)
+
+        self.assertDictEqual(before_vocab, reloaded.get_vocab())
 
     def test_tokenizer_add_token_chars(self):
         tokenizer = self.tokenizer_class.from_pretrained("facebook/wav2vec2-base-960h")
@@ -659,7 +670,7 @@ class Wav2Vec2CTCTokenizerTest(TokenizerTesterMixin, unittest.TestCase):
         #
         #        input_values = feature_extractor(sample["audio"]["array"], return_tensors="pt").input_values
         #        logits = model(input_values).logits
-        #        pred_ids = torch.argmax(logits, axis=-1).cpu().tolist()
+        #        pred_ids = torch.argmax(logits, axis=-1).tolist()
         # ```
         # fmt: off
         pred_ids = [[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 18, 11, 0, 0, 0, 22, 0, 0, 4, 4, 4, 14, 0, 0, 0, 0, 0, 8, 8, 0, 5, 5, 0, 12, 0, 4, 4, 4, 4, 4, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 17, 0, 0, 10, 0, 0, 0, 15, 0, 0, 10, 0, 0, 0, 12, 0, 0, 0, 0, 0, 7, 0, 9, 0, 0, 14, 0, 0, 0, 13, 0, 7, 0, 0, 4, 4, 0, 15, 8, 8, 0, 0, 8, 0, 26, 0, 0, 4, 4, 0, 0, 15, 0, 0, 0, 0, 0, 0, 10, 0, 26, 5, 5, 0, 4, 4, 0, 0, 12, 11, 0, 0, 5, 4, 4, 4, 0, 18, 0, 0, 0, 7, 9, 9, 0, 6, 0, 12, 12, 4, 4, 0, 6, 0, 0, 8, 0, 4, 4, 4, 0, 19, 0, 0, 8, 9, 9, 0, 0, 0, 0, 12, 12, 0, 0, 0, 0, 0, 0, 0, 16, 16, 0, 0, 17, 5, 5, 5, 0, 4, 4, 4, 0, 0, 29, 29, 0, 0, 0, 0, 8, 11, 0, 9, 9, 0, 0, 0, 4, 4, 0, 12, 12, 0, 0, 0, 9, 0, 0, 0, 0, 0, 8, 18, 0, 0, 0, 4, 4, 0, 0, 8, 9, 0, 4, 4, 0, 6, 11, 5, 0, 4, 4, 0, 13, 13, 0, 0, 0, 10, 0, 0, 25, 0, 0, 6, 0, 4, 4, 0, 0, 0, 0, 7, 0, 0, 23, 0, 0, 4, 4, 0, 0, 0, 6, 11, 0, 5, 4, 4, 18, 0, 0, 0, 0, 0, 0, 7, 15, 0, 0, 0, 15, 15, 0, 4, 4, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]

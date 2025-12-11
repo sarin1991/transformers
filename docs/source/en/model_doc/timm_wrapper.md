@@ -16,6 +16,10 @@ rendered properly in your Markdown viewer.
 
 # TimmWrapper
 
+<div class="flex flex-wrap space-x-1">
+<img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-DE3412?style=flat&logo=pytorch&logoColor=white">
+</div>
+
 ## Overview
 
 Helper class to enable loading timm models to be used with the transformers library and its autoclasses.
@@ -47,7 +51,7 @@ Helper class to enable loading timm models to be used with the transformers libr
 >>> top5_probabilities, top5_class_indices = torch.topk(logits.softmax(dim=1) * 100, k=5)
 ```
 
-## Resources:
+## Resources
 
 A list of official Hugging Face and community (indicated by 🌎) resources to help you get started with TimmWrapper.
 
