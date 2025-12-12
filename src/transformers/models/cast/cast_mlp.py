@@ -116,7 +116,7 @@ class CastMLPTritonStreamCompact(nn.Module):
     
     def forward(self, x):
         try:
-            from cast_kernels import cast_mlp_fused_stream_compact
+            from cast_kernels import cast_mlp_fused_stream_compact, cast_mlp_fused_stream_compact_chunked
         except ImportError:
             raise ImportError("cast-kernels package not available. Install with: pip install cast-kernels")
         l2_gate = F.relu(self.l2_gate_proj(x))  # Apply ReLU for auxiliary losses
@@ -129,24 +129,13 @@ class CastMLPTritonStreamCompact(nn.Module):
         if max_intermediate_rows > MAX_NUM_SAMPLES:
             chunk_size = math.ceil(MAX_NUM_SAMPLES / num_blocks)
             rows_to_allocate = calc_rows_to_allocate(chunk_size * num_blocks)
-            num_chunks = math.ceil(batch_seq_size / chunk_size)
-            down_proj_out_list = []
-            l2_gate_flat = l2_gate.view(batch_seq_size,1, -1)
-            x_flat = x.view(batch_seq_size,1, -1)
-            for i in range(num_chunks):
-                start_idx = i * chunk_size
-                end_idx = min(start_idx + chunk_size, batch_seq_size)
-                x_chunk = x_flat[start_idx:end_idx]
-                l2_gate_chunk = l2_gate_flat[start_idx:end_idx]
-                down_proj_out_chunk = cast_mlp_fused_stream_compact(
-                    x_chunk, l2_gate_chunk, 
-                    self.up_proj.weight.t(),    # Transpose: (intermediate, hidden) -> (hidden, intermediate)
-                    self.down_proj.weight.t(),   # Transpose: (hidden, intermediate) -> (intermediate, hidden)
-                    rows_to_allocate
-                )
-                down_proj_out_list.append(down_proj_out_chunk)
-            down_proj_out_flat = torch.cat(down_proj_out_list, dim=0)
-            down_proj_out = down_proj_out_flat.view(batch_size, -1, self.hidden_size)
+            down_proj_out = cast_mlp_fused_stream_compact_chunked(
+                x, l2_gate, 
+                self.up_proj.weight.t(),    # Transpose: (intermediate, hidden) -> (hidden, intermediate)
+                self.down_proj.weight.t(),   # Transpose: (hidden, intermediate) -> (intermediate, hidden)
+                rows_to_allocate,
+                chunk_size,
+            )
         else:
             rows_to_allocate = calc_rows_to_allocate(max_intermediate_rows)
             down_proj_out = cast_mlp_fused_stream_compact(
