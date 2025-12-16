@@ -1,3 +1,4 @@
+import math
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -17,6 +18,60 @@ SHRINK_FACTOR = 0.7  # When to consider shrinking, e.g., consistently using less
 shrink_history = []
 
 MAX_ALLOCATED_ROWS = MAX_NUM_SAMPLES
+
+def choose_chunk_size_from_gates(l2_gate: torch.Tensor):
+    """
+    Choose chunk_size as a power of 2, starting from the smallest power of 2
+    >= dense_min_chunk, and grow while the max active rows per chunk stays
+    <= MAX_NUM_SAMPLES.
+
+    Returns:
+        best_chunk_size, best_max_rows
+    """
+    # Flatten batch/sequence into a single token dimension: (T, num_blocks)
+    gate_flat = l2_gate.reshape(-1, l2_gate.shape[-1])
+    num_tokens, num_blocks = gate_flat.shape
+
+    if num_tokens == 0:
+        return 0, 0
+
+    # Active blocks per token (rows along dim 0)
+    active_blocks_per_token = (gate_flat > 0).sum(dim=1)  # shape: (T,)
+
+    # Dense-safe minimum: assume all blocks active for all tokens in a chunk
+    dense_min_chunk = math.ceil(MAX_NUM_SAMPLES / num_blocks)
+
+    min_exp = math.ceil(math.log2(dense_min_chunk))
+
+    # Largest power of 2 <= num_tokens
+    max_exp = int(math.floor(math.log2(num_tokens)))
+
+    best_chunk_size = None
+    best_max_rows = None
+
+    for exp in range(min_exp, max_exp + 1):
+        candidate_chunk_size = 1 << exp  # 2**exp
+
+        # Split into chunks of size candidate_chunk_size (last one may be shorter)
+        splits = torch.split(
+            active_blocks_per_token,
+            split_size_or_sections=candidate_chunk_size
+        )
+
+        # Total active rows in each chunk = sum of active blocks per token
+        max_active = torch.stack([split.sum() for split in splits]).max().item()
+
+        if max_active <= MAX_NUM_SAMPLES:
+            best_chunk_size = candidate_chunk_size
+            best_max_rows = max_active
+        else:
+            # As chunk size grows, rows per chunk can only increase, so stop
+            break
+
+    if best_chunk_size is None:
+        raise ValueError("No valid chunk_size found under MAX_NUM_SAMPLES.")
+
+    return best_chunk_size, best_max_rows
 
 def calc_rows_to_allocate(max_rows):
     global MAX_ALLOCATED_ROWS
@@ -123,12 +178,11 @@ class CastMLPTritonStreamCompact(nn.Module):
         l2_act_ratio = (l2_gate > 0).mean(dtype=torch.float32)
         l2_reg_loss = l2_gate.sum()
         batch_seq_size = math.prod(l2_gate.shape[:-1])
-        batch_size = l2_gate.shape[0]
         num_blocks = l2_gate.shape[-1]
         max_intermediate_rows = math.ceil(l2_act_ratio * batch_seq_size * num_blocks)
         if max_intermediate_rows > MAX_NUM_SAMPLES:
-            chunk_size = math.ceil(MAX_NUM_SAMPLES / num_blocks)
-            rows_to_allocate = calc_rows_to_allocate(chunk_size * num_blocks)
+            chunk_size, max_rows = choose_chunk_size_from_gates(l2_gate)
+            rows_to_allocate = calc_rows_to_allocate(max_rows)
             down_proj_out = cast_mlp_fused_stream_compact_chunked(
                 x, l2_gate, 
                 self.up_proj.weight.t(),    # Transpose: (intermediate, hidden) -> (hidden, intermediate)
