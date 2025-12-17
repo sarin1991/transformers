@@ -88,6 +88,27 @@ def calc_rows_to_allocate(max_rows):
             shrink_history.clear()
     return MAX_ALLOCATED_ROWS
 
+
+class CastMLPDense(nn.Module):
+    """Standard Dense PyTorch MLP implementation"""
+    
+    def __init__(self, config: CastConfig):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+    
+    def forward(self, x):
+        intermediate = F.relu(self.up_proj(x))
+        down_proj_out = self.down_proj(intermediate)
+        l2_act_ratio = 0
+        l2_reg_loss = 0
+        l2_gate = None
+        return down_proj_out, l2_gate, l2_act_ratio, l2_reg_loss
+
+
 class CastMLPPyTorch(nn.Module):
     """Standard PyTorch MLP implementation with einops-based gate activation"""
     
@@ -203,6 +224,7 @@ class CastMLPTritonStreamCompact(nn.Module):
 
 # Registry mapping implementation names to classes
 CAST_MLP_CLASSES = {
+    "dense": CastMLPDense,
     "pytorch": CastMLPPyTorch,
     "triton_sortpack": CastMLPTritonSortPack,
     "triton_stream_compact": CastMLPTritonStreamCompact,
@@ -214,12 +236,7 @@ def get_mlp_class(config: CastConfig):
     import os
     import warnings
     
-    # Check environment variable for implementation override
-    env_implementation = os.getenv("CAST_MLP_IMPLEMENTATION")
-    if env_implementation:
-        implementation = env_implementation.lower()
-    else:
-        implementation = config.mlp_implementation.lower()
+    implementation = config.mlp_implementation.lower()
     
     if implementation not in CAST_MLP_CLASSES:
         raise ValueError(f"Unknown MLP implementation: {implementation}. Available: {list(CAST_MLP_CLASSES.keys())}")
