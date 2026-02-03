@@ -19,6 +19,22 @@ shrink_history = []
 
 MAX_ALLOCATED_ROWS = MAX_NUM_SAMPLES
 
+
+def resolve_torch_dtype(dt):
+    if dt is None:
+        return None
+    if isinstance(dt, torch.dtype):
+        return dt
+    if isinstance(dt, str):
+        m = {
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }
+        return m[dt]
+    raise TypeError(f"Unsupported torch_dtype: {dt} ({type(dt)})")
+
+
 def choose_chunk_size_from_gates(l2_gate: torch.Tensor):
     """
     Choose chunk_size as a power of 2, starting from the smallest power of 2
@@ -187,8 +203,13 @@ class CastMLPTritonStreamCompact(nn.Module):
         self.l2_line_size = config.l2_line_size
         self.l2_num_blocks = self.intermediate_size // self.l2_line_size
         self.l2_gate_proj = nn.Linear(self.hidden_size, self.l2_num_blocks, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        param_dtype = resolve_torch_dtype(getattr(config, "dtype", None)) or torch.float32
+        up_proj = torch.empty(self.hidden_size, self.intermediate_size,dtype=torch.float32)
+        down_proj = torch.empty(self.intermediate_size, self.hidden_size,dtype=torch.float32)
+        nn.init.kaiming_uniform_(up_proj, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(down_proj, a=math.sqrt(5))
+        self.up_proj = nn.Parameter(up_proj.to(param_dtype))
+        self.down_proj = nn.Parameter(down_proj.to(param_dtype))
     
     def forward(self, x):
         try:
@@ -206,8 +227,8 @@ class CastMLPTritonStreamCompact(nn.Module):
             rows_to_allocate = calc_rows_to_allocate(max_rows)
             down_proj_out = cast_mlp_fused_stream_compact_chunked(
                 x, l2_gate, 
-                self.up_proj.weight.t(),    # Transpose: (intermediate, hidden) -> (hidden, intermediate)
-                self.down_proj.weight.t(),   # Transpose: (hidden, intermediate) -> (intermediate, hidden)
+                self.up_proj,
+                self.down_proj,
                 rows_to_allocate,
                 chunk_size,
             )
@@ -215,8 +236,8 @@ class CastMLPTritonStreamCompact(nn.Module):
             rows_to_allocate = calc_rows_to_allocate(max_intermediate_rows)
             down_proj_out = cast_mlp_fused_stream_compact(
                 x, l2_gate, 
-                self.up_proj.weight.t(),    # Transpose: (intermediate, hidden) -> (hidden, intermediate)
-                self.down_proj.weight.t(),   # Transpose: (hidden, intermediate) -> (intermediate, hidden)
+                self.up_proj,
+                self.down_proj,
                 rows_to_allocate
             )
         return down_proj_out, l2_gate, l2_act_ratio, l2_reg_loss
