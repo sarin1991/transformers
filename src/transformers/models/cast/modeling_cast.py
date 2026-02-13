@@ -503,25 +503,37 @@ class CastModel(CastPreTrainedModel):
                 l2_reg_loss = l2_reg_loss + layer_outputs[3]
         else:
             do_ckpt = self.gradient_checkpointing and self.training
-            layer_flash_kwargs = {} if do_ckpt else flash_attn_kwargs
             for start in range(0, self.config.num_hidden_layers, self.gradient_checkpointing_chunk_size):
                 end = min(start + self.gradient_checkpointing_chunk_size, self.config.num_hidden_layers)
-                def make_run_block_func(start, end, layer_flash_kwargs):
+                def make_run_block_func(start, end, do_ckpt):
                     def run_block(h):
                         act_acc = torch.tensor(0.0, device=h.device)
                         reg_acc = torch.tensor(0.0, device=h.device)
-                        for layer in self.layers[start:end]:
-                            layer_outputs = layer(
-                                h,
-                                attention_mask=causal_mask,
-                                position_ids=position_ids,
-                                past_key_value=past_key_values,
-                                output_attentions=False,
-                                use_cache=use_cache,
-                                cache_position=cache_position,
-                                position_embeddings=position_embeddings,
-                                **layer_flash_kwargs,
-                            )
+                        for decoder_layer in self.layers[start:end]:
+                            if do_ckpt:
+                                layer_outputs = self._gradient_checkpointing_func(
+                                    decoder_layer.__call__,
+                                    h,
+                                    causal_mask,
+                                    position_ids,
+                                    past_key_values,
+                                    output_attentions,
+                                    use_cache,
+                                    cache_position,
+                                    position_embeddings,
+                                )
+                            else:
+                                layer_outputs = decoder_layer(
+                                    h,
+                                    causal_mask,
+                                    position_ids,
+                                    past_key_values,
+                                    output_attentions,
+                                    use_cache,
+                                    cache_position,
+                                    position_embeddings,
+                                    **flash_attn_kwargs,
+                                )
                             h = layer_outputs[0]
                             act_acc = act_acc + (1.0 / self.config.num_hidden_layers) * layer_outputs[2]
                             reg_acc = reg_acc + layer_outputs[3]
@@ -529,7 +541,7 @@ class CastModel(CastPreTrainedModel):
                         return h, act_acc, reg_acc
                     return run_block
                 
-                run_block_func = make_run_block_func(start,end,layer_flash_kwargs)
+                run_block_func = make_run_block_func(start,end,do_ckpt)
 
                 if self.gradient_checkpointing and self.training:
                     hidden_states, l2_act_ratio_block, l2_reg_loss_block = checkpoint(
