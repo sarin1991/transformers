@@ -3,6 +3,7 @@ from typing import Callable, List, Optional, Tuple, Union
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from dataclasses import dataclass
 from liger_kernel.transformers import LigerRMSNorm, liger_rotary_pos_emb, LigerCrossEntropyLoss, LigerFusedLinearCrossEntropyLoss
 
@@ -390,6 +391,7 @@ class CastModel(CastPreTrainedModel):
         self.norm = CastRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = CastRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
+        self.gradient_checkpointing_chunk_size = config.gradient_checkpointing_chunk_size
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -466,42 +468,80 @@ class CastModel(CastPreTrainedModel):
 
         l2_act_ratio = torch.tensor(0.0, device=inputs_embeds.device)
         l2_reg_loss = torch.tensor(0.0, device=inputs_embeds.device)
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
+        if self.gradient_checkpointing_chunk_size == 1:
+            for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+                if output_hidden_states:
+                    all_hidden_states += (hidden_states,)
 
-            if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
-                    decoder_layer.__call__,
-                    hidden_states,
-                    causal_mask,
-                    position_ids,
-                    past_key_values,
-                    output_attentions,
-                    use_cache,
-                    cache_position,
-                    position_embeddings,
-                )
-            else:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                    **flash_attn_kwargs,
-                )
+                if self.gradient_checkpointing and self.training:
+                    layer_outputs = self._gradient_checkpointing_func(
+                        decoder_layer.__call__,
+                        hidden_states,
+                        causal_mask,
+                        position_ids,
+                        past_key_values,
+                        output_attentions,
+                        use_cache,
+                        cache_position,
+                        position_embeddings,
+                    )
+                else:
+                    layer_outputs = decoder_layer(
+                        hidden_states,
+                        attention_mask=causal_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_values,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                        cache_position=cache_position,
+                        position_embeddings=position_embeddings,
+                        **flash_attn_kwargs,
+                    )
 
-            hidden_states = layer_outputs[0]
-            l2_gate = layer_outputs[1]
-            l2_act_ratio += (1.0/self.config.num_hidden_layers) * layer_outputs[2]
-            l2_reg_loss += layer_outputs[3]
+                hidden_states = layer_outputs[0]
+                l2_act_ratio = l2_act_ratio + (1.0/self.config.num_hidden_layers) * layer_outputs[2]
+                l2_reg_loss = l2_reg_loss + layer_outputs[3]
+        else:
+            do_ckpt = self.gradient_checkpointing and self.training
+            layer_flash_kwargs = {} if do_ckpt else flash_attn_kwargs
+            for start in range(0, self.config.num_hidden_layers, self.gradient_checkpointing_chunk_size):
+                end = min(start + self.gradient_checkpointing_chunk_size, self.config.num_hidden_layers)
+                def make_run_block_func(start, end, layer_flash_kwargs):
+                    def run_block(h):
+                        act_acc = torch.tensor(0.0, device=h.device)
+                        reg_acc = torch.tensor(0.0, device=h.device)
+                        for layer in self.layers[start:end]:
+                            layer_outputs = layer(
+                                h,
+                                attention_mask=causal_mask,
+                                position_ids=position_ids,
+                                past_key_value=past_key_values,
+                                output_attentions=False,
+                                use_cache=use_cache,
+                                cache_position=cache_position,
+                                position_embeddings=position_embeddings,
+                                **layer_flash_kwargs,
+                            )
+                            h = layer_outputs[0]
+                            act_acc = act_acc + (1.0 / self.config.num_hidden_layers) * layer_outputs[2]
+                            reg_acc = reg_acc + layer_outputs[3]
 
-            if output_attentions:
-                all_self_attns += (layer_outputs[1],)
+                        return h, act_acc, reg_acc
+                    return run_block
+                
+                run_block_func = make_run_block_func(start,end,layer_flash_kwargs)
+
+                if self.gradient_checkpointing and self.training:
+                    hidden_states, l2_act_ratio_block, l2_reg_loss_block = checkpoint(
+                        run_block_func,
+                        hidden_states,
+                        use_reentrant=False,
+                    )
+                else:
+                    hidden_states, l2_act_ratio_block, l2_reg_loss_block = run_block_func(hidden_states)
+
+                l2_act_ratio = l2_act_ratio + l2_act_ratio_block
+                l2_reg_loss = l2_reg_loss + l2_reg_loss_block
 
         hidden_states = self.norm(hidden_states)
 

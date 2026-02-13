@@ -32,6 +32,7 @@ class CastConfig(PretrainedConfig):
         l1_line_size=64,
         l2_line_size=1024,
         num_hidden_layers=32,
+        gradient_checkpointing_chunk_size=1,
         num_attention_heads=32,
         num_key_value_heads=8,
         head_dim=None,
@@ -57,6 +58,7 @@ class CastConfig(PretrainedConfig):
         self.l1_line_size = l1_line_size
         self.l2_line_size = l2_line_size
         self.num_hidden_layers = num_hidden_layers
+        self.gradient_checkpointing_chunk_size = gradient_checkpointing_chunk_size
         self.num_attention_heads = num_attention_heads
         self.sliding_window = sliding_window
         self.head_dim = head_dim or hidden_size // num_attention_heads
