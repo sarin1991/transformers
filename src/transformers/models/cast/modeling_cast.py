@@ -548,6 +548,7 @@ class CastModel(CastPreTrainedModel):
                         run_block_func,
                         hidden_states,
                         use_reentrant=False,
+                        determinism_check="none",
                     )
                 else:
                     hidden_states, l2_act_ratio_block, l2_reg_loss_block = run_block_func(hidden_states)
