@@ -509,8 +509,10 @@ class CastModel(CastPreTrainedModel):
                     def run_block(h):
                         act_acc = torch.tensor(0.0, device=h.device)
                         reg_acc = torch.tensor(0.0, device=h.device)
+                        # Only checkpoint inner layers if autograd is enabled in *this* context
+                        inner_ckpt = do_ckpt and torch.is_grad_enabled()
                         for decoder_layer in self.layers[start:end]:
-                            if do_ckpt:
+                            if inner_ckpt:
                                 layer_outputs = self._gradient_checkpointing_func(
                                     decoder_layer.__call__,
                                     h,
