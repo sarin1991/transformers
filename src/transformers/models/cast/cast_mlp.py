@@ -203,7 +203,7 @@ class CastMLPTritonStreamCompact(nn.Module):
         self.l2_line_size = config.l2_line_size
         self.l2_num_blocks = self.intermediate_size // self.l2_line_size
         self.l2_gate_proj = nn.Linear(self.hidden_size, self.l2_num_blocks, bias=False)
-        param_dtype = resolve_torch_dtype(getattr(config, "dtype", None)) or torch.float32
+        param_dtype = resolve_torch_dtype(config.mlp_dtype)
         up_proj = torch.empty(self.hidden_size, self.intermediate_size,dtype=torch.float32)
         down_proj = torch.empty(self.intermediate_size, self.hidden_size,dtype=torch.float32)
         nn.init.kaiming_uniform_(up_proj, a=math.sqrt(5))
