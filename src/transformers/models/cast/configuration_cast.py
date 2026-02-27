@@ -48,6 +48,10 @@ class CastConfig(PretrainedConfig):
         rope_theta=10000.0,
         sliding_window=4096,
         attention_dropout=0.0,
+        moe_topk=2,
+        router_bias_update_rate = 1e-3,
+        router_score_fn = "sigmoid",
+        router_bias_clamp = 5.0,
         mlp_implementation="pytorch",
         mlp_dtype="float32",
         **kwargs,
@@ -75,6 +79,10 @@ class CastConfig(PretrainedConfig):
         self.use_cache = use_cache
         self.rope_theta = rope_theta
         self.attention_dropout = attention_dropout
+        self.moe_topk = moe_topk
+        self.router_bias_update_rate = router_bias_update_rate
+        self.router_score_fn = router_score_fn
+        self.router_bias_clamp = router_bias_clamp
         self.mlp_implementation = mlp_implementation
         self.mlp_dtype = mlp_dtype
 

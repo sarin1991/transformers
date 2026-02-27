@@ -7,6 +7,7 @@ import os
 import math
 from .configuration_cast import CastConfig
 import threading
+from .router import Router
 
 GLOBAL_LOCK = threading.Lock()
 
@@ -216,7 +217,7 @@ class CastMLPTritonStreamCompact(nn.Module):
             from cast_kernels import cast_mlp_fused_stream_compact, cast_mlp_fused_stream_compact_chunked
         except ImportError:
             raise ImportError("cast-kernels package not available. Install with: pip install cast-kernels")
-        l2_gate = F.relu(self.l2_gate_proj(x))  # Apply ReLU for auxiliary losses
+        l2_gate = Router(self.l2_gate_proj(x))
         l2_act_ratio = (l2_gate > 0).mean(dtype=torch.float32)
         l2_reg_loss = l2_gate.sum()
         batch_seq_size = math.prod(l2_gate.shape[:-1])

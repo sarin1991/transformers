@@ -549,7 +549,7 @@ class CastModel(CastPreTrainedModel):
                     hidden_states, l2_act_ratio_block, l2_reg_loss_block = checkpoint(
                         run_block_func,
                         hidden_states,
-                        use_reentrant=False,
+                        use_reentrant=True,
                         determinism_check="none",
                     )
                 else:
