@@ -52,7 +52,7 @@ class Router(nn.Module):
         topk_w = topk_w / (topk_w.sum(dim=-1, keepdim=True) + self.eps)     # [T, K]
 
         gate = torch.zeros_like(scores)                                     # [T, E]
-        gate.scatter_(dim=-1, index=topk_idx, src=topk_w)
+        gate.scatter_(dim=-1, index=topk_idx, src=topk_w.to(dtype=gate.dtype))
 
         if self.training and torch.is_grad_enabled():
             flat = topk_idx.reshape(-1)
