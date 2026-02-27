@@ -37,22 +37,26 @@ class Router(nn.Module):
             self.expert_bias.clamp_(-self.bias_clamp, self.bias_clamp)
 
     def forward(self, logits: torch.Tensor):
-        T, E = logits.shape
+        orig_shape = logits.shape
+        logits = logits.reshape(-1, orig_shape[-1])  # [T, E]
+        E = logits.shape[-1]
         if E != self.n_experts:
             raise ValueError(f"Expected E={self.n_experts}, got {E}")
 
-        scores = self._scores(logits)
+        scores = self._scores(logits)  # [T, E]
         routed_scores = scores + self.expert_bias.to(dtype=scores.dtype)
 
-        topk_idx = torch.topk(routed_scores, k=self.top_k, dim=-1).indices
+        topk_idx = torch.topk(routed_scores, k=self.top_k, dim=-1).indices  # [T, K]
 
-        w = scores.gather(dim=-1, index=topk_idx)
-        w = w / (w.sum(dim=-1, keepdim=True) + self.eps)
+        topk_w = scores.gather(dim=-1, index=topk_idx)                      # [T, K]
+        topk_w = topk_w / (topk_w.sum(dim=-1, keepdim=True) + self.eps)     # [T, K]
 
-        flat = topk_idx.reshape(-1)
-        counts = torch.bincount(flat, minlength=E).to(torch.float32)
+        gate = torch.zeros_like(scores)                                     # [T, E]
+        gate.scatter_(dim=-1, index=topk_idx, src=topk_w)
 
         if self.training and torch.is_grad_enabled():
+            flat = topk_idx.reshape(-1)
+            counts = torch.bincount(flat, minlength=E).to(torch.float32)
             self._update_bias_inplace(counts)
 
-        return topk_idx, w, counts
+        return gate.reshape(orig_shape)
