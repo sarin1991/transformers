@@ -204,6 +204,7 @@ class CastMLPTritonStreamCompact(nn.Module):
         self.l2_line_size = config.l2_line_size
         self.l2_num_blocks = self.intermediate_size // self.l2_line_size
         self.l2_gate_proj = nn.Linear(self.hidden_size, self.l2_num_blocks, bias=False)
+        self.router = Router(config)
         param_dtype = resolve_torch_dtype(config.mlp_dtype)
         up_proj = torch.empty(self.hidden_size, self.intermediate_size,dtype=torch.float32)
         down_proj = torch.empty(self.intermediate_size, self.hidden_size,dtype=torch.float32)
@@ -217,7 +218,7 @@ class CastMLPTritonStreamCompact(nn.Module):
             from cast_kernels import cast_mlp_fused_stream_compact, cast_mlp_fused_stream_compact_chunked
         except ImportError:
             raise ImportError("cast-kernels package not available. Install with: pip install cast-kernels")
-        l2_gate = Router(self.l2_gate_proj(x))
+        l2_gate = self.router(self.l2_gate_proj(x))
         l2_act_ratio = (l2_gate > 0).mean(dtype=torch.float32)
         l2_reg_loss = l2_gate.sum()
         batch_seq_size = math.prod(l2_gate.shape[:-1])
