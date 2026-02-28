@@ -8,9 +8,9 @@ class Router(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.l2_line_size = config.l2_line_size
-        self.l2_num_blocks = self.intermediate_size // self.l2_line_size
-        self.n_experts = self.l2_num_blocks
+        self.line_size = config.line_size
+        self.num_blocks = self.intermediate_size // self.line_size
+        self.n_experts = self.num_blocks
 
         self.top_k = config.moe_topk
         self.bias_update_rate = config.router_bias_update_rate

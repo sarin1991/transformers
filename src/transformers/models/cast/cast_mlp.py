@@ -36,7 +36,7 @@ def resolve_torch_dtype(dt):
     raise TypeError(f"Unsupported torch_dtype: {dt} ({type(dt)})")
 
 
-def choose_chunk_size_from_gates(l2_gate: torch.Tensor):
+def choose_chunk_size_from_gates(gate: torch.Tensor):
     """
     Choose chunk_size as a power of 2, starting from the smallest power of 2
     >= dense_min_chunk, and grow while the max active rows per chunk stays
@@ -46,7 +46,7 @@ def choose_chunk_size_from_gates(l2_gate: torch.Tensor):
         best_chunk_size, best_max_rows
     """
     # Flatten batch/sequence into a single token dimension: (T, num_blocks)
-    gate_flat = l2_gate.reshape(-1, l2_gate.shape[-1])
+    gate_flat = gate.reshape(-1, gate.shape[-1])
     num_tokens, num_blocks = gate_flat.shape
 
     if num_tokens == 0:
@@ -122,8 +122,8 @@ class CastMLPDense(nn.Module):
         down_proj_out = self.down_proj(intermediate)
         l2_act_ratio = 0
         l2_reg_loss = 0
-        l2_gate = None
-        return down_proj_out, l2_gate, l2_act_ratio, l2_reg_loss
+        gate = None
+        return down_proj_out, gate, l2_act_ratio, l2_reg_loss
 
 
 class CastMLPPyTorch(nn.Module):
@@ -134,9 +134,9 @@ class CastMLPPyTorch(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.l2_line_size = config.l2_line_size
-        self.l2_num_blocks = self.intermediate_size // self.l2_line_size
-        self.l2_gate_proj = nn.Linear(self.hidden_size, self.l2_num_blocks, bias=True)
+        self.line_size = config.line_size
+        self.num_blocks = self.intermediate_size // self.line_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.num_blocks, bias=True)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
     
@@ -149,12 +149,12 @@ class CastMLPPyTorch(nn.Module):
     
     def forward(self, x):
         up_proj_out = F.relu(self.up_proj(x))
-        l2_gate = F.relu(self.l2_gate_proj(x))
-        intermediate = self.gate_activation(up_proj_out, l2_gate, self.l2_num_blocks, self.l2_line_size)
+        gate = F.relu(self.gate_proj(x))
+        intermediate = self.gate_activation(up_proj_out, gate, self.num_blocks, self.line_size)
         down_proj_out = self.down_proj(intermediate)
-        l2_act_ratio = (l2_gate > 0).mean(dtype=torch.float32)
-        l2_reg_loss = l2_gate.sum()
-        return down_proj_out, l2_gate, l2_act_ratio, l2_reg_loss
+        l2_act_ratio = (gate > 0).mean(dtype=torch.float32)
+        l2_reg_loss = gate.sum()
+        return down_proj_out, gate, l2_act_ratio, l2_reg_loss
 
 
 class CastMLPTritonSortPack(nn.Module):
@@ -165,9 +165,9 @@ class CastMLPTritonSortPack(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.l2_line_size = config.l2_line_size
-        self.l2_num_blocks = self.intermediate_size // self.l2_line_size
-        self.l2_gate_proj = nn.Linear(self.hidden_size, self.l2_num_blocks, bias=True)
+        self.line_size = config.line_size
+        self.num_blocks = self.intermediate_size // self.line_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.num_blocks, bias=True)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
     
@@ -177,20 +177,20 @@ class CastMLPTritonSortPack(nn.Module):
         except ImportError:
             raise ImportError("cast-kernels package not available. Install with: pip install cast-kernels")
         
-        l2_gate = F.relu(self.l2_gate_proj(x)).to(torch.float32)  # Apply ReLU for auxiliary losses
+        gate = F.relu(self.gate_proj(x)).to(torch.float32)  # Apply ReLU for auxiliary losses
         
         # Use optimized fused kernel with TRANSPOSED weights from Linear layers
         # nn.Linear weights are (out_features, in_features), but kernels expect (in_features, out_features)
         down_proj_out = cast_mlp_fused(
-            x, l2_gate, 
+            x, gate, 
             self.up_proj.weight.t(),    # Transpose: (intermediate, hidden) -> (hidden, intermediate)
             self.down_proj.weight.t(),    # Transpose: (hidden, intermediate) -> (intermediate, hidden)
             kernel="sortpack"
         )
         
-        l2_act_ratio = (l2_gate > 0).mean(dtype=torch.float32)
-        l2_reg_loss = l2_gate.sum()
-        return down_proj_out, l2_gate, l2_act_ratio, l2_reg_loss
+        l2_act_ratio = (gate > 0).mean(dtype=torch.float32)
+        l2_reg_loss = gate.sum()
+        return down_proj_out, gate, l2_act_ratio, l2_reg_loss
 
 
 class CastMLPTritonStreamCompact(nn.Module):
@@ -201,9 +201,9 @@ class CastMLPTritonStreamCompact(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.l2_line_size = config.l2_line_size
-        self.l2_num_blocks = self.intermediate_size // self.l2_line_size
-        self.l2_gate_proj = nn.Linear(self.hidden_size, self.l2_num_blocks, bias=False)
+        self.line_size = config.line_size
+        self.num_blocks = self.intermediate_size // self.line_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.num_blocks, bias=False)
         self.router = Router(config)
         param_dtype = resolve_torch_dtype(config.mlp_dtype)
         up_proj = torch.empty(self.hidden_size, self.intermediate_size,dtype=torch.float32)
@@ -218,17 +218,17 @@ class CastMLPTritonStreamCompact(nn.Module):
             from cast_kernels import cast_mlp_fused_stream_compact, cast_mlp_fused_stream_compact_chunked
         except ImportError:
             raise ImportError("cast-kernels package not available. Install with: pip install cast-kernels")
-        l2_gate = self.router(self.l2_gate_proj(x))
-        l2_act_ratio = (l2_gate > 0).mean(dtype=torch.float32)
-        l2_reg_loss = l2_gate.sum()
-        batch_seq_size = math.prod(l2_gate.shape[:-1])
-        num_blocks = l2_gate.shape[-1]
+        gate = self.router(self.gate_proj(x))
+        l2_act_ratio = (gate > 0).mean(dtype=torch.float32)
+        l2_reg_loss = gate.sum()
+        batch_seq_size = math.prod(gate.shape[:-1])
+        num_blocks = gate.shape[-1]
         max_intermediate_rows = math.ceil(l2_act_ratio * batch_seq_size * num_blocks)
         if max_intermediate_rows > MAX_NUM_SAMPLES:
-            chunk_size, max_rows = choose_chunk_size_from_gates(l2_gate)
+            chunk_size, max_rows = choose_chunk_size_from_gates(gate)
             rows_to_allocate = calc_rows_to_allocate(max_rows)
             down_proj_out = cast_mlp_fused_stream_compact_chunked(
-                x, l2_gate, 
+                x, gate, 
                 self.up_proj,
                 self.down_proj,
                 rows_to_allocate,
@@ -237,12 +237,12 @@ class CastMLPTritonStreamCompact(nn.Module):
         else:
             rows_to_allocate = calc_rows_to_allocate(max_intermediate_rows)
             down_proj_out = cast_mlp_fused_stream_compact(
-                x, l2_gate, 
+                x, gate, 
                 self.up_proj,
                 self.down_proj,
                 rows_to_allocate
             )
-        return down_proj_out, l2_gate, l2_act_ratio, l2_reg_loss
+        return down_proj_out, gate, l2_act_ratio, l2_reg_loss
 
 
 # Registry mapping implementation names to classes

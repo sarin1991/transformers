@@ -29,8 +29,7 @@ class CastConfig(PretrainedConfig):
         vocab_size=32000,
         hidden_size=4096,
         intermediate_size=14336,
-        l1_line_size=64,
-        l2_line_size=1024,
+        line_size=1024,
         num_hidden_layers=32,
         gradient_checkpointing_chunk_size=1,
         num_attention_heads=32,
@@ -60,8 +59,7 @@ class CastConfig(PretrainedConfig):
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
-        self.l1_line_size = l1_line_size
-        self.l2_line_size = l2_line_size
+        self.line_size = line_size
         self.num_hidden_layers = num_hidden_layers
         self.gradient_checkpointing_chunk_size = gradient_checkpointing_chunk_size
         self.num_attention_heads = num_attention_heads
