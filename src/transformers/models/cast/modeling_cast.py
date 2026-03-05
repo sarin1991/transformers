@@ -457,6 +457,10 @@ class CastModel(CastPreTrainedModel):
             position_ids=position_ids,
         )
 
+        if torch.is_autocast_enabled():
+            inputs_embeds = inputs_embeds.to(torch.get_autocast_gpu_dtype())
+        else:
+            inputs_embeds = inputs_embeds
         hidden_states = inputs_embeds
 
         # create position embeddings to be shared across the decoder layers
