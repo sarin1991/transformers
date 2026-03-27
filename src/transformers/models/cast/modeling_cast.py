@@ -385,8 +385,8 @@ class CastModel(CastPreTrainedModel):
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList(
-            [CastDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        self.layers = nn.ModuleDict(
+            {str(layer_idx): CastDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)}
         )
         self.norm = CastRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = CastRotaryEmbedding(config=config)
@@ -404,7 +404,7 @@ class CastModel(CastPreTrainedModel):
 
     def forward(
         self,
-        input_ids: torch.LongTensor = None,
+        input_ids: Optional[Union[torch.LongTensor, dict]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
@@ -414,8 +414,16 @@ class CastModel(CastPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        l2_act_ratio: Optional[torch.Tensor] = None,
+        l2_reg_loss: Optional[torch.Tensor] = None,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
-    ) -> Union[Tuple, CastModelOutputWithPast]:
+    ) -> Union[Tuple, CastModelOutputWithPast, dict]:
+        if isinstance(input_ids, dict):
+            inputs_embeds = input_ids["inputs_embeds"]
+            l2_act_ratio = input_ids["l2_act_ratio"]
+            l2_reg_loss = input_ids["l2_reg_loss"]
+            input_ids = None
+
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -433,6 +441,8 @@ class CastModel(CastPreTrainedModel):
             use_cache = False
 
         if inputs_embeds is None:
+            if self.embed_tokens is None:
+                raise ValueError("embed_tokens is None, so inputs_embeds must be provided")
             inputs_embeds = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
@@ -470,10 +480,16 @@ class CastModel(CastPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
 
-        l2_act_ratio = torch.tensor(0.0, device=inputs_embeds.device)
-        l2_reg_loss = torch.tensor(0.0, device=inputs_embeds.device)
+        if l2_act_ratio is None:
+            l2_act_ratio = torch.tensor(0.0, device=inputs_embeds.device)
+        if l2_reg_loss is None:
+            l2_reg_loss = torch.tensor(0.0, device=inputs_embeds.device)
+
+        layer_list = [self.layers[k] for k in sorted(self.layers.keys(), key=int)]
+        num_active_layers = len(layer_list)
+
         if self.gradient_checkpointing_chunk_size == 1:
-            for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            for decoder_layer in layer_list:
                 if output_hidden_states:
                     all_hidden_states += (hidden_states,)
 
@@ -507,15 +523,15 @@ class CastModel(CastPreTrainedModel):
                 l2_reg_loss = l2_reg_loss + layer_outputs[3]
         else:
             do_ckpt = self.gradient_checkpointing and self.training
-            for start in range(0, self.config.num_hidden_layers, self.gradient_checkpointing_chunk_size):
-                end = min(start + self.gradient_checkpointing_chunk_size, self.config.num_hidden_layers)
+            for start in range(0, num_active_layers, self.gradient_checkpointing_chunk_size):
+                end = min(start + self.gradient_checkpointing_chunk_size, num_active_layers)
                 def make_run_block_func(start, end, do_ckpt):
                     def run_block(h):
                         act_acc = torch.tensor(0.0, device=h.device)
                         reg_acc = torch.tensor(0.0, device=h.device)
                         # Only checkpoint inner layers if autograd is enabled in *this* context
                         inner_ckpt = do_ckpt and torch.is_grad_enabled()
-                        for decoder_layer in self.layers[start:end]:
+                        for decoder_layer in layer_list[start:end]:
                             if inner_ckpt:
                                 layer_outputs = self._gradient_checkpointing_func(
                                     decoder_layer.__call__,
@@ -562,11 +578,19 @@ class CastModel(CastPreTrainedModel):
                 l2_act_ratio = l2_act_ratio + l2_act_ratio_block
                 l2_reg_loss = l2_reg_loss + l2_reg_loss_block
 
-        hidden_states = self.norm(hidden_states)
+        if self.norm is not None:
+            hidden_states = self.norm(hidden_states)
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
+
+        if self.norm is None:
+            return {
+                "inputs_embeds": hidden_states,
+                "l2_act_ratio": l2_act_ratio,
+                "l2_reg_loss": l2_reg_loss,
+            }
 
         output = CastModelOutputWithPast(
             last_hidden_state=hidden_states,
