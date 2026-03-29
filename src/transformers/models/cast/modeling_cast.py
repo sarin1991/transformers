@@ -672,6 +672,7 @@ class CastForCausalLM(CastPreTrainedModel, GenerationMixin):
             inputs_embeds = input_ids["inputs_embeds"]
             l2_act_ratio = input_ids["l2_act_ratio"]
             l2_reg_loss = input_ids["l2_reg_loss"]
+            labels = input_ids["labels"]
             input_ids = None
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -697,6 +698,7 @@ class CastForCausalLM(CastPreTrainedModel, GenerationMixin):
         )
 
         if self.lm_head is None:
+            outputs["labels"] = labels
             return outputs
 
         hidden_states = outputs.last_hidden_state
@@ -788,6 +790,7 @@ class CastForTokenClassification(CastPreTrainedModel):
             inputs_embeds = input_ids["inputs_embeds"]
             l2_act_ratio = input_ids["l2_act_ratio"]
             l2_reg_loss = input_ids["l2_reg_loss"]
+            labels = input_ids["labels"]
             input_ids = None
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -807,6 +810,7 @@ class CastForTokenClassification(CastPreTrainedModel):
         )
 
         if self.score is None:
+            outputs["labels"] = labels
             return outputs
 
         sequence_output = outputs[0]
@@ -864,6 +868,7 @@ class CastForSequenceClassification(CastPreTrainedModel):
             inputs_embeds = input_ids["inputs_embeds"]
             l2_act_ratio = input_ids["l2_act_ratio"]
             l2_reg_loss = input_ids["l2_reg_loss"]
+            labels = input_ids["labels"]
             input_ids = None
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -883,6 +888,7 @@ class CastForSequenceClassification(CastPreTrainedModel):
         )
 
         if self.score is None:
+            transformer_outputs["labels"] = labels
             return transformer_outputs
 
         hidden_states = transformer_outputs[0]
@@ -965,6 +971,8 @@ class CastForQuestionAnswering(CastPreTrainedModel):
             inputs_embeds = input_ids["inputs_embeds"]
             l2_act_ratio = input_ids["l2_act_ratio"]
             l2_reg_loss = input_ids["l2_reg_loss"]
+            start_positions = input_ids["start_positions"]
+            end_positions = input_ids["end_positions"]
             input_ids = None
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -983,6 +991,8 @@ class CastForQuestionAnswering(CastPreTrainedModel):
         )
 
         if self.qa_outputs is None:
+            outputs["start_positions"] = start_positions
+            outputs["end_positions"] = end_positions
             return outputs
 
         sequence_output = outputs[0]
