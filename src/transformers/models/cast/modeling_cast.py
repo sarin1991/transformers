@@ -404,7 +404,7 @@ class CastModel(CastPreTrainedModel):
 
     def forward(
         self,
-        input_ids: Optional[Union[torch.LongTensor, dict]] = None,
+        input_ids: Optional[Union[torch.LongTensor, Tuple[torch.Tensor, ...]]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
@@ -417,11 +417,9 @@ class CastModel(CastPreTrainedModel):
         l2_act_ratio: Optional[torch.Tensor] = None,
         l2_reg_loss: Optional[torch.Tensor] = None,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
-    ) -> Union[Tuple, CastModelOutputWithPast, dict]:
-        if isinstance(input_ids, dict):
-            inputs_embeds = input_ids["inputs_embeds"]
-            l2_act_ratio = input_ids["l2_act_ratio"]
-            l2_reg_loss = input_ids["l2_reg_loss"]
+    ) -> Union[Tuple, CastModelOutputWithPast]:
+        if isinstance(input_ids, tuple):
+            inputs_embeds, l2_act_ratio, l2_reg_loss = input_ids
             input_ids = None
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -586,11 +584,7 @@ class CastModel(CastPreTrainedModel):
             all_hidden_states += (hidden_states,)
 
         if self.norm is None:
-            return {
-                "inputs_embeds": hidden_states,
-                "l2_act_ratio": l2_act_ratio,
-                "l2_reg_loss": l2_reg_loss,
-            }
+            return (hidden_states, l2_act_ratio, l2_reg_loss)
 
         output = CastModelOutputWithPast(
             last_hidden_state=hidden_states,
@@ -652,7 +646,7 @@ class CastForCausalLM(CastPreTrainedModel, GenerationMixin):
     @deprecate_kwarg("num_logits_to_keep", version="4.50", new_name="logits_to_keep")
     def forward(
         self,
-        input_ids: Optional[Union[torch.LongTensor, dict]] = None,
+        input_ids: Optional[Union[torch.LongTensor, Tuple[torch.Tensor, ...]]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
@@ -667,12 +661,9 @@ class CastForCausalLM(CastPreTrainedModel, GenerationMixin):
         l2_act_ratio: Optional[torch.Tensor] = None,
         l2_reg_loss: Optional[torch.Tensor] = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> Union[Tuple, CastCausalLMOutputWithPast, dict]:
-        if isinstance(input_ids, dict):
-            inputs_embeds = input_ids["inputs_embeds"]
-            l2_act_ratio = input_ids["l2_act_ratio"]
-            l2_reg_loss = input_ids["l2_reg_loss"]
-            labels = input_ids["labels"]
+    ) -> Union[Tuple, CastCausalLMOutputWithPast]:
+        if isinstance(input_ids, tuple):
+            inputs_embeds, l2_act_ratio, l2_reg_loss, labels = input_ids
             input_ids = None
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -698,8 +689,8 @@ class CastForCausalLM(CastPreTrainedModel, GenerationMixin):
         )
 
         if self.lm_head is None:
-            outputs["labels"] = labels
-            return outputs
+            hidden_states, l2_act_ratio, l2_reg_loss = outputs
+            return (hidden_states, l2_act_ratio, l2_reg_loss, labels)
 
         hidden_states = outputs.last_hidden_state
         l2_act_ratio=outputs.l2_act_ratio
@@ -773,7 +764,7 @@ class CastForTokenClassification(CastPreTrainedModel):
 
     def forward(
         self,
-        input_ids: Optional[Union[torch.LongTensor, dict]] = None,
+        input_ids: Optional[Union[torch.LongTensor, Tuple[torch.Tensor, ...]]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
@@ -785,12 +776,9 @@ class CastForTokenClassification(CastPreTrainedModel):
         return_dict: Optional[bool] = None,
         l2_act_ratio: Optional[torch.Tensor] = None,
         l2_reg_loss: Optional[torch.Tensor] = None,
-    ) -> Union[Tuple, TokenClassifierOutput, dict]:
-        if isinstance(input_ids, dict):
-            inputs_embeds = input_ids["inputs_embeds"]
-            l2_act_ratio = input_ids["l2_act_ratio"]
-            l2_reg_loss = input_ids["l2_reg_loss"]
-            labels = input_ids["labels"]
+    ) -> Union[Tuple, TokenClassifierOutput]:
+        if isinstance(input_ids, tuple):
+            inputs_embeds, l2_act_ratio, l2_reg_loss, labels = input_ids
             input_ids = None
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -810,8 +798,8 @@ class CastForTokenClassification(CastPreTrainedModel):
         )
 
         if self.score is None:
-            outputs["labels"] = labels
-            return outputs
+            hidden_states, l2_act_ratio, l2_reg_loss = outputs
+            return (hidden_states, l2_act_ratio, l2_reg_loss, labels)
 
         sequence_output = outputs[0]
         sequence_output = self.dropout(sequence_output)
@@ -851,7 +839,7 @@ class CastForSequenceClassification(CastPreTrainedModel):
 
     def forward(
         self,
-        input_ids: Optional[Union[torch.LongTensor, dict]] = None,
+        input_ids: Optional[Union[torch.LongTensor, Tuple[torch.Tensor, ...]]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
@@ -863,12 +851,9 @@ class CastForSequenceClassification(CastPreTrainedModel):
         return_dict: Optional[bool] = None,
         l2_act_ratio: Optional[torch.Tensor] = None,
         l2_reg_loss: Optional[torch.Tensor] = None,
-    ) -> Union[Tuple, SequenceClassifierOutputWithPast, dict]:
-        if isinstance(input_ids, dict):
-            inputs_embeds = input_ids["inputs_embeds"]
-            l2_act_ratio = input_ids["l2_act_ratio"]
-            l2_reg_loss = input_ids["l2_reg_loss"]
-            labels = input_ids["labels"]
+    ) -> Union[Tuple, SequenceClassifierOutputWithPast]:
+        if isinstance(input_ids, tuple):
+            inputs_embeds, l2_act_ratio, l2_reg_loss, labels = input_ids
             input_ids = None
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -888,8 +873,8 @@ class CastForSequenceClassification(CastPreTrainedModel):
         )
 
         if self.score is None:
-            transformer_outputs["labels"] = labels
-            return transformer_outputs
+            hidden_states, l2_act_ratio, l2_reg_loss = transformer_outputs
+            return (hidden_states, l2_act_ratio, l2_reg_loss, labels)
 
         hidden_states = transformer_outputs[0]
         logits = self.score(hidden_states)
@@ -953,7 +938,7 @@ class CastForQuestionAnswering(CastPreTrainedModel):
 
     def forward(
         self,
-        input_ids: Optional[Union[torch.LongTensor, dict]] = None,
+        input_ids: Optional[Union[torch.LongTensor, Tuple[torch.Tensor, ...]]] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
@@ -966,13 +951,9 @@ class CastForQuestionAnswering(CastPreTrainedModel):
         l2_act_ratio: Optional[torch.Tensor] = None,
         l2_reg_loss: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> Union[Tuple, QuestionAnsweringModelOutput, dict]:
-        if isinstance(input_ids, dict):
-            inputs_embeds = input_ids["inputs_embeds"]
-            l2_act_ratio = input_ids["l2_act_ratio"]
-            l2_reg_loss = input_ids["l2_reg_loss"]
-            start_positions = input_ids["start_positions"]
-            end_positions = input_ids["end_positions"]
+    ) -> Union[Tuple, QuestionAnsweringModelOutput]:
+        if isinstance(input_ids, tuple):
+            inputs_embeds, l2_act_ratio, l2_reg_loss, start_positions, end_positions = input_ids
             input_ids = None
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -991,9 +972,8 @@ class CastForQuestionAnswering(CastPreTrainedModel):
         )
 
         if self.qa_outputs is None:
-            outputs["start_positions"] = start_positions
-            outputs["end_positions"] = end_positions
-            return outputs
+            hidden_states, l2_act_ratio, l2_reg_loss = outputs
+            return (hidden_states, l2_act_ratio, l2_reg_loss, start_positions, end_positions)
 
         sequence_output = outputs[0]
 
